@@ -34,6 +34,12 @@ services:
       # `Authorization: Bearer <key>`. Leave unset to disable wrapper auth.
       CLAUDE_WRAPPER_API_KEYS: "${CLAUDE_WRAPPER_API_KEYS:-}"
 
+      # If set, the wrapper emits markdown download links for generated
+      # files in assistant output, e.g. [report.pdf](http://host:8000/v1/files/file-.../content).
+      # Point this at whatever URL clients (Open WebUI, etc.) can reach the
+      # wrapper on. Leave unset to fall back to the plain "file_id=…" block.
+      CLAUDE_WRAPPER_PUBLIC_BASE_URL: "${CLAUDE_WRAPPER_PUBLIC_BASE_URL:-}"
+
       CLAUDE_WRAPPER_DEFAULT_MODEL: "${CLAUDE_WRAPPER_DEFAULT_MODEL:-claude-sonnet-4-6}"
       CLAUDE_WRAPPER_MAX_UPLOAD_BYTES: "${CLAUDE_WRAPPER_MAX_UPLOAD_BYTES:-2147483648}"
       CLAUDE_WRAPPER_REQUEST_TIMEOUT: "${CLAUDE_WRAPPER_REQUEST_TIMEOUT:-1800}"

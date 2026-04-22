@@ -389,12 +389,23 @@ async def _register_generated_files(
     return records
 
 
+def _file_download_url(file_id: str) -> Optional[str]:
+    base = SETTINGS.public_base_url
+    if not base:
+        return None
+    return f"{base}/v1/files/{file_id}/content"
+
+
 def _append_file_references(text: str, attachments: list[dict]) -> str:
     lines = []
     for a in attachments:
-        lines.append(
-            f"- {a.get('filename')} ({a.get('mime_type')}, {a.get('bytes')} bytes) → file_id={a['id']}"
-        )
+        filename = a.get("filename") or a["id"]
+        meta = f"{a.get('mime_type')}, {a.get('bytes')} bytes"
+        url = _file_download_url(a["id"])
+        if url:
+            lines.append(f"- [{filename}]({url}) ({meta}, file_id=`{a['id']}`)")
+        else:
+            lines.append(f"- {filename} ({meta}) → file_id={a['id']}")
     ref_block = "Generated files:\n" + "\n".join(lines)
     if not text:
         return ref_block

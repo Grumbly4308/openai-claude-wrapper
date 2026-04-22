@@ -1,0 +1,10 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.3
+python-multipart==0.0.19
+aiofiles==24.1.0
+python-magic==0.4.27
+httpx==0.28.1
+websockets==13.1
+numpy==2.2.0
+fastembed==0.4.2

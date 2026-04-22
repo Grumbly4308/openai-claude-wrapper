@@ -1,0 +1,56 @@
+services:
+  claude-wrapper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: claude-wrapper:latest
+    container_name: claude-wrapper
+    restart: unless-stopped
+    # Default command: run the OpenAI-compatible API server.
+    # Run a one-time login with:
+    #   docker compose run --rm -it claude-wrapper login
+    # or a long-lived headless token with:
+    #   docker compose run --rm -it claude-wrapper setup-token
+    # Either writes credentials to the `claude-home` volume below, which
+    # persists across container rebuilds and restarts.
+    command: ["serve"]
+    # Explicitly bind on 0.0.0.0 so the server is reachable from any
+    # network interface on the host, not just the loopback-by-default
+    # that some Docker configs fall back to.
+    ports:
+      - "0.0.0.0:${CLAUDE_WRAPPER_PORT:-8000}:${CLAUDE_WRAPPER_PORT:-8000}"
+    environment:
+      # Container-internal uvicorn port. Must match the host port above
+      # so the compose mapping is a straight pass-through.
+      CLAUDE_WRAPPER_PORT: "${CLAUDE_WRAPPER_PORT:-8000}"
+      CLAUDE_WRAPPER_HOST: "0.0.0.0"
+
+      # Optional: fall back to env-based auth instead of the persisted
+      # OAuth login. Leave blank once you've run `compose run … login`.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:-}"
+
+      # Comma-separated bearer tokens clients must send as
+      # `Authorization: Bearer <key>`. Leave unset to disable wrapper auth.
+      CLAUDE_WRAPPER_API_KEYS: "${CLAUDE_WRAPPER_API_KEYS:-}"
+
+      CLAUDE_WRAPPER_DEFAULT_MODEL: "${CLAUDE_WRAPPER_DEFAULT_MODEL:-claude-sonnet-4-6}"
+      CLAUDE_WRAPPER_MAX_UPLOAD_BYTES: "${CLAUDE_WRAPPER_MAX_UPLOAD_BYTES:-2147483648}"
+      CLAUDE_WRAPPER_REQUEST_TIMEOUT: "${CLAUDE_WRAPPER_REQUEST_TIMEOUT:-1800}"
+      CLAUDE_WRAPPER_WORKERS: "${CLAUDE_WRAPPER_WORKERS:-1}"
+    volumes:
+      # Uploads, generated outputs, per-session workspaces, session id map.
+      - claude-data:/data
+      # Claude Code's own state — credentials live here, so this is the
+      # volume that makes `compose run … login` survive restarts.
+      - claude-home:/home/claude/.claude
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CLAUDE_WRAPPER_PORT:-8000}/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  claude-data:
+  claude-home:

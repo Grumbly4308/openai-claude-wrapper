@@ -17,6 +17,7 @@ class Settings:
     claude_bin: str
     max_upload_bytes: int
     request_timeout_seconds: int
+    public_base_url: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -43,6 +44,7 @@ class Settings:
             claude_bin=os.environ.get("CLAUDE_WRAPPER_CLAUDE_BIN", "claude"),
             max_upload_bytes=int(os.environ.get("CLAUDE_WRAPPER_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024))),
             request_timeout_seconds=int(os.environ.get("CLAUDE_WRAPPER_REQUEST_TIMEOUT", "1800")),
+            public_base_url=os.environ.get("CLAUDE_WRAPPER_PUBLIC_BASE_URL", "").rstrip("/"),
         )
 
 

@@ -134,16 +134,15 @@ class ClaudeRunner:
 
     def _build_argv(
         self,
-        prompt: str,
         session_uuid: str,
         model: Optional[str],
         resume: bool,
         extra_args: Optional[list[str]] = None,
     ) -> list[str]:
+        # Prompt is fed via stdin (not argv) to avoid E2BIG on large prompts.
         argv = [
             self.claude_bin,
             "-p",
-            prompt,
             "--output-format",
             "stream-json",
             "--verbose",
@@ -179,7 +178,6 @@ class ClaudeRunner:
             snapshot = self._snapshot_outputs(cwd)
 
             argv = self._build_argv(
-                prompt=prompt,
                 session_uuid=session_uuid,
                 model=model,
                 resume=not created,
@@ -196,13 +194,26 @@ class ClaudeRunner:
 
             proc = await asyncio.create_subprocess_exec(
                 *argv,
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(cwd),
                 env=env,
             )
 
+            async def _feed_stdin() -> None:
+                # Concurrent writer so a prompt larger than the pipe buffer
+                # (typically 64 KiB on Linux) doesn't deadlock against stdout.
+                try:
+                    proc.stdin.write(prompt.encode("utf-8"))
+                    await proc.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                finally:
+                    with contextlib.suppress(Exception):
+                        proc.stdin.close()
+
+            stdin_task = asyncio.create_task(_feed_stdin())
             stderr_task = asyncio.create_task(_drain_stderr(proc.stderr))
             final_text_parts: list[str] = []
             stop_reason = "stop"
@@ -246,6 +257,8 @@ class ClaudeRunner:
             finally:
                 returncode = await proc.wait()
                 stderr_output = await stderr_task
+                with contextlib.suppress(Exception):
+                    await stdin_task
                 if returncode != 0 and errored is None:
                     errored = f"claude exited {returncode}: {stderr_output[-500:] if stderr_output else ''}"
                 # Rotate uuid on resume-failure so the next request starts fresh.

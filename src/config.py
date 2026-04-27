@@ -18,6 +18,9 @@ class Settings:
     max_upload_bytes: int
     request_timeout_seconds: int
     public_base_url: str
+    openwebui_base_url: str
+    openwebui_api_key: str
+    openwebui_default_collection: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -45,6 +48,9 @@ class Settings:
             max_upload_bytes=int(os.environ.get("CLAUDE_WRAPPER_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024))),
             request_timeout_seconds=int(os.environ.get("CLAUDE_WRAPPER_REQUEST_TIMEOUT", "1800")),
             public_base_url=os.environ.get("CLAUDE_WRAPPER_PUBLIC_BASE_URL", "").rstrip("/"),
+            openwebui_base_url=os.environ.get("OPENWEBUI_BASE_URL", "").rstrip("/"),
+            openwebui_api_key=os.environ.get("OPENWEBUI_API_KEY", ""),
+            openwebui_default_collection=os.environ.get("OPENWEBUI_DEFAULT_COLLECTION", ""),
         )
 
 

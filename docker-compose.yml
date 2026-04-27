@@ -44,6 +44,13 @@ services:
       CLAUDE_WRAPPER_MAX_UPLOAD_BYTES: "${CLAUDE_WRAPPER_MAX_UPLOAD_BYTES:-2147483648}"
       CLAUDE_WRAPPER_REQUEST_TIMEOUT: "${CLAUDE_WRAPPER_REQUEST_TIMEOUT:-1800}"
       CLAUDE_WRAPPER_WORKERS: "${CLAUDE_WRAPPER_WORKERS:-1}"
+
+      # When set, the wrapper injects a system-prompt addendum telling
+      # Claude how to query OpenWebUI's retrieval API. The api key passes
+      # through to Claude's Bash tool via env, never into the prompt.
+      OPENWEBUI_BASE_URL: "${OPENWEBUI_BASE_URL:-}"
+      OPENWEBUI_API_KEY: "${OPENWEBUI_API_KEY:-}"
+      OPENWEBUI_DEFAULT_COLLECTION: "${OPENWEBUI_DEFAULT_COLLECTION:-}"
     volumes:
       # Uploads, generated outputs, per-session workspaces, session id map.
       - claude-data:/data

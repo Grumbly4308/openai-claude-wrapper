@@ -56,6 +56,10 @@ class SessionRegistry:
     def _path(self, key: str) -> Path:
         return self.root / f"{key}.json"
 
+    def has(self, key: str) -> bool:
+        """Return True if a uuid is already bound to this session key."""
+        return self._path(key).exists()
+
     async def lock_for(self, key: str) -> asyncio.Lock:
         async with self._registry_lock:
             lock = self._locks.get(key)
@@ -82,6 +86,14 @@ class SessionRegistry:
     async def bind_uuid(self, key: str, new_uuid: str) -> None:
         async with aiofiles.open(self._path(key), "w") as f:
             await f.write(json.dumps({"key": key, "uuid": new_uuid}))
+
+    async def forget(self, key: str) -> None:
+        """Drop the registry entry so the next call mints a fresh uuid."""
+        path = self._path(key)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 class ClaudeRunner:
@@ -261,7 +273,8 @@ class ClaudeRunner:
                     await stdin_task
                 if returncode != 0 and errored is None:
                     errored = f"claude exited {returncode}: {stderr_output[-500:] if stderr_output else ''}"
-                # Rotate uuid on resume-failure so the next request starts fresh.
+                # Drop the registry entry on resume-failure so the next request
+                # mints a fresh uuid, uses --session-id, and replays full history.
                 if (
                     returncode != 0
                     and not created
@@ -269,8 +282,8 @@ class ClaudeRunner:
                     and "session" in stderr_output.lower()
                     and ("not found" in stderr_output.lower() or "no such" in stderr_output.lower())
                 ):
-                    log.warning("session %s uuid %s missing; rotating for next call", session_key, session_uuid)
-                    await self.registry.bind_uuid(session_key, str(uuid.uuid4()))
+                    log.warning("session %s uuid %s missing; dropping for next call", session_key, session_uuid)
+                    await self.registry.forget(session_key)
 
             final_text = "".join(final_text_parts).strip()
 

@@ -14,6 +14,13 @@ import aiofiles
 
 log = logging.getLogger("claude_wrapper.runner")
 
+# Claude Code stream-json events are newline-delimited, but a single event
+# (large assistant text, tool input, or tool result) can easily exceed the
+# default asyncio StreamReader limit of 64 KiB and trip readline() with
+# "Separator is found, but chunk is longer than limit". Give the reader
+# enough headroom for realistic payloads.
+_STREAM_BUFFER_LIMIT = 64 * 1024 * 1024  # 64 MiB
+
 
 @dataclass
 class StreamEvent:
@@ -211,6 +218,7 @@ class ClaudeRunner:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(cwd),
                 env=env,
+                limit=_STREAM_BUFFER_LIMIT,
             )
 
             async def _feed_stdin() -> None:
@@ -356,6 +364,31 @@ async def _read_lines(stream: asyncio.StreamReader, timeout: int) -> AsyncIterat
             line = await asyncio.wait_for(stream.readline(), timeout=timeout)
         except asyncio.TimeoutError:
             raise
+        except ValueError:
+            # readline() raises ValueError when a single line exceeds the
+            # StreamReader buffer. Drain and concatenate partial chunks via
+            # readuntil() so we still produce the full event instead of
+            # killing the whole stream.
+            buf = bytearray()
+            while True:
+                try:
+                    part = await asyncio.wait_for(
+                        stream.readuntil(b"\n"), timeout=timeout
+                    )
+                    buf.extend(part)
+                    break
+                except ValueError as exc:
+                    partial = getattr(exc, "partial", None)
+                    if not partial:
+                        raise
+                    buf.extend(partial)
+                except asyncio.IncompleteReadError as exc:
+                    if exc.partial:
+                        buf.extend(exc.partial)
+                    if not buf:
+                        return
+                    break
+            line = bytes(buf)
         if not line:
             return
         yield line.decode("utf-8", errors="replace")

@@ -8,3 +8,4 @@ httpx==0.28.1
 websockets==13.1
 numpy==2.2.0
 fastembed==0.4.2
+pypdf==5.1.0

@@ -163,6 +163,12 @@ class MessagePreparer:
         return target, rec.mime_type, rec.filename
 
     async def _materialize_file_data(self, b64: str, mime: Optional[str], filename: Optional[str], workspace: Path) -> tuple[Path, str]:
+        # OpenAI's spec for inline files uses a data URL ("data:application/pdf;base64,...");
+        # some clients send raw base64 with mime in a sibling field. Accept both.
+        m = DATA_URL_RE.match(b64)
+        if m:
+            mime = mime or (m.group("mime") or "").strip() or None
+            b64 = m.group("data") or ""
         try:
             raw = base64.b64decode(b64, validate=False)
         except (binascii.Error, ValueError) as e:

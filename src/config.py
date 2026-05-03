@@ -21,6 +21,7 @@ class Settings:
     openwebui_base_url: str
     openwebui_api_key: str
     openwebui_default_collection: str
+    pdf_inline_max_chars: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -51,6 +52,7 @@ class Settings:
             openwebui_base_url=os.environ.get("OPENWEBUI_BASE_URL", "").rstrip("/"),
             openwebui_api_key=os.environ.get("OPENWEBUI_API_KEY", ""),
             openwebui_default_collection=os.environ.get("OPENWEBUI_DEFAULT_COLLECTION", ""),
+            pdf_inline_max_chars=int(os.environ.get("CLAUDE_WRAPPER_PDF_INLINE_MAX_CHARS", str(2_000_000))),
         )
 
 

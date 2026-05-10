@@ -334,38 +334,36 @@ class MessagePreparer:
         return "", None
 
     def _render_file_block(self, path: Path, mime: str, filename: str) -> str:
-        """Render an attached file as prompt text.
+        """Render an attached file as a path reference.
 
-        For PDFs we extract text and inline it directly (with page markers) so
-        the model can see the whole document without making per-page Read-tool
-        calls. The path is still mentioned so it can fall back to the Read
-        tool for figures/specific pages if needed.
+        Files are written to the session workspace and referenced by absolute
+        path. Claude Code uses Read/Bash to pull whatever portion it actually
+        needs — keeping the prompt small and letting the model handle PDFs,
+        text, code, etc. natively.
+
+        PDF text inlining is opt-in via CLAUDE_WRAPPER_PDF_INLINE_MAX_CHARS>0.
         """
-        if (mime or "").lower() == "application/pdf" or path.suffix.lower() == ".pdf":
+        is_pdf = (mime or "").lower() == "application/pdf" or path.suffix.lower() == ".pdf"
+        if is_pdf and SETTINGS.pdf_inline_max_chars > 0:
             result = extract_pdf_text(path, max_chars=SETTINGS.pdf_inline_max_chars)
-            if result.error or not result.text.strip():
-                # Extraction failed — fall back to the original behavior so
-                # Claude can at least try the Read tool.
-                note = f" (extraction error: {result.error})" if result.error else ""
-                return f"[attached file: {path} (filename={filename}, mime={mime}){note}]"
-
-            trunc_note = (
-                f" — truncated to first {SETTINGS.pdf_inline_max_chars} characters"
-                if result.truncated
-                else ""
-            )
-            header = (
-                f"[attached PDF: {path} (filename={filename}, "
-                f"{result.num_pages} pages{trunc_note}). Full text inlined below; "
-                f"use the Read tool on the path above only if you need specific pages "
-                f"verified or images extracted.]"
-            )
-            return (
-                f"{header}\n"
-                f"<<<PDF-START {filename}>>>\n"
-                f"{result.text}\n"
-                f"<<<PDF-END {filename}>>>"
-            )
+            if not result.error and result.text.strip():
+                trunc_note = (
+                    f" — truncated to first {SETTINGS.pdf_inline_max_chars} characters"
+                    if result.truncated
+                    else ""
+                )
+                header = (
+                    f"[attached PDF: {path} (filename={filename}, "
+                    f"{result.num_pages} pages{trunc_note}). Full text inlined below; "
+                    f"use the Read tool on the path above only if you need specific pages "
+                    f"verified or images extracted.]"
+                )
+                return (
+                    f"{header}\n"
+                    f"<<<PDF-START {filename}>>>\n"
+                    f"{result.text}\n"
+                    f"<<<PDF-END {filename}>>>"
+                )
 
         return f"[attached file: {path} (filename={filename}, mime={mime})]"
 

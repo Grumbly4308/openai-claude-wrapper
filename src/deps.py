@@ -20,6 +20,7 @@ RUNNER = ClaudeRunner(
     workspace_root=SETTINGS.workspace_dir,
     claude_bin=SETTINGS.claude_bin,
     request_timeout_seconds=SETTINGS.request_timeout_seconds,
+    effort=SETTINGS.effort,
 )
 PREPARER = MessagePreparer(FILE_STORE, SETTINGS.workspace_dir, registry=SESSIONS)
 DELEGATE = Delegator(RUNNER, SETTINGS.workspace_dir)

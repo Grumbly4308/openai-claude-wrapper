@@ -40,7 +40,12 @@ services:
       # wrapper on. Leave unset to fall back to the plain "file_id=…" block.
       CLAUDE_WRAPPER_PUBLIC_BASE_URL: "${CLAUDE_WRAPPER_PUBLIC_BASE_URL:-}"
 
-      CLAUDE_WRAPPER_DEFAULT_MODEL: "${CLAUDE_WRAPPER_DEFAULT_MODEL:-claude-sonnet-4-6}"
+      CLAUDE_WRAPPER_DEFAULT_MODEL: "${CLAUDE_WRAPPER_DEFAULT_MODEL:-claude-opus-4-8}"
+
+      # Reasoning effort forwarded to every `claude` invocation as
+      # `--effort <level>`: low | medium | high | xhigh | max. Applies to
+      # Opus 4.5+ models. Leave blank to use the CLI's own default.
+      CLAUDE_WRAPPER_EFFORT: "${CLAUDE_WRAPPER_EFFORT:-max}"
       CLAUDE_WRAPPER_MAX_UPLOAD_BYTES: "${CLAUDE_WRAPPER_MAX_UPLOAD_BYTES:-2147483648}"
       CLAUDE_WRAPPER_REQUEST_TIMEOUT: "${CLAUDE_WRAPPER_REQUEST_TIMEOUT:-1800}"
       CLAUDE_WRAPPER_WORKERS: "${CLAUDE_WRAPPER_WORKERS:-1}"

@@ -62,6 +62,7 @@ services:
       # Claude Code's own state — credentials live here, so this is the
       # volume that makes `compose run … login` survive restarts.
       - claude-home:/home/claude/.claude
+      - /root/inbox:/data/inbox:ro     # add this
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CLAUDE_WRAPPER_PORT:-8000}/healthz"]
       interval: 30s

@@ -12,6 +12,8 @@ from typing import AsyncIterator, Optional
 
 import aiofiles
 
+from .config import is_effort_capable
+
 log = logging.getLogger("claude_wrapper.runner")
 
 # Claude Code stream-json events are newline-delimited, but a single event
@@ -112,11 +114,13 @@ class ClaudeRunner:
         workspace_root: Path,
         claude_bin: str = "claude",
         request_timeout_seconds: int = 1800,
+        effort: str = "",
     ):
         self.registry = registry
         self.workspace_root = workspace_root
         self.claude_bin = claude_bin
         self.request_timeout_seconds = request_timeout_seconds
+        self.effort = effort
 
     def _session_cwd(self, session_key: str) -> Path:
         d = self.workspace_root / session_key
@@ -157,6 +161,7 @@ class ClaudeRunner:
         model: Optional[str],
         resume: bool,
         extra_args: Optional[list[str]] = None,
+        effort: Optional[str] = None,
     ) -> list[str]:
         # Prompt is fed via stdin (not argv) to avoid E2BIG on large prompts.
         argv = [
@@ -172,6 +177,14 @@ class ClaudeRunner:
             argv += ["--session-id", session_uuid]
         if model:
             argv += ["--model", model]
+        # Per-call effort overrides; an explicit "" means "no --effort flag".
+        # When unset (None) fall back to the server default, but only for
+        # effort-capable (Opus) models — other families reject the flag.
+        eff = effort
+        if eff is None:
+            eff = self.effort if is_effort_capable(model or "") else ""
+        if eff:
+            argv += ["--effort", eff]
         argv += ["--dangerously-skip-permissions"]
         if extra_args:
             argv += list(extra_args)
@@ -184,6 +197,7 @@ class ClaudeRunner:
         model: Optional[str] = None,
         env_extra: Optional[dict[str, str]] = None,
         extra_args: Optional[list[str]] = None,
+        effort: Optional[str] = None,
     ) -> AsyncIterator[StreamEvent]:
         """Yield StreamEvents as the subprocess produces them.
 
@@ -201,6 +215,7 @@ class ClaudeRunner:
                 model=model,
                 resume=not created,
                 extra_args=extra_args,
+                effort=effort,
             )
 
             env = os.environ.copy()
@@ -321,6 +336,7 @@ class ClaudeRunner:
         model: Optional[str] = None,
         env_extra: Optional[dict[str, str]] = None,
         extra_args: Optional[list[str]] = None,
+        effort: Optional[str] = None,
     ) -> ClaudeResult:
         result = ClaudeResult(session_uuid="", final_text="")
         text_parts: list[str] = []
@@ -331,6 +347,7 @@ class ClaudeRunner:
             model=model,
             env_extra=env_extra,
             extra_args=extra_args,
+            effort=effort,
         ):
             result.events.append(evt)
             if evt.kind == "text" and evt.text:

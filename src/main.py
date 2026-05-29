@@ -25,7 +25,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .config import SETTINGS, SUPPORTED_MODELS
+from .config import SETTINGS, SUPPORTED_MODELS, advertised_models, split_model_effort
 from .converters import derive_session_id
 from .deps import FILE_STORE, PREPARER, RUNNER, auth_dependency
 from .models import (
@@ -90,12 +90,13 @@ async def healthz() -> dict:
 @app.get("/v1/models", response_model=ModelList, dependencies=[Depends(auth_dependency)])
 async def list_models() -> ModelList:
     now = int(time.time())
-    return ModelList(data=[ModelInfo(id=m, created=now) for m in SUPPORTED_MODELS])
+    return ModelList(data=[ModelInfo(id=m, created=now) for m in advertised_models()])
 
 
 @app.get("/v1/models/{model_id}", dependencies=[Depends(auth_dependency)])
 async def retrieve_model(model_id: str) -> ModelInfo:
-    if model_id not in SUPPORTED_MODELS:
+    base, _effort = split_model_effort(model_id)
+    if base not in SUPPORTED_MODELS:
         raise HTTPException(status_code=404, detail=f"unknown model: {model_id}")
     return ModelInfo(id=model_id, created=int(time.time()))
 
@@ -212,7 +213,10 @@ async def _sync_response(
     session_key: str,
     model: str,
 ) -> JSONResponse:
-    result = await RUNNER.run_collect(prompt=prompt, session_key=session_key, model=model)
+    run_model, effort = split_model_effort(model)
+    result = await RUNNER.run_collect(
+        prompt=prompt, session_key=session_key, model=run_model, effort=effort
+    )
 
     if result.error and not result.final_text:
         raise HTTPException(status_code=502, detail=f"claude failed: {result.error}")
@@ -266,6 +270,7 @@ async def _stream_response(
 ) -> AsyncIterator[bytes]:
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
+    run_model, effort = split_model_effort(model)
 
     first_chunk = ChatCompletionChunk(
         id=chunk_id,
@@ -287,7 +292,9 @@ async def _stream_response(
     errored: Optional[str] = None
 
     try:
-        async for evt in RUNNER.run_stream(prompt=prompt, session_key=session_key, model=model):
+        async for evt in RUNNER.run_stream(
+            prompt=prompt, session_key=session_key, model=run_model, effort=effort
+        ):
             if evt.kind == "text" and evt.text:
                 chunk = ChatCompletionChunk(
                     id=chunk_id,

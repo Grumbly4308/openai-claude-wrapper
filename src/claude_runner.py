@@ -12,7 +12,7 @@ from typing import AsyncIterator, Optional
 
 import aiofiles
 
-from .config import is_effort_capable
+from .config import ULTRACODE_EFFORT, is_effort_capable
 
 log = logging.getLogger("claude_wrapper.runner")
 
@@ -177,13 +177,23 @@ class ClaudeRunner:
             argv += ["--session-id", session_uuid]
         if model:
             argv += ["--model", model]
-        # Per-call effort overrides; an explicit "" means "no --effort flag".
-        # When unset (None) fall back to the server default, but only for
-        # effort-capable (Opus) models — other families reject the flag.
-        eff = effort
-        if eff is None:
-            eff = self.effort if is_effort_capable(model or "") else ""
-        if eff:
+        # Resolve this call's effort: an explicit value wins (including "",
+        # which means "no effort flag"); otherwise fall back to the server
+        # default. Effort — and the ultracode settings overlay — only apply to
+        # effort-capable (Opus) models, so drop it for other families, which
+        # ignore or reject the flag. Gating here (not only on the default path)
+        # means a hand-crafted "claude-sonnet-4-6:max" never emits a flag the
+        # CLI would silently ignore.
+        eff = effort if effort is not None else self.effort
+        if not is_effort_capable(model or ""):
+            eff = ""
+        if eff == ULTRACODE_EFFORT:
+            # "ultracode" is not a --effort value (the CLI ignores it and falls
+            # back to default effort). It is requested via settings instead,
+            # where the CLI resolves it to xhigh effort plus ultracode's
+            # dynamic-workflow orchestration opt-in.
+            argv += ["--settings", '{"ultracode": true}']
+        elif eff:
             argv += ["--effort", eff]
         argv += ["--dangerously-skip-permissions"]
         if extra_args:

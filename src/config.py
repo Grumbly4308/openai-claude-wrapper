@@ -77,12 +77,24 @@ SUPPORTED_MODELS: tuple[str, ...] = (
 )
 
 
-# Reasoning-effort levels accepted by `claude --effort`. The wrapper advertises
-# one model variant per level for every effort-capable (Opus) model, e.g.
-# "claude-opus-4-8 (max)", so clients can switch effort from a model dropdown.
+# Reasoning-effort levels accepted by `claude --effort`.
 EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
-_EFFORT_LEVEL_SET = frozenset(EFFORT_LEVELS)
+# "ultracode" is exposed as an effort choice too, but it is NOT a `--effort`
+# value — the CLI ignores it and falls back to the default effort. It is
+# requested via `--settings '{"ultracode": true}'` instead, which the CLI
+# resolves to xhigh effort plus ultracode's dynamic-workflow orchestration
+# opt-in (the exact behavior is the CLI's to decide). The runner special-cases
+# it when building argv (see claude_runner._build_argv).
+ULTRACODE_EFFORT = "ultracode"
+
+# Every effort token a client may select. The wrapper advertises one model
+# variant per choice for each effort-capable (Opus) model, e.g.
+# "claude-opus-4-8 (max)" / "claude-opus-4-8 (ultracode)", so clients can
+# switch effort straight from a model dropdown.
+EFFORT_CHOICES: tuple[str, ...] = EFFORT_LEVELS + (ULTRACODE_EFFORT,)
+
+_EFFORT_CHOICE_SET = frozenset(EFFORT_CHOICES)
 
 
 def is_effort_capable(model: str) -> bool:
@@ -92,29 +104,29 @@ def is_effort_capable(model: str) -> bool:
 
 
 def advertised_models() -> list[str]:
-    """SUPPORTED_MODELS plus one '<model> (<level>)' variant per effort level
+    """SUPPORTED_MODELS plus one '<model> (<choice>)' variant per effort choice
     for each effort-capable model. This is what /v1/models exposes."""
     out: list[str] = []
     for base in SUPPORTED_MODELS:
         out.append(base)
         if is_effort_capable(base):
-            out.extend(f"{base} ({lvl})" for lvl in EFFORT_LEVELS)
+            out.extend(f"{base} ({lvl})" for lvl in EFFORT_CHOICES)
     return out
 
 
 def split_model_effort(model: str) -> tuple[str, str | None]:
     """Split an advertised model id into (base_model, effort).
 
-    Accepts the '<base> (<level>)' form shown in /v1/models and a '<base>:<level>'
+    Accepts the '<base> (<choice>)' form shown in /v1/models and a '<base>:<choice>'
     shorthand. Returns (model, None) when no recognized effort suffix is present,
     so plain model ids keep using the server-default effort.
     """
     m = (model or "").strip()
     paren = re.match(r"^(?P<base>.+?)\s*\((?P<lvl>[A-Za-z]+)\)\s*$", m)
-    if paren and paren.group("lvl").lower() in _EFFORT_LEVEL_SET:
+    if paren and paren.group("lvl").lower() in _EFFORT_CHOICE_SET:
         return paren.group("base").strip(), paren.group("lvl").lower()
     if ":" in m:
         base, _, lvl = m.rpartition(":")
-        if base.strip() and lvl.strip().lower() in _EFFORT_LEVEL_SET:
+        if base.strip() and lvl.strip().lower() in _EFFORT_CHOICE_SET:
             return base.strip(), lvl.strip().lower()
     return m, None

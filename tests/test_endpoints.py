@@ -32,7 +32,7 @@ TINY_PNG = base64.b64decode(
 )
 
 
-async def _stub_run_collect(self, prompt, session_key, model=None, env_extra=None, extra_args=None):
+async def _stub_run_collect(self, prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None):
     cwd = self.workspace_root / session_key
     (cwd / "outputs").mkdir(parents=True, exist_ok=True)
     text = "ok"
@@ -72,7 +72,7 @@ async def _stub_run_collect(self, prompt, session_key, model=None, env_extra=Non
     )
 
 
-async def _stub_run_stream(self, prompt, session_key, model=None, env_extra=None, extra_args=None):
+async def _stub_run_stream(self, prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None):
     yield StreamEvent(kind="text", text="hello ")
     yield StreamEvent(kind="text", text="stream")
     yield StreamEvent(

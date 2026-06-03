@@ -42,9 +42,11 @@ services:
 
       CLAUDE_WRAPPER_DEFAULT_MODEL: "${CLAUDE_WRAPPER_DEFAULT_MODEL:-claude-opus-4-8}"
 
-      # Reasoning effort forwarded to every `claude` invocation as
-      # `--effort <level>`: low | medium | high | xhigh | max. Applies to
-      # Opus 4.5+ models. Leave blank to use the CLI's own default.
+      # Reasoning effort forwarded to every `claude` invocation: low | medium |
+      # high | xhigh | max are passed as `--effort <level>`. "ultracode" is also
+      # accepted — it is not a --effort value but requests xhigh effort plus
+      # ultracode's dynamic-workflow orchestration opt-in via `--settings`.
+      # Applies to Opus 4.5+ models. Leave blank to use the CLI's own default.
       CLAUDE_WRAPPER_EFFORT: "${CLAUDE_WRAPPER_EFFORT:-max}"
       CLAUDE_WRAPPER_MAX_UPLOAD_BYTES: "${CLAUDE_WRAPPER_MAX_UPLOAD_BYTES:-2147483648}"
       CLAUDE_WRAPPER_REQUEST_TIMEOUT: "${CLAUDE_WRAPPER_REQUEST_TIMEOUT:-1800}"

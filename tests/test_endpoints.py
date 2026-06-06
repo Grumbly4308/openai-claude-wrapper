@@ -153,6 +153,55 @@ def test_chat_completion_stream() -> None:
     check("chat.completions.stream", has_done and len(chunks) >= 2)
 
 
+def test_chat_completion_stream_heartbeat() -> None:
+    """A slow runner with no early text must still emit keep-alive comments,
+    and thinking must arrive on the reasoning channel, not in answer content."""
+    import asyncio as _asyncio
+
+    import src.main as _main
+
+    async def _slow_run_stream(self, prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None):
+        await _asyncio.sleep(0.15)  # silent "thinking" gap — should trigger heartbeats
+        yield StreamEvent(kind="thinking", text="pondering")
+        yield StreamEvent(kind="text", text="answer")
+        yield StreamEvent(
+            kind="final",
+            text="answer",
+            raw={"stop_reason": "stop", "new_outputs": [], "session_uuid": "stub"},
+        )
+
+    orig_run_stream = ClaudeRunner.run_stream
+    orig_hb = _main._STREAM_HEARTBEAT_SECONDS
+    ClaudeRunner.run_stream = _slow_run_stream
+    _main._STREAM_HEARTBEAT_SECONDS = 0.05
+    try:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ) as r:
+            raw = r.read().decode()
+    finally:
+        ClaudeRunner.run_stream = orig_run_stream
+        _main._STREAM_HEARTBEAT_SECONDS = orig_hb
+
+    has_heartbeat = ": keep-alive" in raw
+    has_reasoning = '"reasoning_content":"pondering"' in raw
+    has_answer = '"content":"answer"' in raw
+    has_done = "[DONE]" in raw
+    # Thinking must NOT leak into answer content.
+    no_thinking_in_content = '"content":"pondering"' not in raw
+    check(
+        "chat.completions.stream.heartbeat",
+        has_heartbeat and has_reasoning and has_answer and has_done and no_thinking_in_content,
+        note=f"hb={has_heartbeat} reason={has_reasoning} ans={has_answer} done={has_done} clean={no_thinking_in_content}",
+    )
+
+
 def test_legacy_completions() -> None:
     r = client.post(
         "/v1/completions",
@@ -461,6 +510,7 @@ def main() -> int:
         test_models,
         test_chat_completion,
         test_chat_completion_stream,
+        test_chat_completion_stream_heartbeat,
         test_legacy_completions,
         test_responses_api,
         test_embeddings,

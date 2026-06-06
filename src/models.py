@@ -116,6 +116,10 @@ class ChatCompletionResponse(BaseModel):
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    # Reasoning is streamed on its own channel so it renders as a collapsible
+    # "thinking" block (OpenWebUI et al.) instead of being concatenated into the
+    # answer. Clients that don't understand the field simply ignore it.
+    reasoning_content: Optional[str] = None
 
 
 class ChatCompletionChunkChoice(BaseModel):

@@ -61,10 +61,13 @@ services:
     volumes:
       # Uploads, generated outputs, per-session workspaces, session id map.
       - claude-data:/data
+      # Host-side drop folder. Put files here on the host; reference them
+      # in chat as /data/inbox/<file> so Claude reads the real bytes
+      # instead of OWU's text extraction. Read-only by default.
+      - /home/vbox/inbox:/data/inbox:ro
       # Claude Code's own state — credentials live here, so this is the
       # volume that makes `compose run … login` survive restarts.
       - claude-home:/home/claude/.claude
-      - /root/inbox:/data/inbox:ro     # add this
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CLAUDE_WRAPPER_PORT:-8000}/healthz"]
       interval: 30s

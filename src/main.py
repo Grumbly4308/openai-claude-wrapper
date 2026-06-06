@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import mimetypes
+import os
 import time
 import uuid
 from pathlib import Path
@@ -57,6 +58,16 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 log = logging.getLogger("claude_wrapper.api")
+
+# How often to emit an SSE keep-alive comment while the runner is producing no
+# visible output (extended thinking, tool/subagent work). Long reasoning phases
+# — common with xhigh/ultracode effort and the 1M-context models — can run for
+# many minutes before the first assistant text. Without bytes on the wire, an
+# idle-timeout proxy or the client's own read timeout severs the chunked
+# response mid-stream, which surfaces to the client as a truncated/incomplete
+# payload. Comment lines (": ...\n\n") are ignored by OpenAI-compatible SSE
+# parsers but keep every idle timer in the path from firing.
+_STREAM_HEARTBEAT_SECONDS = float(os.environ.get("CLAUDE_WRAPPER_SSE_HEARTBEAT", "15"))
 
 
 app = FastAPI(title="Claude Code OpenAI Wrapper", version="0.1.0")
@@ -291,10 +302,49 @@ async def _stream_response(
     new_outputs: list[str] = []
     errored: Optional[str] = None
 
+    # Pump runner events through a queue so we can interleave keep-alive
+    # heartbeats. The producer task owns the run_stream generator — and thus the
+    # Claude subprocess and the session lock — while the consumer below only
+    # reads the queue. This decoupling is deliberate: wrapping the generator's
+    # __anext__ in asyncio.wait_for() would, on every heartbeat timeout, cancel
+    # the await *inside* run_stream, killing the subprocess and releasing the
+    # lock mid-run. With a queue, a quiet stretch only times out queue.get().
+    queue: asyncio.Queue = asyncio.Queue()
+    _DONE = object()
+
+    async def _pump() -> None:
+        try:
+            async for evt in RUNNER.run_stream(
+                prompt=prompt, session_key=session_key, model=run_model, effort=effort
+            ):
+                await queue.put(evt)
+        except Exception as e:  # pragma: no cover - defensive
+            await queue.put(e)
+        finally:
+            await queue.put(_DONE)
+
+    producer = asyncio.create_task(_pump())
+
     try:
-        async for evt in RUNNER.run_stream(
-            prompt=prompt, session_key=session_key, model=run_model, effort=effort
-        ):
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=_STREAM_HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                # No event for a while — Claude is thinking or running tools.
+                # Keep the connection warm so idle-timeout proxies (and the
+                # client's own read timeout) don't sever a stream that simply
+                # hasn't produced visible text yet.
+                yield b": keep-alive\n\n"
+                continue
+
+            if item is _DONE:
+                break
+            if isinstance(item, Exception):
+                errored = str(item)
+                finish_reason = "stop"
+                continue
+
+            evt = item
             if evt.kind == "text" and evt.text:
                 chunk = ChatCompletionChunk(
                     id=chunk_id,
@@ -309,6 +359,23 @@ async def _stream_response(
                     ],
                 )
                 yield _sse_chunk(chunk)
+            elif evt.kind == "thinking" and evt.text:
+                # Stream reasoning on its own channel: gives live progress during
+                # long think phases and doubles as real byte flow, while keeping
+                # the answer content clean.
+                chunk = ChatCompletionChunk(
+                    id=chunk_id,
+                    created=created,
+                    model=model,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            index=0,
+                            delta=DeltaMessage(reasoning_content=evt.text),
+                            finish_reason=None,
+                        )
+                    ],
+                )
+                yield _sse_chunk(chunk)
             elif evt.kind == "final":
                 meta = evt.raw or {}
                 finish_reason = meta.get("stop_reason") or "stop"
@@ -317,9 +384,15 @@ async def _stream_response(
                     errored = str(meta["error"])
             elif evt.kind == "error":
                 errored = evt.text or errored
-    except Exception as e:  # pragma: no cover - defensive
-        errored = str(e)
-        finish_reason = "stop"
+    finally:
+        # On early exit — a client disconnect propagates CancelledError into
+        # this generator — cancel the pump so run_stream tears down the
+        # subprocess and releases the session lock. After a normal drain the
+        # task is already finished and this is a no-op.
+        if not producer.done():
+            producer.cancel()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await producer
 
     attachments = await _register_generated_files(
         paths=[Path(p) for p in new_outputs],

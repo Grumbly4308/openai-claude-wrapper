@@ -155,6 +155,24 @@ class ClaudeRunner:
                 new.append(p)
         return sorted(new)
 
+    def _resolve_effort(self, model: Optional[str], effort: Optional[str]) -> tuple[str, str]:
+        """Resolve the effort actually applied to a run, plus where it came from.
+
+        An explicit per-request value wins (including "", meaning "no flag");
+        otherwise we fall back to the server default (CLAUDE_WRAPPER_EFFORT).
+        Effort — and the ultracode settings overlay — only apply to effort-capable
+        (Opus) models, so it's dropped for other families which ignore/reject it.
+        Returns (effective_effort, source) where source is one of:
+        "request" | "server-default" | "model-incapable".
+        """
+        if effort is not None:
+            eff, source = effort, "request"
+        else:
+            eff, source = self.effort, "server-default"
+        if not is_effort_capable(model or ""):
+            return "", "model-incapable"
+        return eff, source
+
     def _build_argv(
         self,
         session_uuid: str,
@@ -177,16 +195,7 @@ class ClaudeRunner:
             argv += ["--session-id", session_uuid]
         if model:
             argv += ["--model", model]
-        # Resolve this call's effort: an explicit value wins (including "",
-        # which means "no effort flag"); otherwise fall back to the server
-        # default. Effort — and the ultracode settings overlay — only apply to
-        # effort-capable (Opus) models, so drop it for other families, which
-        # ignore or reject the flag. Gating here (not only on the default path)
-        # means a hand-crafted "claude-sonnet-4-6:max" never emits a flag the
-        # CLI would silently ignore.
-        eff = effort if effort is not None else self.effort
-        if not is_effort_capable(model or ""):
-            eff = ""
+        eff, _src = self._resolve_effort(model, effort)
         if eff == ULTRACODE_EFFORT:
             # "ultracode" is not a --effort value (the CLI ignores it and falls
             # back to default effort). It is requested via settings instead,
@@ -234,7 +243,16 @@ class ClaudeRunner:
             if env_extra:
                 env.update(env_extra)
 
-            log.info("launching claude session_key=%s uuid=%s resume=%s", session_key, session_uuid, not created)
+            eff_applied, eff_source = self._resolve_effort(model, effort)
+            log.info(
+                "launching claude session_key=%s uuid=%s resume=%s model=%s effort=%s (%s)",
+                session_key,
+                session_uuid,
+                not created,
+                model,
+                eff_applied or "cli-default",
+                eff_source,
+            )
 
             proc = await asyncio.create_subprocess_exec(
                 *argv,

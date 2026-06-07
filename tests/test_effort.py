@@ -114,8 +114,25 @@ def test_argv_noncapable_drops_effort() -> None:
         check(f"argv.noncapable.{eff}.no_settings", "--settings" not in argv)
 
 
+def test_resolve_effort_source() -> None:
+    # Server default applies when the request carries no effort suffix — this is
+    # exactly the "bare model ran at max" case. The source label makes it visible.
+    r = ClaudeRunner(
+        registry=SessionRegistry(Path(_TMP) / "sessions-re"),
+        workspace_root=Path(_TMP) / "workspace-re",
+        claude_bin="claude",
+        effort="max",
+    )
+    check("resolve.default", r._resolve_effort("claude-opus-4-8", None) == ("max", "server-default"))
+    check("resolve.request", r._resolve_effort("claude-opus-4-8", "low") == ("low", "request"))
+    check("resolve.ultracode", r._resolve_effort("claude-opus-4-8", "ultracode") == ("ultracode", "request"))
+    check("resolve.incapable", r._resolve_effort("claude-sonnet-4-6", "max") == ("", "model-incapable"))
+    check("resolve.explicit_empty", r._resolve_effort("claude-opus-4-8", "") == ("", "request"))
+
+
 def main() -> int:
     tests = [
+        test_resolve_effort_source,
         test_ultracode_advertised_for_opus,
         test_ultracode_not_advertised_for_nonopus,
         test_split_ultracode,

@@ -52,6 +52,19 @@ services:
       CLAUDE_WRAPPER_REQUEST_TIMEOUT: "${CLAUDE_WRAPPER_REQUEST_TIMEOUT:-1800}"
       CLAUDE_WRAPPER_WORKERS: "${CLAUDE_WRAPPER_WORKERS:-1}"
 
+      # Per-conversation token cap. Each conversation may spend
+      # ALLOWANCE x PERCENT tokens before the wrapper pauses with a checkpoint
+      # message; reply with a continue keyword to grant another block, or start
+      # a new chat to reset. ON by default at the Max 5x ($100) plan. Set the
+      # allowance by plan (pro | max 5x | max 20x — an estimate scaled from
+      # PRO_SESSION_TOKENS) or directly via SESSION_TOKEN_ALLOWANCE (which wins).
+      # Set the plan to "off" to disable the cap.
+      CLAUDE_WRAPPER_SESSION_PLAN: "${CLAUDE_WRAPPER_SESSION_PLAN:-max 5x}"
+      CLAUDE_WRAPPER_PRO_SESSION_TOKENS: "${CLAUDE_WRAPPER_PRO_SESSION_TOKENS:-1500000}"
+      CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE: "${CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE:-0}"
+      CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT: "${CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT:-5}"
+      CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD: "${CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD:-continue,proceed,keep going,go on,yes}"
+
       # When set, the wrapper injects a system-prompt addendum telling
       # Claude how to query OpenWebUI's retrieval API. The api key passes
       # through to Claude's Bash tool via env, never into the prompt.

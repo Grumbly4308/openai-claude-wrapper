@@ -344,6 +344,70 @@ To pin a session explicitly pass `session_id` in the request body:
 
 The response body echoes `session_id` so clients can round-trip it.
 
+## Per-conversation usage cap (usage checkpoint)
+
+Every request spends your Anthropic session/subscription quota, and a single
+long conversation — especially at `max`/`ultracode` effort — can eat a large
+slice of it with no warning. The wrapper can cap that **per conversation** and
+ask before spending more.
+
+**The cap is ON by default at the Max 5× ($100) plan** (allowance 7,500,000,
+checkpoint every 375,000 tokens). Override it **by plan**, **by an explicit
+number**, or turn it **off**:
+
+```bash
+# (a) By subscription plan — pro | max 5x ($100) | max 20x ($200)  [default: max 5x]
+CLAUDE_WRAPPER_SESSION_PLAN="max 5x"
+CLAUDE_WRAPPER_PRO_SESSION_TOKENS=1500000        # Pro anchor; Max scales 5x/20x from it
+
+# (b) Or set the allowance directly (this wins over the plan)
+CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE=0         # one "session's worth" of tokens (0 = use plan)
+
+# Disable entirely:
+CLAUDE_WRAPPER_SESSION_PLAN=off
+
+CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT=5            # block = 5% of the allowance
+CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD=continue,proceed,keep going,go on,yes
+```
+
+> ⚠️ **The per-plan token figures are estimates.** Anthropic does not publish a
+> token number for the Pro/Max *session* windows, and the wrapper can't query it
+> (the subscription quota is exposed nowhere in the API — see below). What's
+> defined is the *relationship*: Max is "5×" ($100) and "20×" ($200) of Pro. So
+> the plan setting anchors on `CLAUDE_WRAPPER_PRO_SESSION_TOKENS` and scales from
+> there. The default anchor (1,500,000) is **calibrated from real usage** — a
+> heavy ~2h Claude Code session measured ~1.54M billable tokens (input +
+> cache-creation + output, excluding near-free cache reads), which the operator
+> reported as 21% of a Max-5× window → ~7.5M per window → ~1.5M Pro anchor. Tune
+> it to your own usage; the cap is a safety checkpoint, not an exact mirror of
+> Anthropic's accounting. On startup the wrapper logs the resolved `plan` /
+> `allowance` / `block` so you can confirm.
+
+| Plan setting | Multiplier | Allowance (default anchor 1.5M) | Block @ 5% |
+|---|---|---|---|
+| `pro` / `pro $20` | 1× | 1,500,000 | 75,000 |
+| `max 5x` / `max $100` **(default)** | 5× | 7,500,000 | 375,000 |
+| `max 20x` / `max $200` | 20× | 30,000,000 | 1,500,000 |
+| `off` / `none` | — | disabled | — |
+
+How it works:
+
+- The wrapper tracks tokens (input + output) spent by each conversation.
+- A **block** is `allowance × percent` (e.g. 1,000,000 × 5% = 50,000 tokens).
+  Each conversation starts with one block of headroom.
+- Once a conversation has spent its current block, the **next** request doesn't
+  call Claude — it returns a checkpoint message:
+  > ⏸️ **Usage checkpoint.** This conversation has used **52,000 tokens**,
+  > reaching its **50,000-token** budget block (5% of the configured session
+  > allowance). Reply **continue** to allow another block, or start a new chat
+  > to reset.
+- Replying with a continue keyword grants one more block and proceeds. Starting
+  a **new chat** (new session) begins with a fresh budget.
+
+Because the check happens before Claude is spawned, a paused conversation costs
+nothing until you confirm. The cap ships **enabled** at the Max 5× plan; set
+`CLAUDE_WRAPPER_SESSION_PLAN=off` to disable it.
+
 ## Concurrency
 
 - FastAPI + uvicorn serve requests async. Different sessions execute

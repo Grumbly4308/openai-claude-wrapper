@@ -287,6 +287,7 @@ async def _sync_response(
             total_tokens=result.input_tokens + result.output_tokens,
         ),
         session_id=session_key,
+        effort=_effort_info(run_model, effort),
     )
     return JSONResponse(content=response.model_dump(exclude_none=True))
 
@@ -313,6 +314,7 @@ async def _stream_response(
             )
         ],
         session_id=session_key,
+        effort=_effort_info(run_model, effort),
     )
     yield _sse_chunk(first_chunk)
 
@@ -460,6 +462,16 @@ async def _stream_response(
 
 def _sse_chunk(chunk: ChatCompletionChunk) -> bytes:
     return f"data: {chunk.model_dump_json(exclude_none=True)}\n\n".encode("utf-8")
+
+
+def _effort_info(run_model: str, requested_effort: Optional[str]) -> dict:
+    """Resolved effort for the response: what was applied, and its origin.
+
+    Mirrors the per-request launch log so clients can confirm an effort choice
+    took effect rather than silently falling back to the server default.
+    """
+    applied, source = RUNNER._resolve_effort(run_model, requested_effort)
+    return {"applied": applied or "cli-default", "source": source, "requested": requested_effort}
 
 
 # ---------- per-conversation budget gating ----------

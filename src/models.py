@@ -108,6 +108,10 @@ class ChatCompletionResponse(BaseModel):
     choices: list[ChatCompletionChoice]
     usage: Usage = Field(default_factory=Usage)
     session_id: Optional[str] = None
+    # Non-standard: the reasoning effort actually applied to this run and where
+    # it came from, e.g. {"applied": "medium", "source": "server-default",
+    # "requested": null}. Lets clients confirm effort selection took effect.
+    effort: Optional[dict[str, Any]] = None
 
 
 # ---------- Streaming chunks ----------
@@ -135,6 +139,9 @@ class ChatCompletionChunk(BaseModel):
     model: str
     choices: list[ChatCompletionChunkChoice]
     session_id: Optional[str] = None
+    # Non-standard: resolved reasoning effort (emitted on the first chunk only),
+    # same shape as ChatCompletionResponse.effort.
+    effort: Optional[dict[str, Any]] = None
 
 
 # ---------- Models list ----------

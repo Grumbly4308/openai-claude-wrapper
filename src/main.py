@@ -28,19 +28,21 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .config import SETTINGS, SUPPORTED_MODELS, advertised_models, split_model_effort
 from .converters import derive_session_id
-from .deps import FILE_STORE, PREPARER, RUNNER, auth_dependency
+from .deps import FILE_STORE, PREPARER, RUNNER, USAGE_LEDGER, auth_dependency
 from .models import (
     ChatCompletionChoice,
     ChatCompletionChunk,
     ChatCompletionChunkChoice,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatMessage,
     ChoiceMessage,
     DeltaMessage,
     ModelInfo,
     ModelList,
     Usage,
 )
+from .usage import UsageState
 from .routes_assistants import router as assistants_router
 from .routes_audio import router as audio_router
 from .routes_batches import router as batches_router
@@ -193,6 +195,19 @@ async def run_chat_completion(req: ChatCompletionRequest):
     """Shared implementation reused by /v1/chat/completions, /v1/completions,
     /v1/responses, and the batches worker."""
     session_key = derive_session_id(req.messages, req.session_id, req.user)
+
+    # Per-conversation token budget. If this conversation has already spent its
+    # current allowance, pause *before* spawning Claude and ask the user to
+    # confirm — unless their latest message is a "continue", which buys one more
+    # block. Disabled (no-op) unless a session token allowance is configured.
+    if USAGE_LEDGER.enabled:
+        state = await USAGE_LEDGER.snapshot(session_key)
+        if state.over_budget:
+            if _is_continue(req.messages):
+                await USAGE_LEDGER.grant(session_key)
+            else:
+                return _budget_pause(req, session_key, state)
+
     prompt, _attachments = await PREPARER.prepare_messages(req.messages, session_key)
     model = req.model if req.model and req.model != "auto" else SETTINGS.default_model
 
@@ -231,6 +246,9 @@ async def _sync_response(
 
     if result.error and not result.final_text:
         raise HTTPException(status_code=502, detail=f"claude failed: {result.error}")
+
+    if USAGE_LEDGER.enabled:
+        await USAGE_LEDGER.record(session_key, result.input_tokens + result.output_tokens)
 
     new_outputs: list[str] = []
     for evt in result.events:
@@ -301,6 +319,7 @@ async def _stream_response(
     finish_reason: Optional[str] = None
     new_outputs: list[str] = []
     errored: Optional[str] = None
+    usage_tokens = 0
 
     # Pump runner events through a queue so we can interleave keep-alive
     # heartbeats. The producer task owns the run_stream generator — and thus the
@@ -380,6 +399,7 @@ async def _stream_response(
                 meta = evt.raw or {}
                 finish_reason = meta.get("stop_reason") or "stop"
                 new_outputs = list(meta.get("new_outputs") or [])
+                usage_tokens = int(meta.get("input_tokens") or 0) + int(meta.get("output_tokens") or 0)
                 if meta.get("error"):
                     errored = str(meta["error"])
             elif evt.kind == "error":
@@ -393,6 +413,9 @@ async def _stream_response(
             producer.cancel()
         with contextlib.suppress(Exception, asyncio.CancelledError):
             await producer
+
+    if USAGE_LEDGER.enabled:
+        await USAGE_LEDGER.record(session_key, usage_tokens)
 
     attachments = await _register_generated_files(
         paths=[Path(p) for p in new_outputs],
@@ -437,6 +460,120 @@ async def _stream_response(
 
 def _sse_chunk(chunk: ChatCompletionChunk) -> bytes:
     return f"data: {chunk.model_dump_json(exclude_none=True)}\n\n".encode("utf-8")
+
+
+# ---------- per-conversation budget gating ----------
+
+
+def _last_user_text(messages: list[ChatMessage]) -> str:
+    """Flatten the most recent user message to plain text.
+
+    Content may be a bare string or a list of content parts (multimodal); we pull
+    text from whichever shape it is and ignore non-text parts.
+    """
+    for msg in reversed(messages):
+        if msg.role != "user":
+            continue
+        content = msg.content
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        parts = [getattr(p, "text", "") for p in content if getattr(p, "text", "")]
+        return "\n".join(parts)
+    return ""
+
+
+def _normalize_keyword(s: str) -> str:
+    return s.strip().lower().strip(".!?,;:'\"() \t\r\n")
+
+
+def _is_continue(messages: list[ChatMessage]) -> bool:
+    """Whether the latest user message is a 'continue' confirmation.
+
+    Matches a configured keyword as the whole message or as a leading/trailing
+    word, so "continue", "yes, continue", and "continue please" all resume.
+    """
+    text = _normalize_keyword(_last_user_text(messages))
+    if not text:
+        return False
+    for kw in SETTINGS.budget_continue_keywords:
+        if text == kw or text.startswith(kw + " ") or text.endswith(" " + kw):
+            return True
+    return False
+
+
+def _budget_message(state: UsageState) -> str:
+    pct = f"{SETTINGS.session_block_percent:g}"
+    return (
+        f"⏸️ **Usage checkpoint.** This conversation has used "
+        f"**{state.spent_tokens:,} tokens**, reaching its **{state.block_tokens:,}-token** "
+        f"budget block ({pct}% of the configured session allowance). "
+        f"Reply **continue** to allow another block, or start a new chat to reset."
+    )
+
+
+def _budget_pause(req: ChatCompletionRequest, session_key: str, state: UsageState):
+    """Return a checkpoint message in the request's shape without running Claude."""
+    text = _budget_message(state)
+    if req.stream:
+        return StreamingResponse(
+            _budget_pause_stream(req, session_key, text),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    response = ChatCompletionResponse(
+        id=f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        created=int(time.time()),
+        model=req.model,
+        choices=[
+            ChatCompletionChoice(
+                index=0,
+                message=ChoiceMessage(role="assistant", content=text),
+                finish_reason="stop",
+            )
+        ],
+        usage=Usage(),
+        session_id=session_key,
+    )
+    return JSONResponse(content=response.model_dump(exclude_none=True))
+
+
+async def _budget_pause_stream(
+    req: ChatCompletionRequest, session_key: str, text: str
+) -> AsyncIterator[bytes]:
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+    yield _sse_chunk(
+        ChatCompletionChunk(
+            id=chunk_id,
+            created=created,
+            model=req.model,
+            choices=[
+                ChatCompletionChunkChoice(
+                    index=0,
+                    delta=DeltaMessage(role="assistant", content=text),
+                    finish_reason=None,
+                )
+            ],
+            session_id=session_key,
+        )
+    )
+    yield _sse_chunk(
+        ChatCompletionChunk(
+            id=chunk_id,
+            created=created,
+            model=req.model,
+            choices=[
+                ChatCompletionChunkChoice(index=0, delta=DeltaMessage(), finish_reason="stop")
+            ],
+        )
+    )
+    yield b"data: [DONE]\n\n"
 
 
 # ---------- generated-file handling ----------

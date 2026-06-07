@@ -47,7 +47,7 @@ services:
       # accepted — it is not a --effort value but requests xhigh effort plus
       # ultracode's dynamic-workflow orchestration opt-in via `--settings`.
       # Applies to Opus 4.5+ models. Leave blank to use the CLI's own default.
-      CLAUDE_WRAPPER_EFFORT: "${CLAUDE_WRAPPER_EFFORT:-max}"
+      CLAUDE_WRAPPER_EFFORT: "${CLAUDE_WRAPPER_EFFORT:-medium}"
       CLAUDE_WRAPPER_MAX_UPLOAD_BYTES: "${CLAUDE_WRAPPER_MAX_UPLOAD_BYTES:-2147483648}"
       CLAUDE_WRAPPER_REQUEST_TIMEOUT: "${CLAUDE_WRAPPER_REQUEST_TIMEOUT:-1800}"
       CLAUDE_WRAPPER_WORKERS: "${CLAUDE_WRAPPER_WORKERS:-1}"

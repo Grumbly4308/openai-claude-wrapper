@@ -138,6 +138,47 @@ def test_chat_completion() -> None:
     check("chat.completions", r.status_code == 200 and r.json()["choices"][0]["message"]["content"])
 
 
+def test_chat_completion_effort_surfaced() -> None:
+    # Non-stream: an explicit Opus variant is echoed back as applied/request.
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "claude-opus-4-8 (high)", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    eff = r.json().get("effort")
+    check(
+        "chat.effort.sync",
+        bool(eff) and eff["applied"] == "high" and eff["source"] == "request",
+        note=str(eff),
+    )
+
+    # Bare model falls back to the server default (source != request).
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "claude-opus-4-8", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    eff = r.json().get("effort")
+    check("chat.effort.default_source", bool(eff) and eff["source"] == "server-default", note=str(eff))
+
+    # Streaming: the first chunk carries the resolved effort.
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "claude-opus-4-8 (ultracode)",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    ) as r:
+        chunks = [ln for ln in r.iter_lines() if ln]
+    effort_chunk = next((c for c in chunks if c.startswith("data: ") and '"effort"' in c), None)
+    eff = json.loads(effort_chunk[6:]).get("effort") if effort_chunk else None
+    check(
+        "chat.effort.stream",
+        bool(eff) and eff["applied"] == "ultracode" and eff["source"] == "request",
+        note=str(eff),
+    )
+
+
 def test_chat_completion_stream() -> None:
     with client.stream(
         "POST",
@@ -509,6 +550,7 @@ def main() -> int:
         test_health,
         test_models,
         test_chat_completion,
+        test_chat_completion_effort_surfaced,
         test_chat_completion_stream,
         test_chat_completion_stream_heartbeat,
         test_legacy_completions,

@@ -233,6 +233,10 @@ _SONNET_EFFORT_MIN = (4, 6)
 # snapshot ("claude-opus-4-20250514") isn't misread as version (4, 20).
 _MODEL_FAMILY_RE = re.compile(r"^claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})(?!\d)")
 
+# Codename families (fable/mythos) carry a single version, e.g. claude-fable-5,
+# and are treated as Opus-tier for effort (full ladder + ultracode).
+_CODENAME_RE = re.compile(r"^claude-(fable|mythos)-(\d{1,2})(?!\d)")
+
 
 def _family_version(model: str) -> tuple[str | None, tuple[int, int] | None]:
     """Parse (family, (major, minor)) from a model id; (None, None) if unparseable.
@@ -249,17 +253,20 @@ def _family_version(model: str) -> tuple[str | None, tuple[int, int] | None]:
 def effort_choices_for(model: str) -> tuple[str, ...]:
     """Effort choices a given model accepts, by the family rule.
 
-    Opus 4.5+: low/medium/high/xhigh/max + ultracode. Sonnet 4.6+:
-    low/medium/high/xhigh (no max, no ultracode). Haiku, older Opus/Sonnet, and
-    anything unrecognized: none.
+    Opus 4.5+ and the codename families (fable/mythos): low/medium/high/xhigh/max
+    + ultracode. Sonnet 4.6+: low/medium/high/xhigh (no max, no ultracode).
+    Haiku, older Opus/Sonnet, and anything unrecognized: none.
     """
     fam, ver = _family_version(model)
-    if ver is None:
+    if ver is not None:
+        if fam == "opus" and ver >= _OPUS_EFFORT_MIN:
+            return EFFORT_CHOICES
+        if fam == "sonnet" and ver >= _SONNET_EFFORT_MIN:
+            return _SONNET_EFFORT_LEVELS
         return ()
-    if fam == "opus" and ver >= _OPUS_EFFORT_MIN:
+    # Codename families (fable/mythos) are Opus-tier: full ladder + ultracode.
+    if _CODENAME_RE.match(model or ""):
         return EFFORT_CHOICES
-    if fam == "sonnet" and ver >= _SONNET_EFFORT_MIN:
-        return _SONNET_EFFORT_LEVELS
     return ()
 
 

@@ -5,9 +5,11 @@ and the on-disk option caches are empty unless a 3P provider populates them. The
 one place the full set lives is the CLI binary itself: a ~250 MB bundled
 executable whose embedded JS contains every model id it understands.
 
-We scan that binary once at startup, keep only the canonical
-``<family>-<major>-<minor>`` ids (optionally the ``[1m]`` long-context variant),
-and hand the result to ``config.supported_models()``. The bundle also contains
+We scan that binary once at startup, keep only the canonical model ids — the
+versioned families (``<opus|sonnet|haiku>-<major>-<minor>``) and the single-
+version codename families (``<fable|mythos>-<n>``), optionally with the ``[1m]``
+long-context variant — and hand the result to ``config.supported_models()``.
+The bundle also contains
 dated snapshots (``…-20251101``), internal routing ids (``…-v1``), deployment
 ids (``…-fast``), dotted aliases (``sonnet-4.6``), and bare family aliases
 (``claude-opus-4``) — all of which we drop here.
@@ -27,12 +29,17 @@ log = logging.getLogger("claude_wrapper.models")
 
 # Broad matcher for any claude-* model token embedded in the bundle. Deliberately
 # permissive (dates, suffixes, [1m], dotted) — narrowing happens in filter_canonical.
-_MODEL_TOKEN = re.compile(rb"claude-(?:opus|sonnet|haiku)-[0-9][0-9a-z.\-]*(?:\[1m\])?")
+_MODEL_TOKEN = re.compile(
+    rb"claude-(?:opus|sonnet|haiku|fable|mythos)-[0-9][0-9a-z.\-]*(?:\[1m\])?"
+)
 
-# Keep only canonical "<family>-<major>-<minor>" ids (optionally the [1m]
-# variant). Minor is bounded to 1-2 digits so an 8-digit dated snapshot like
-# "claude-opus-4-20250514" (date read as a "minor") doesn't slip through.
+# Versioned families carry "<major>-<minor>", e.g. claude-opus-4-8. Minor is
+# bounded to 1-2 digits so an 8-digit dated snapshot like "claude-opus-4-20250514"
+# (date read as a "minor") doesn't slip through.
 _CANONICAL = re.compile(r"^claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})(\[1m\])?$")
+
+# Codename families carry a single version, e.g. claude-fable-5 / claude-mythos-5.
+_CODENAME = re.compile(r"^claude-(fable|mythos)-(\d{1,2})(\[1m\])?$")
 
 # Families below this major are retired (sonnet-3-7, haiku-3-5, opus-3, …).
 _MIN_MAJOR = 4
@@ -91,14 +98,15 @@ def filter_canonical(ids: set[str]) -> list[str]:
     """Reduce raw bundle tokens to the canonical, current-family ids we expose."""
     keep: list[str] = []
     for mid in ids:
-        m = _CANONICAL.match(mid)
-        if not m:
-            continue
-        if int(m.group(2)) < _MIN_MAJOR:
-            continue
         if mid.removesuffix("[1m]") in DEPRECATED_MODELS:
             continue
-        keep.append(mid)
+        m = _CANONICAL.match(mid)
+        if m:
+            if int(m.group(2)) < _MIN_MAJOR:
+                continue
+            keep.append(mid)
+        elif _CODENAME.match(mid):
+            keep.append(mid)
     return sorted(keep)
 
 

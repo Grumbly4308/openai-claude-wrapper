@@ -244,6 +244,44 @@ def test_chat_completion_stream_heartbeat() -> None:
     )
 
 
+def test_chat_completion_stream_terminates_on_post_loop_error() -> None:
+    """If post-stream bookkeeping raises after bytes are on the wire, the SSE
+    stream must STILL terminate with a clean error frame + [DONE] — never a
+    truncated chunked body (which aiohttp clients like Open WebUI surface as
+    'TransferEncodingError: Not enough data to satisfy transfer length header')."""
+    import src.main as _main
+
+    async def _boom(*a, **k):
+        raise OSError("simulated post-loop failure")
+
+    orig = _main._register_generated_files
+    _main._register_generated_files = _boom
+    try:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ) as r:
+            raw = r.read().decode()
+    finally:
+        _main._register_generated_files = orig
+
+    frames = [f for f in raw.strip().split("\n\n") if f]
+    ends_with_done = frames[-1].strip() == "data: [DONE]"
+    has_error_frame = any('"type": "upstream_error"' in f for f in frames)
+    # The streamed answer text must still have been delivered before the failure.
+    has_answer = '"content":"hello stream"' in raw or '"content":"stream"' in raw
+    check(
+        "chat.completions.stream.post_loop_error",
+        ends_with_done and has_error_frame and has_answer,
+        note=f"done={ends_with_done} error_frame={has_error_frame} answer={has_answer}",
+    )
+
+
 def test_legacy_completions() -> None:
     r = client.post(
         "/v1/completions",

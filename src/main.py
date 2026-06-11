@@ -354,116 +354,142 @@ async def _stream_response(
 
     producer = asyncio.create_task(_pump())
 
+    # Everything past the first chunk is wrapped so the SSE stream is ALWAYS
+    # terminated cleanly. Starlette only writes the chunked-encoding terminator
+    # if this generator runs to completion; if it raises after the first byte,
+    # the client receives a truncated body and aiohttp-based clients (Open WebUI)
+    # surface it as "TransferEncodingError: Not enough data to satisfy transfer
+    # length header". So any unexpected error here becomes a visible error chunk
+    # + [DONE] rather than a severed connection.
     try:
-        while True:
-            try:
-                item = await asyncio.wait_for(queue.get(), timeout=_STREAM_HEARTBEAT_SECONDS)
-            except asyncio.TimeoutError:
-                # No event for a while — Claude is thinking or running tools.
-                # Keep the connection warm so idle-timeout proxies (and the
-                # client's own read timeout) don't sever a stream that simply
-                # hasn't produced visible text yet.
-                yield b": keep-alive\n\n"
-                continue
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=_STREAM_HEARTBEAT_SECONDS)
+                except asyncio.TimeoutError:
+                    # No event for a while — Claude is thinking or running tools.
+                    # Keep the connection warm so idle-timeout proxies (and the
+                    # client's own read timeout) don't sever a stream that simply
+                    # hasn't produced visible text yet.
+                    yield b": keep-alive\n\n"
+                    continue
 
-            if item is _DONE:
-                break
-            if isinstance(item, Exception):
-                errored = str(item)
-                finish_reason = "stop"
-                continue
+                if item is _DONE:
+                    break
+                if isinstance(item, Exception):
+                    errored = str(item)
+                    finish_reason = "stop"
+                    continue
 
-            evt = item
-            if evt.kind == "text" and evt.text:
-                chunk = ChatCompletionChunk(
-                    id=chunk_id,
-                    created=created,
-                    model=model,
-                    choices=[
-                        ChatCompletionChunkChoice(
-                            index=0,
-                            delta=DeltaMessage(content=evt.text),
-                            finish_reason=None,
-                        )
-                    ],
-                )
-                yield _sse_chunk(chunk)
-            elif evt.kind == "thinking" and evt.text:
-                # Stream reasoning on its own channel: gives live progress during
-                # long think phases and doubles as real byte flow, while keeping
-                # the answer content clean.
-                chunk = ChatCompletionChunk(
-                    id=chunk_id,
-                    created=created,
-                    model=model,
-                    choices=[
-                        ChatCompletionChunkChoice(
-                            index=0,
-                            delta=DeltaMessage(reasoning_content=evt.text),
-                            finish_reason=None,
-                        )
-                    ],
-                )
-                yield _sse_chunk(chunk)
-            elif evt.kind == "final":
-                meta = evt.raw or {}
-                finish_reason = meta.get("stop_reason") or "stop"
-                new_outputs = list(meta.get("new_outputs") or [])
-                usage_tokens = int(meta.get("input_tokens") or 0) + int(meta.get("output_tokens") or 0)
-                if meta.get("error"):
-                    errored = str(meta["error"])
-            elif evt.kind == "error":
-                errored = evt.text or errored
-    finally:
-        # On early exit — a client disconnect propagates CancelledError into
-        # this generator — cancel the pump so run_stream tears down the
-        # subprocess and releases the session lock. After a normal drain the
-        # task is already finished and this is a no-op.
-        if not producer.done():
-            producer.cancel()
-        with contextlib.suppress(Exception, asyncio.CancelledError):
-            await producer
+                evt = item
+                if evt.kind == "text" and evt.text:
+                    chunk = ChatCompletionChunk(
+                        id=chunk_id,
+                        created=created,
+                        model=model,
+                        choices=[
+                            ChatCompletionChunkChoice(
+                                index=0,
+                                delta=DeltaMessage(content=evt.text),
+                                finish_reason=None,
+                            )
+                        ],
+                    )
+                    yield _sse_chunk(chunk)
+                elif evt.kind == "thinking" and evt.text:
+                    # Stream reasoning on its own channel: gives live progress
+                    # during long think phases and doubles as real byte flow,
+                    # while keeping the answer content clean.
+                    chunk = ChatCompletionChunk(
+                        id=chunk_id,
+                        created=created,
+                        model=model,
+                        choices=[
+                            ChatCompletionChunkChoice(
+                                index=0,
+                                delta=DeltaMessage(reasoning_content=evt.text),
+                                finish_reason=None,
+                            )
+                        ],
+                    )
+                    yield _sse_chunk(chunk)
+                elif evt.kind == "final":
+                    meta = evt.raw or {}
+                    finish_reason = meta.get("stop_reason") or "stop"
+                    new_outputs = list(meta.get("new_outputs") or [])
+                    usage_tokens = int(meta.get("input_tokens") or 0) + int(meta.get("output_tokens") or 0)
+                    if meta.get("error"):
+                        errored = str(meta["error"])
+                elif evt.kind == "error":
+                    errored = evt.text or errored
+        finally:
+            # On early exit — a client disconnect propagates CancelledError into
+            # this generator — cancel the pump so run_stream tears down the
+            # subprocess and releases the session lock. After a normal drain the
+            # task is already finished and this is a no-op.
+            if not producer.done():
+                producer.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await producer
 
-    if USAGE_LEDGER.enabled:
-        await USAGE_LEDGER.record(session_key, usage_tokens)
+        # Post-stream bookkeeping. These touch disk (the token ledger) and the
+        # file store, so they can fail — but a failure here must not truncate an
+        # otherwise-complete response. Any error is folded into `errored` below.
+        if USAGE_LEDGER.enabled:
+            await USAGE_LEDGER.record(session_key, usage_tokens)
 
-    attachments = await _register_generated_files(
-        paths=[Path(p) for p in new_outputs],
-        session_key=session_key,
-        inline=req.inline_generated_files,
-    )
-    if attachments:
-        trailer = "\n\n" + _append_file_references("", attachments).strip()
-        trailer_chunk = ChatCompletionChunk(
+        attachments = await _register_generated_files(
+            paths=[Path(p) for p in new_outputs],
+            session_key=session_key,
+            inline=req.inline_generated_files,
+        )
+        if attachments:
+            trailer = "\n\n" + _append_file_references("", attachments).strip()
+            trailer_chunk = ChatCompletionChunk(
+                id=chunk_id,
+                created=created,
+                model=model,
+                choices=[
+                    ChatCompletionChunkChoice(
+                        index=0,
+                        delta=DeltaMessage(content=trailer),
+                        finish_reason=None,
+                    )
+                ],
+            )
+            yield _sse_chunk(trailer_chunk)
+    except asyncio.CancelledError:
+        # Client disconnected: the socket is gone, so emitting a terminator would
+        # only raise again. Propagate so Starlette/uvicorn finish tearing down.
+        raise
+    except Exception as exc:  # pragma: no cover - defensive
+        log.exception("streaming response failed mid-stream (session=%s)", session_key)
+        if not errored:
+            errored = f"internal wrapper error: {exc}"
+        finish_reason = finish_reason or "stop"
+
+    # Always-emitted clean terminator. Guarded so that even a serialization
+    # failure when building the final chunk still closes the stream with [DONE]
+    # rather than leaving a dangling chunked body.
+    try:
+        final_chunk = ChatCompletionChunk(
             id=chunk_id,
             created=created,
             model=model,
             choices=[
                 ChatCompletionChunkChoice(
                     index=0,
-                    delta=DeltaMessage(content=trailer),
-                    finish_reason=None,
+                    delta=DeltaMessage(),
+                    finish_reason=finish_reason or "stop",
                 )
             ],
         )
-        yield _sse_chunk(trailer_chunk)
-
-    final_chunk = ChatCompletionChunk(
-        id=chunk_id,
-        created=created,
-        model=model,
-        choices=[
-            ChatCompletionChunkChoice(
-                index=0,
-                delta=DeltaMessage(),
-                finish_reason=finish_reason or ("stop" if not errored else "stop"),
-            )
-        ],
-    )
-    yield _sse_chunk(final_chunk)
-    if errored:
-        err_payload = {"error": {"message": errored, "type": "upstream_error"}}
-        yield f"data: {json.dumps(err_payload)}\n\n".encode("utf-8")
+        yield _sse_chunk(final_chunk)
+        if errored:
+            err_payload = {"error": {"message": errored, "type": "upstream_error"}}
+            yield f"data: {json.dumps(err_payload)}\n\n".encode("utf-8")
+    except Exception:  # pragma: no cover - last-resort
+        log.exception("failed to emit stream terminator (session=%s)", session_key)
 
     yield b"data: [DONE]\n\n"
 

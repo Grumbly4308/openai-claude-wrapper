@@ -26,7 +26,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .config import SETTINGS, SUPPORTED_MODELS, advertised_models, split_model_effort
+from .config import SETTINGS, advertised_models, split_model_effort, supported_models
 from .converters import derive_session_id
 from .deps import FILE_STORE, PREPARER, RUNNER, USAGE_LEDGER, auth_dependency
 from .models import (
@@ -75,6 +75,14 @@ _STREAM_HEARTBEAT_SECONDS = float(os.environ.get("CLAUDE_WRAPPER_SSE_HEARTBEAT",
 app = FastAPI(title="Claude Code OpenAI Wrapper", version="0.1.0")
 
 
+@app.on_event("startup")
+async def _startup() -> None:
+    # Build the model list once on load by scanning the installed Claude Code
+    # binary (memoized thereafter). Logged so the resolved set is visible at boot.
+    models = supported_models()
+    log.info("model list ready: %d models — %s", len(models), ", ".join(models))
+
+
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     await PREPARER.aclose()
@@ -109,7 +117,7 @@ async def list_models() -> ModelList:
 @app.get("/v1/models/{model_id}", dependencies=[Depends(auth_dependency)])
 async def retrieve_model(model_id: str) -> ModelInfo:
     base, _effort = split_model_effort(model_id)
-    if base not in SUPPORTED_MODELS:
+    if base not in supported_models():
         raise HTTPException(status_code=404, detail=f"unknown model: {model_id}")
     return ModelInfo(id=model_id, created=int(time.time()))
 

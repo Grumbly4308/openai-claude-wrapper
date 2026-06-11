@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger("claude_wrapper.config")
 
 
 def _int_env(name: str, default: int) -> int:
@@ -184,7 +187,10 @@ class Settings:
 SETTINGS = Settings.from_env()
 
 
-SUPPORTED_MODELS: tuple[str, ...] = (
+# Static fallback used only when binary discovery yields nothing (binary
+# missing, unreadable, or its bundle format changed). Mirrors what the wrapper
+# shipped with so /v1/models is never empty.
+FALLBACK_MODELS: tuple[str, ...] = (
     "claude-opus-4-8",
     "claude-opus-4-8[1m]",
     "claude-opus-4-7",
@@ -193,44 +199,120 @@ SUPPORTED_MODELS: tuple[str, ...] = (
     "claude-sonnet-4-6",
     "claude-sonnet-4-5",
     "claude-haiku-4-5",
-    "claude-haiku-4-5-20251001",
 )
 
 
-# Reasoning-effort levels accepted by `claude --effort`.
+# Reasoning-effort levels accepted by `claude --effort`. This stays the Opus
+# ladder for back-compat with callers/tests that import EFFORT_LEVELS.
 EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+# Sonnet 4.6+ accepts effort but not `max`; earlier Sonnet rejects effort entirely.
+_SONNET_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
 
 # "ultracode" is exposed as an effort choice too, but it is NOT a `--effort`
 # value — the CLI ignores it and falls back to the default effort. It is
 # requested via `--settings '{"ultracode": true}'` instead, which the CLI
 # resolves to xhigh effort plus ultracode's dynamic-workflow orchestration
 # opt-in (the exact behavior is the CLI's to decide). The runner special-cases
-# it when building argv (see claude_runner._build_argv).
+# it when building argv (see claude_runner._build_argv). Ultracode is Opus-only.
 ULTRACODE_EFFORT = "ultracode"
 
-# Every effort token a client may select. The wrapper advertises one model
-# variant per choice for each effort-capable (Opus) model, e.g.
-# "claude-opus-4-8 (max)" / "claude-opus-4-8 (ultracode)", so clients can
-# switch effort straight from a model dropdown.
+# Union of every effort token a client may select, used to *recognize* a
+# suffix while parsing a model id. Whether a given token actually applies to a
+# given model is decided per-model by effort_choices_for().
 EFFORT_CHOICES: tuple[str, ...] = EFFORT_LEVELS + (ULTRACODE_EFFORT,)
 
 _EFFORT_CHOICE_SET = frozenset(EFFORT_CHOICES)
 
+# Family-rule version boundaries for effort support (from the model docs):
+# effort landed on Opus 4.5 and on Sonnet 4.6.
+_OPUS_EFFORT_MIN = (4, 5)
+_SONNET_EFFORT_MIN = (4, 6)
+
+# Minor is 1-2 digits and must not be followed by another digit, so a dated
+# snapshot ("claude-opus-4-20250514") isn't misread as version (4, 20).
+_MODEL_FAMILY_RE = re.compile(r"^claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})(?!\d)")
+
+
+def _family_version(model: str) -> tuple[str | None, tuple[int, int] | None]:
+    """Parse (family, (major, minor)) from a model id; (None, None) if unparseable.
+
+    Tolerates trailing suffixes like ``[1m]`` — only the leading
+    ``claude-<family>-<major>-<minor>`` is needed.
+    """
+    m = _MODEL_FAMILY_RE.match(model or "")
+    if not m:
+        return None, None
+    return m.group(1), (int(m.group(2)), int(m.group(3)))
+
+
+def effort_choices_for(model: str) -> tuple[str, ...]:
+    """Effort choices a given model accepts, by the family rule.
+
+    Opus 4.5+: low/medium/high/xhigh/max + ultracode. Sonnet 4.6+:
+    low/medium/high/xhigh (no max, no ultracode). Haiku, older Opus/Sonnet, and
+    anything unrecognized: none.
+    """
+    fam, ver = _family_version(model)
+    if ver is None:
+        return ()
+    if fam == "opus" and ver >= _OPUS_EFFORT_MIN:
+        return EFFORT_CHOICES
+    if fam == "sonnet" and ver >= _SONNET_EFFORT_MIN:
+        return _SONNET_EFFORT_LEVELS
+    return ()
+
 
 def is_effort_capable(model: str) -> bool:
-    """Whether `claude --effort` applies to this model. Effort is an Opus 4.5+
-    feature; other families ignore or reject the flag."""
-    return model.startswith("claude-opus-")
+    """Whether `claude --effort` / the ultracode settings overlay apply here."""
+    return bool(effort_choices_for(model))
+
+
+_supported_models_cache: tuple[str, ...] | None = None
+
+
+def _discovery_mode() -> str:
+    """`auto` (default) scans the installed binary; `off` uses FALLBACK_MODELS."""
+    return (os.environ.get("CLAUDE_WRAPPER_MODEL_DISCOVERY", "auto") or "auto").strip().lower()
+
+
+def _build_supported_models() -> tuple[str, ...]:
+    discovered: list[str] = []
+    if _discovery_mode() != "off":
+        try:
+            from .model_discovery import discover_models
+
+            discovered = discover_models(SETTINGS.claude_bin)
+        except Exception:  # never let discovery break startup
+            log.exception("model discovery failed; falling back to static list")
+            discovered = []
+    models = discovered or list(FALLBACK_MODELS)
+    # The configured default must always be selectable, even if discovery missed it.
+    if SETTINGS.default_model and SETTINGS.default_model not in models:
+        models.append(SETTINGS.default_model)
+    return tuple(dict.fromkeys(models))  # de-dupe, preserve order
+
+
+def supported_models() -> tuple[str, ...]:
+    """Models the wrapper accepts.
+
+    Built once on first call by scanning the installed Claude Code binary (see
+    model_discovery), then memoized for the process lifetime. Falls back to
+    FALLBACK_MODELS when discovery is disabled or yields nothing.
+    """
+    global _supported_models_cache
+    if _supported_models_cache is None:
+        _supported_models_cache = _build_supported_models()
+    return _supported_models_cache
 
 
 def advertised_models() -> list[str]:
-    """SUPPORTED_MODELS plus one '<model> (<choice>)' variant per effort choice
-    for each effort-capable model. This is what /v1/models exposes."""
+    """Each supported base model, plus one '<model> (<choice>)' variant per
+    effort choice the model accepts. This is what /v1/models exposes."""
     out: list[str] = []
-    for base in SUPPORTED_MODELS:
+    for base in supported_models():
         out.append(base)
-        if is_effort_capable(base):
-            out.extend(f"{base} ({lvl})" for lvl in EFFORT_CHOICES)
+        out.extend(f"{base} ({choice})" for choice in effort_choices_for(base))
     return out
 
 

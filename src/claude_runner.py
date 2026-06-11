@@ -12,7 +12,7 @@ from typing import AsyncIterator, Optional
 
 import aiofiles
 
-from .config import ULTRACODE_EFFORT, is_effort_capable
+from .config import ULTRACODE_EFFORT, effort_choices_for
 
 log = logging.getLogger("claude_wrapper.runner")
 
@@ -160,17 +160,22 @@ class ClaudeRunner:
 
         An explicit per-request value wins (including "", meaning "no flag");
         otherwise we fall back to the server default (CLAUDE_WRAPPER_EFFORT).
-        Effort — and the ultracode settings overlay — only apply to effort-capable
-        (Opus) models, so it's dropped for other families which ignore/reject it.
+        Effort — and the ultracode settings overlay — only apply to the effort
+        choices a given model accepts (see config.effort_choices_for), so it's
+        dropped for models that take no effort and for an effort the model
+        doesn't support (e.g. max/ultracode on Sonnet).
         Returns (effective_effort, source) where source is one of:
-        "request" | "server-default" | "model-incapable".
+        "request" | "server-default" | "model-incapable" | "effort-unsupported".
         """
         if effort is not None:
             eff, source = effort, "request"
         else:
             eff, source = self.effort, "server-default"
-        if not is_effort_capable(model or ""):
+        allowed = effort_choices_for(model or "")
+        if not allowed:
             return "", "model-incapable"
+        if eff and eff not in allowed:
+            return "", "effort-unsupported"
         return eff, source
 
     def _build_argv(

@@ -21,6 +21,7 @@ from pathlib import Path
 _TMP = tempfile.mkdtemp(prefix="claude-wrapper-test-")
 os.environ["CLAUDE_WRAPPER_DATA"] = _TMP
 os.environ["CLAUDE_WRAPPER_DEFAULT_MODEL"] = "claude-sonnet-4-6"
+os.environ["CLAUDE_WRAPPER_MODEL_DISCOVERY"] = "off"
 os.environ.pop("CLAUDE_WRAPPER_API_KEYS", None)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 

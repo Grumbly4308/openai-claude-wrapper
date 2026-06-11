@@ -468,9 +468,20 @@ The compose file mounts two named volumes:
 
 ## Supported models
 
-The `/v1/models` endpoint lists the Claude models the wrapper accepts:
-current Opus / Sonnet / Haiku family. Pass `"model": "auto"` to use
-`CLAUDE_WRAPPER_DEFAULT_MODEL`.
+The `/v1/models` endpoint lists the Claude models the wrapper accepts. The
+list is **built once at startup by scanning the installed Claude Code binary**
+for the model ids it ships with (the current Opus / Sonnet / Haiku families,
+including the `[1m]` long-context variants), so it tracks whatever Claude Code
+version is installed instead of a hardcoded set. Set
+`CLAUDE_WRAPPER_MODEL_DISCOVERY=off` to serve a static built-in list instead;
+discovery also falls back to that list automatically if the binary can't be
+read. Pass `"model": "auto"` to use `CLAUDE_WRAPPER_DEFAULT_MODEL`.
+
+Each effort-capable model is advertised with one variant per effort level it
+accepts (the *family rule*): Opus 4.5+ exposes
+`(low)`/`(medium)`/`(high)`/`(xhigh)`/`(max)` plus `(ultracode)`; Sonnet 4.6+
+exposes through `(xhigh)`; Haiku and older models expose none. Selecting a
+variant like `claude-opus-4-8 (xhigh)` sets the per-request effort.
 
 ## Limitations
 

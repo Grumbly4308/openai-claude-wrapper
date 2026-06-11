@@ -18,6 +18,8 @@ from pathlib import Path
 # a tempdir so importing src.* never touches /data.
 _TMP = tempfile.mkdtemp(prefix="claude-wrapper-effort-test-")
 os.environ["CLAUDE_WRAPPER_DATA"] = _TMP
+# Use the static fallback list — don't scan the 250 MB CLI binary during tests.
+os.environ["CLAUDE_WRAPPER_MODEL_DISCOVERY"] = "off"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.claude_runner import ClaudeRunner, SessionRegistry  # noqa: E402
@@ -65,11 +67,24 @@ def test_ultracode_advertised_for_opus() -> None:
     check("advertise.levels.opus", all(f"claude-opus-4-8 ({lvl})" in models for lvl in EFFORT_LEVELS))
 
 
-def test_ultracode_not_advertised_for_nonopus() -> None:
+def test_sonnet_effort_variants() -> None:
     models = advertised_models()
-    # Effort variants (incl. ultracode) only exist for effort-capable models.
-    check("advertise.ultracode.sonnet.absent", "claude-sonnet-4-6 (ultracode)" not in models)
+    # Sonnet 4.6 takes effort through xhigh, but never max or the Opus-only
+    # ultracode overlay.
     check("advertise.sonnet.base.present", "claude-sonnet-4-6" in models)
+    check("advertise.sonnet.xhigh.present", "claude-sonnet-4-6 (xhigh)" in models)
+    check("advertise.sonnet.max.absent", "claude-sonnet-4-6 (max)" not in models)
+    check("advertise.ultracode.sonnet.absent", "claude-sonnet-4-6 (ultracode)" not in models)
+
+
+def test_haiku_has_no_effort_variants() -> None:
+    models = advertised_models()
+    # Haiku takes no effort at all — base only, no variants.
+    check("advertise.haiku.base.present", "claude-haiku-4-5" in models)
+    check(
+        "advertise.haiku.no_variants",
+        not any(m.startswith("claude-haiku-4-5 (") for m in models),
+    )
 
 
 # ---------- parsing ----------
@@ -106,12 +121,23 @@ def test_argv_empty_effort_passes_nothing() -> None:
 
 
 def test_argv_noncapable_drops_effort() -> None:
-    # A non-effort-capable model never gets a flag the CLI would ignore/reject,
-    # even when an effort suffix is requested explicitly (e.g. via :max / :ultracode).
+    # A non-effort-capable model (Haiku) never gets a flag the CLI would
+    # ignore/reject, even when an effort suffix is requested explicitly.
     for eff in ("max", "ultracode"):
-        argv = _argv("claude-sonnet-4-6", eff)
+        argv = _argv("claude-haiku-4-5", eff)
         check(f"argv.noncapable.{eff}.no_effort", "--effort" not in argv)
         check(f"argv.noncapable.{eff}.no_settings", "--settings" not in argv)
+
+
+def test_argv_sonnet_effort() -> None:
+    # Sonnet takes a supported effort via --effort, but an unsupported one
+    # (max/ultracode) is dropped rather than passed through.
+    argv = _argv("claude-sonnet-4-6", "xhigh")
+    check("argv.sonnet.xhigh.effort", argv[argv.index("--effort") + 1] == "xhigh")
+    for eff in ("max", "ultracode"):
+        argv = _argv("claude-sonnet-4-6", eff)
+        check(f"argv.sonnet.{eff}.no_effort", "--effort" not in argv)
+        check(f"argv.sonnet.{eff}.no_settings", "--settings" not in argv)
 
 
 def test_resolve_effort_source() -> None:
@@ -126,7 +152,11 @@ def test_resolve_effort_source() -> None:
     check("resolve.default", r._resolve_effort("claude-opus-4-8", None) == ("max", "server-default"))
     check("resolve.request", r._resolve_effort("claude-opus-4-8", "low") == ("low", "request"))
     check("resolve.ultracode", r._resolve_effort("claude-opus-4-8", "ultracode") == ("ultracode", "request"))
-    check("resolve.incapable", r._resolve_effort("claude-sonnet-4-6", "max") == ("", "model-incapable"))
+    # Haiku takes no effort at all.
+    check("resolve.incapable", r._resolve_effort("claude-haiku-4-5", "max") == ("", "model-incapable"))
+    # Sonnet takes effort, but not max — supported levels pass, unsupported drop.
+    check("resolve.sonnet.xhigh", r._resolve_effort("claude-sonnet-4-6", "xhigh") == ("xhigh", "request"))
+    check("resolve.sonnet.max", r._resolve_effort("claude-sonnet-4-6", "max") == ("", "effort-unsupported"))
     check("resolve.explicit_empty", r._resolve_effort("claude-opus-4-8", "") == ("", "request"))
 
 
@@ -134,12 +164,14 @@ def main() -> int:
     tests = [
         test_resolve_effort_source,
         test_ultracode_advertised_for_opus,
-        test_ultracode_not_advertised_for_nonopus,
+        test_sonnet_effort_variants,
+        test_haiku_has_no_effort_variants,
         test_split_ultracode,
         test_argv_ultracode_uses_settings_not_effort,
         test_argv_level_uses_effort_flag,
         test_argv_empty_effort_passes_nothing,
         test_argv_noncapable_drops_effort,
+        test_argv_sonnet_effort,
     ]
     for t in tests:
         try:

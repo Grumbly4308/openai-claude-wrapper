@@ -20,6 +20,7 @@ import pytest
 # Match the env setup the other test file uses so config doesn't try to write to /data.
 _TMP = tempfile.mkdtemp(prefix="claude-wrapper-pdftest-")
 os.environ.setdefault("CLAUDE_WRAPPER_DATA", _TMP)
+os.environ.setdefault("CLAUDE_WRAPPER_MODEL_DISCOVERY", "off")
 os.environ.pop("CLAUDE_WRAPPER_API_KEYS", None)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 

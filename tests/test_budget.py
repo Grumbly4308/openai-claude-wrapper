@@ -25,6 +25,7 @@ from pathlib import Path
 _TMP = tempfile.mkdtemp(prefix="claude-wrapper-budget-test-")
 os.environ["CLAUDE_WRAPPER_DATA"] = _TMP
 os.environ["CLAUDE_WRAPPER_DEFAULT_MODEL"] = "claude-opus-4-8"
+os.environ["CLAUDE_WRAPPER_MODEL_DISCOVERY"] = "off"
 os.environ["CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE"] = "2000"
 os.environ["CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT"] = "5"
 os.environ.pop("CLAUDE_WRAPPER_API_KEYS", None)

@@ -26,8 +26,10 @@ from src.claude_runner import ClaudeRunner, SessionRegistry  # noqa: E402
 from src.config import (  # noqa: E402
     EFFORT_LEVELS,
     advertised_models,
+    effort_choices_for,
     split_model_effort,
 )
+from src.model_discovery import filter_canonical  # noqa: E402
 
 _PASS = 0
 _FAIL = 0
@@ -75,6 +77,35 @@ def test_sonnet_effort_variants() -> None:
     check("advertise.sonnet.xhigh.present", "claude-sonnet-4-6 (xhigh)" in models)
     check("advertise.sonnet.max.absent", "claude-sonnet-4-6 (max)" not in models)
     check("advertise.ultracode.sonnet.absent", "claude-sonnet-4-6 (ultracode)" not in models)
+
+
+def test_codename_families_effort() -> None:
+    # fable/mythos are single-version codename families, treated as Opus-tier:
+    # full effort ladder including ultracode.
+    for mid in ("claude-fable-5", "claude-mythos-5"):
+        choices = effort_choices_for(mid)
+        check(f"codename.{mid}.xhigh", "xhigh" in choices)
+        check(f"codename.{mid}.max", "max" in choices)
+        check(f"codename.{mid}.ultracode", "ultracode" in choices)
+
+
+def test_filter_canonical_keeps_codename_drops_junk() -> None:
+    raw = {
+        "claude-fable-5",
+        "claude-mythos-5",
+        "claude-opus-4-8",
+        "claude-opus-4-0",            # deprecated -> drop
+        "claude-opus-4-20250514",     # dated snapshot -> drop
+        "claude-sonnet-3-7",          # retired (<4) -> drop
+        "claude-opus-4",              # bare family alias -> drop
+        "fable",                      # bare alias -> drop
+    }
+    kept = filter_canonical(raw)
+    check(
+        "filter.codename_and_canonical",
+        kept == ["claude-fable-5", "claude-mythos-5", "claude-opus-4-8"],
+        note=str(kept),
+    )
 
 
 def test_haiku_has_no_effort_variants() -> None:
@@ -140,6 +171,16 @@ def test_argv_sonnet_effort() -> None:
         check(f"argv.sonnet.{eff}.no_settings", "--settings" not in argv)
 
 
+def test_argv_codename_effort() -> None:
+    # Codename families get the Opus-tier mapping: --effort for levels, --settings
+    # for ultracode.
+    argv = _argv("claude-fable-5", "max")
+    check("argv.fable.max.effort", argv[argv.index("--effort") + 1] == "max")
+    argv = _argv("claude-fable-5", "ultracode")
+    check("argv.fable.ultracode.settings", '{"ultracode": true}' in argv)
+    check("argv.fable.ultracode.no_effort", "--effort" not in argv)
+
+
 def test_resolve_effort_source() -> None:
     # Server default applies when the request carries no effort suffix — this is
     # exactly the "bare model ran at max" case. The source label makes it visible.
@@ -165,6 +206,8 @@ def main() -> int:
         test_resolve_effort_source,
         test_ultracode_advertised_for_opus,
         test_sonnet_effort_variants,
+        test_codename_families_effort,
+        test_filter_canonical_keeps_codename_drops_junk,
         test_haiku_has_no_effort_variants,
         test_split_ultracode,
         test_argv_ultracode_uses_settings_not_effort,
@@ -172,6 +215,7 @@ def main() -> int:
         test_argv_empty_effort_passes_nothing,
         test_argv_noncapable_drops_effort,
         test_argv_sonnet_effort,
+        test_argv_codename_effort,
     ]
     for t in tests:
         try:

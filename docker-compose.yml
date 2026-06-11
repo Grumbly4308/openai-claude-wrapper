@@ -78,9 +78,13 @@ services:
       # in chat as /data/inbox/<file> so Claude reads the real bytes
       # instead of OWU's text extraction. Read-only by default.
       - /home/vbox/inbox:/data/inbox:ro
-      # Claude Code's own state — credentials live here, so this is the
-      # volume that makes `compose run … login` survive restarts.
-      - claude-home:/home/claude/.claude
+      # Claude Code's own state — bind-mounted from the host so the
+      # container shares the SAME login as the host CLI. Logging in (or a
+      # token refresh) on the host propagates automatically; both `serve`
+      # and `docker exec … claude` read these same credentials.
+      # NOTE: this co-mingles all host Claude state (history, sessions,
+      # projects, locks) with the container — intended single-user setup.
+      - /home/vbox/.claude:/home/claude/.claude
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CLAUDE_WRAPPER_PORT:-8000}/healthz"]
       interval: 30s
@@ -90,4 +94,3 @@ services:
 
 volumes:
   claude-data:
-  claude-home:

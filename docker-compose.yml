@@ -78,13 +78,20 @@ services:
       # in chat as /data/inbox/<file> so Claude reads the real bytes
       # instead of OWU's text extraction. Read-only by default.
       - /home/vbox/inbox:/data/inbox:ro
-      # Claude Code's own state — bind-mounted from the host so the
-      # container shares the SAME login as the host CLI. Logging in (or a
-      # token refresh) on the host propagates automatically; both `serve`
-      # and `docker exec … claude` read these same credentials.
-      # NOTE: this co-mingles all host Claude state (history, sessions,
-      # projects, locks) with the container — intended single-user setup.
-      - /home/vbox/.claude:/home/claude/.claude
+      # Claude Code's own state. Sessions/projects/locks MUST stay isolated to
+      # this container: bind-mounting the host's whole ~/.claude co-mingles its
+      # live daemon, session locks and 700-mode sessions dir, which breaks
+      # `claude --resume` — the first turn of a chat succeeds (it creates a
+      # session) but every follow-up turn then fails with
+      # `error_during_execution`. So Claude state lives in a container-local
+      # volume, and we share ONLY the login credential file so a host login /
+      # token refresh still propagates (the original point of the bind mount).
+      #
+      # If you authenticate via CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY env
+      # instead of a host login, drop the second line below (no host
+      # credentials file to share).
+      - claude-home:/home/claude/.claude
+      - ${CLAUDE_HOST_CREDENTIALS:-/home/vbox/.claude/.credentials.json}:/home/claude/.claude/.credentials.json
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CLAUDE_WRAPPER_PORT:-8000}/healthz"]
       interval: 30s
@@ -94,3 +101,6 @@ services:
 
 volumes:
   claude-data:
+  # Container-local Claude Code state (sessions/projects/locks), isolated from
+  # the host so `--resume` works on follow-up turns. Survives restarts/rebuilds.
+  claude-home:

@@ -329,16 +329,36 @@ class ClaudeRunner:
                     await stdin_task
                 if returncode != 0 and errored is None:
                     errored = f"claude exited {returncode}: {stderr_output[-500:] if stderr_output else ''}"
-                # Drop the registry entry on resume-failure so the next request
-                # mints a fresh uuid, uses --session-id, and replays full history.
-                if (
-                    returncode != 0
-                    and not created
-                    and stderr_output
-                    and "session" in stderr_output.lower()
-                    and ("not found" in stderr_output.lower() or "no such" in stderr_output.lower())
-                ):
-                    log.warning("session %s uuid %s missing; dropping for next call", session_key, session_uuid)
+                # Self-heal a broken resume. If a --resume turn fails — a non-zero
+                # exit, or a stream-json result with an error subtype like
+                # "error_during_execution" (which exits 0) — without producing any
+                # assistant text, the underlying Claude session is unusable. The
+                # most common cause is its transcript being gone (e.g. the session
+                # store was wiped, or never persisted) while our key->uuid mapping
+                # survived, so every retry re-resumes the same dead uuid and fails
+                # identically. Drop the mapping so the NEXT request mints a fresh
+                # uuid, switches to --session-id, and replays the full transcript
+                # (prepare_messages leaves replay-only mode once registry.has() is
+                # False). Costs one extra full-history turn but keeps the
+                # conversation alive instead of permanently bricking it.
+                #
+                # The "no assistant text this turn" guard means a session that
+                # streamed a real answer and only then hit a late error is left
+                # intact — we only reset sessions that produced nothing usable.
+                stderr_lc = (stderr_output or "").lower()
+                session_missing = "session" in stderr_lc and (
+                    "not found" in stderr_lc or "no such" in stderr_lc
+                )
+                resume_unusable = bool(errored) and not final_text_parts
+                if not created and (session_missing or resume_unusable):
+                    log.warning(
+                        "resume failed for session %s uuid %s (returncode=%s error=%r); "
+                        "dropping mapping so the next turn replays full history",
+                        session_key,
+                        session_uuid,
+                        returncode,
+                        errored,
+                    )
                     await self.registry.forget(session_key)
 
             final_text = "".join(final_text_parts).strip()

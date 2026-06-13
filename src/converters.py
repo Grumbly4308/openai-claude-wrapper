@@ -91,22 +91,40 @@ class MessagePreparer:
             if SETTINGS.openwebui_api_key
             else ""
         )
-        coll_hint = (
-            f' (default collection: "{default_collection}")' if default_collection else ""
+        # The default is configured as a knowledge-base id (what /query/collection
+        # wants); if an operator set a display name instead, the discovery step
+        # below still lets the model resolve it. Surface it as a hint either way.
+        default_hint = (
+            f' When nothing more specific fits, default to $OPENWEBUI_DEFAULT_COLLECTION ("{default_collection}").'
+            if default_collection
+            else ""
         )
         return (
             "## Knowledge base\n"
-            f"An OpenWebUI knowledge base is reachable at $OPENWEBUI_BASE_URL{coll_hint}. "
-            "When the user asks something that may be answered by stored documents, "
-            "search the KB before answering. Use Bash + curl, e.g.:\n"
+            "An OpenWebUI knowledge base is reachable at $OPENWEBUI_BASE_URL. When the "
+            "user asks something that may be answered by stored documents, search the KB "
+            "before answering — do not answer from memory for those. Use Bash + curl:\n"
+            "\n"
+            "1. Discover collections. `collection_names` below takes the knowledge-base "
+            "`id`, NOT its display name, so first list what exists and read each entry's "
+            "`id` and `name`:\n"
+            "```\n"
+            f"curl -sS{auth_hint} \"$OPENWEBUI_BASE_URL/api/v1/knowledge/\"\n"
+            "```\n"
+            f"Pick the `id`(s) of the knowledge base(s) whose name/description fit the question.{default_hint}\n"
+            "\n"
+            "2. Query the chosen collection(s) by id:\n"
             "```\n"
             f"curl -sS{auth_hint} -H 'Content-Type: application/json' \\\n"
             "  -X POST \"$OPENWEBUI_BASE_URL/api/v1/retrieval/query/collection\" \\\n"
-            "  -d '{\"collection_names\":[\"<collection>\"],\"query\":\"<query>\",\"k\":5}'\n"
+            "  -d '{\"collection_names\":[\"<id-from-step-1>\"],\"query\":\"<search text>\",\"k\":5}'\n"
             "```\n"
-            "Read the JSON response, cite the most relevant chunks in your answer, "
-            "and do not invent facts that are not in either the KB results or the "
-            "user-supplied context."
+            "\n"
+            "Read the JSON response, cite the most relevant chunks in your answer, and do "
+            "not invent facts that are not in either the KB results or the user-supplied "
+            "context. If a call returns 401/403 the API key is missing or wrong; if a "
+            "query returns nothing, re-run step 1 and confirm you used the collection "
+            "`id` rather than its name."
         )
 
     async def _materialize_data_url(self, data_url: str, workspace: Path, hint_name: Optional[str]) -> tuple[Path, str]:

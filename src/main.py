@@ -82,6 +82,27 @@ async def _startup() -> None:
     models = supported_models()
     log.info("model list ready: %d models — %s", len(models), ", ".join(models))
 
+    # Surface KB passthrough state at boot. The OpenWebUI addendum is silently
+    # skipped when OPENWEBUI_BASE_URL is unset, which makes "Claude can't see the
+    # KB" hard to diagnose — so make it explicit in the logs either way.
+    if SETTINGS.openwebui_base_url:
+        log.info(
+            "knowledge-base passthrough ENABLED — base_url=%s api_key=%s default_collection=%s",
+            SETTINGS.openwebui_base_url,
+            "set" if SETTINGS.openwebui_api_key else "MISSING",
+            SETTINGS.openwebui_default_collection or "(none)",
+        )
+        if not SETTINGS.openwebui_api_key:
+            log.warning(
+                "OPENWEBUI_BASE_URL is set but OPENWEBUI_API_KEY is empty; "
+                "OpenWebUI retrieval endpoints normally require auth and will 401."
+            )
+    else:
+        log.info(
+            "knowledge-base passthrough DISABLED — set OPENWEBUI_BASE_URL to teach "
+            "Claude to query the OpenWebUI retrieval API."
+        )
+
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:

@@ -484,6 +484,14 @@ families expose `(low)`/`(medium)`/`(high)`/`(xhigh)`/`(max)` plus `(ultracode)`
 Sonnet 4.6+ exposes through `(xhigh)`; Haiku and older models expose none.
 Selecting a variant like `claude-opus-4-8 (xhigh)` sets the per-request effort.
 
+The `(ultracode)` variant is special: it requests xhigh effort **plus** Claude
+Code's dynamic-workflow (multi-agent) orchestration. Because ultracode is gated
+on dynamic workflows being enabled — and that setting defaults off in a headless
+container — the wrapper turns it on in the same overlay
+(`--settings '{"enableWorkflows": true, "ultracode": true}'`). An org-policy
+`disableWorkflows` or an account-level launch gate can still override this; those
+are account-side and cannot be set by the wrapper.
+
 ## Limitations
 
 - No tool-calling over the OpenAI function/tool surface — Claude Code

@@ -133,8 +133,17 @@ def test_split_ultracode() -> None:
 
 
 def test_argv_ultracode_uses_settings_not_effort() -> None:
+    import json as _json
+
     argv = _argv("claude-opus-4-8", "ultracode")
-    check("argv.ultracode.settings", "--settings" in argv and '{"ultracode": true}' in argv)
+    check("argv.ultracode.settings_flag", "--settings" in argv)
+    # The settings overlay must enable BOTH ultracode and dynamic workflows.
+    # ultracode is gated on workflows being enabled; without enableWorkflows the
+    # CLI rejects ultracode and silently runs at default effort.
+    payload = argv[argv.index("--settings") + 1]
+    parsed = _json.loads(payload)
+    check("argv.ultracode.opt_in", parsed.get("ultracode") is True, note=str(parsed))
+    check("argv.ultracode.workflows_enabled", parsed.get("enableWorkflows") is True, note=str(parsed))
     check("argv.ultracode.no_effort_flag", "--effort" not in argv)
 
 
@@ -177,7 +186,11 @@ def test_argv_codename_effort() -> None:
     argv = _argv("claude-fable-5", "max")
     check("argv.fable.max.effort", argv[argv.index("--effort") + 1] == "max")
     argv = _argv("claude-fable-5", "ultracode")
-    check("argv.fable.ultracode.settings", '{"ultracode": true}' in argv)
+    import json as _json
+
+    parsed = _json.loads(argv[argv.index("--settings") + 1])
+    check("argv.fable.ultracode.opt_in", parsed.get("ultracode") is True, note=str(parsed))
+    check("argv.fable.ultracode.workflows_enabled", parsed.get("enableWorkflows") is True, note=str(parsed))
     check("argv.fable.ultracode.no_effort", "--effort" not in argv)
 
 

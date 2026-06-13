@@ -206,7 +206,16 @@ class ClaudeRunner:
             # back to default effort). It is requested via settings instead,
             # where the CLI resolves it to xhigh effort plus ultracode's
             # dynamic-workflow orchestration opt-in.
-            argv += ["--settings", '{"ultracode": true}']
+            #
+            # Ultracode is GATED on dynamic workflows being enabled: with them
+            # off the CLI rejects it ("Ultracode needs dynamic workflows
+            # enabled") and silently runs at default effort. In a fresh headless
+            # container the `enableWorkflows` setting defaults to false, so we
+            # must turn it on in the same overlay — otherwise the advertised
+            # "(ultracode)" model is selectable but a functional no-op. (An
+            # org-policy `disableWorkflows` or account launch gate can still
+            # override this; those are account-side, not settable here.)
+            argv += ["--settings", '{"enableWorkflows": true, "ultracode": true}']
         elif eff:
             argv += ["--effort", eff]
         argv += ["--dangerously-skip-permissions"]

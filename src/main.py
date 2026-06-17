@@ -40,6 +40,7 @@ from .models import (
     DeltaMessage,
     ModelInfo,
     ModelList,
+    ResponsesRequest,
     Usage,
 )
 from .usage import UsageState
@@ -70,6 +71,15 @@ log = logging.getLogger("claude_wrapper.api")
 # payload. Comment lines (": ...\n\n") are ignored by OpenAI-compatible SSE
 # parsers but keep every idle timer in the path from firing.
 _STREAM_HEARTBEAT_SECONDS = float(os.environ.get("CLAUDE_WRAPPER_SSE_HEARTBEAT", "15"))
+
+# Shared SSE response headers. Disabling proxy buffering (X-Accel-Buffering) and
+# caching is what lets keep-alive comments and incremental chunks actually reach
+# the client instead of being held until the response completes.
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
 
 
 app = FastAPI(title="Claude Code OpenAI Wrapper", version="0.1.0")
@@ -220,9 +230,29 @@ async def download_file(file_id: str) -> StreamingResponse:
 # ---------- chat completions ----------
 
 
-async def run_chat_completion(req: ChatCompletionRequest):
-    """Shared implementation reused by /v1/chat/completions, /v1/completions,
-    /v1/responses, and the batches worker."""
+class _BudgetPause:
+    """Sentinel returned by _prepare_run when a conversation hit its token cap.
+
+    Carries the bookkeeping each endpoint shape needs to render its own
+    checkpoint message (chat-shaped vs Responses-shaped) without running Claude.
+    """
+
+    __slots__ = ("session_key", "state")
+
+    def __init__(self, session_key: str, state: UsageState) -> None:
+        self.session_key = session_key
+        self.state = state
+
+
+async def _prepare_run(req: ChatCompletionRequest):
+    """Shared prelude for every text-generation endpoint.
+
+    Resolves the session key, enforces the per-conversation token budget, builds
+    the prompt, and resolves the model. Returns either ``(prompt, session_key,
+    model)`` ready to run, or a ``_BudgetPause`` the caller renders in its own
+    response shape. Used by /v1/chat/completions, /v1/completions, /v1/responses,
+    and the batches worker.
+    """
     session_key = derive_session_id(req.messages, req.session_id, req.user)
 
     # Per-conversation token budget. If this conversation has already spent its
@@ -235,7 +265,7 @@ async def run_chat_completion(req: ChatCompletionRequest):
             if _is_continue(req.messages):
                 await USAGE_LEDGER.grant(session_key)
             else:
-                return _budget_pause(req, session_key, state)
+                return _BudgetPause(session_key, state)
 
     prompt, _attachments = await PREPARER.prepare_messages(req.messages, session_key)
     model = req.model if req.model and req.model != "auto" else SETTINGS.default_model
@@ -243,15 +273,22 @@ async def run_chat_completion(req: ChatCompletionRequest):
     if not prompt.strip():
         raise HTTPException(status_code=400, detail="no prompt content derived from messages")
 
+    return prompt, session_key, model
+
+
+async def run_chat_completion(req: ChatCompletionRequest):
+    """Shared implementation reused by /v1/chat/completions, /v1/completions,
+    and the batches worker."""
+    prep = await _prepare_run(req)
+    if isinstance(prep, _BudgetPause):
+        return _budget_pause(req, prep.session_key, prep.state)
+    prompt, session_key, model = prep
+
     if req.stream:
         return StreamingResponse(
             _stream_response(req, prompt, session_key, model),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
+            headers=_SSE_HEADERS,
         )
 
     return await _sync_response(req, prompt, session_key, model)
@@ -529,6 +566,393 @@ def _effort_info(run_model: str, requested_effort: Optional[str]) -> dict:
     return {"applied": applied or "cli-default", "source": source, "requested": requested_effort}
 
 
+# ---------- responses API (/v1/responses) ----------
+#
+# OpenAI's "ask and response" primitive. Two things distinguish it from
+# /v1/chat/completions and force a dedicated implementation rather than a thin
+# reshape of the chat response:
+#
+#  1. Conversation chaining is by id: the client passes the previous response's
+#     `id` back as `previous_response_id` to continue the thread. We make that
+#     work by deriving the response id FROM the session key (resp_<session_key>),
+#     so handing it back deterministically reattaches to the same Claude session
+#     via `derive_session_id`'s explicit-id path. A throwaway random id would
+#     silently start a fresh session every turn.
+#  2. The streaming wire format is a typed event sequence (response.created,
+#     response.output_text.delta, response.completed …), NOT chat.completion
+#     chunks. SDK clients parse on the event `type`, so chat chunks would be
+#     unintelligible to them.
+
+_RESPONSE_ID_PREFIX = "resp_"
+
+
+def _response_id(session_key: str) -> str:
+    return f"{_RESPONSE_ID_PREFIX}{session_key}"
+
+
+def _session_from_response_id(response_id: Optional[str]) -> Optional[str]:
+    """Recover the session key a `previous_response_id` points at.
+
+    Inverse of `_response_id`. Tolerates ids without our prefix (a client may
+    pass back a session key directly) by treating them as the key verbatim.
+    """
+    if not response_id:
+        return None
+    if response_id.startswith(_RESPONSE_ID_PREFIX):
+        return response_id[len(_RESPONSE_ID_PREFIX) :]
+    return response_id
+
+
+def _responses_envelope(
+    rreq: ResponsesRequest,
+    session_key: str,
+    model: str,
+    run_model: str,
+    effort: Optional[str],
+    *,
+    text: str,
+    status: str,
+    input_tokens: int,
+    output_tokens: int,
+    created: int,
+    item_id: str,
+    error: Optional[str] = None,
+) -> dict:
+    """Build a Responses-API `response` object (shared by sync + the terminal
+    streaming event)."""
+    output: list[dict] = []
+    if text:
+        output.append(
+            {
+                "type": "message",
+                "id": item_id,
+                "status": "completed" if status != "in_progress" else "in_progress",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+        )
+    envelope = {
+        "id": _response_id(session_key),
+        "object": "response",
+        "created_at": created,
+        "status": status,
+        "model": model,
+        "output": output,
+        "output_text": text,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        },
+        "instructions": rreq.instructions,
+        "temperature": rreq.temperature,
+        "top_p": rreq.top_p,
+        "max_output_tokens": rreq.max_output_tokens,
+        "previous_response_id": rreq.previous_response_id,
+        "metadata": rreq.metadata or {},
+        # Non-standard parity field: which effort actually ran (mirrors chat).
+        "effort": _effort_info(run_model, effort),
+    }
+    if error is not None:
+        envelope["error"] = {"message": error, "type": "upstream_error"}
+    return envelope
+
+
+async def run_responses(rreq: ResponsesRequest, messages: list[ChatMessage]):
+    """Entry point for /v1/responses, shared by the route and the batches worker.
+
+    `messages` is the chat-shaped conversation already flattened from the
+    Responses `input` by the route layer.
+    """
+    # `previous_response_id` wins over the message anchor so an explicit chain
+    # always reattaches to the right session.
+    session_key = derive_session_id(
+        messages, _session_from_response_id(rreq.previous_response_id), rreq.user
+    )
+    chat_req = ChatCompletionRequest(
+        model=rreq.model,
+        messages=messages,
+        stream=rreq.stream,
+        temperature=rreq.temperature,
+        top_p=rreq.top_p,
+        max_tokens=rreq.max_output_tokens,
+        user=rreq.user,
+        session_id=session_key,
+    )
+
+    prep = await _prepare_run(chat_req)
+    if isinstance(prep, _BudgetPause):
+        return _responses_budget_pause(rreq, prep.session_key, prep.state)
+    prompt, session_key, model = prep
+
+    if rreq.stream:
+        return StreamingResponse(
+            _responses_stream(rreq, prompt, session_key, model),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+    return await _responses_sync(rreq, prompt, session_key, model)
+
+
+async def _responses_sync(
+    rreq: ResponsesRequest, prompt: str, session_key: str, model: str
+) -> JSONResponse:
+    run_model, effort = split_model_effort(model)
+    result = await RUNNER.run_collect(
+        prompt=prompt, session_key=session_key, model=run_model, effort=effort
+    )
+    if result.error and not result.final_text:
+        raise HTTPException(status_code=502, detail=f"claude failed: {result.error}")
+
+    if USAGE_LEDGER.enabled:
+        await USAGE_LEDGER.record(session_key, result.input_tokens + result.output_tokens)
+
+    new_outputs: list[str] = []
+    for evt in result.events:
+        if evt.kind == "system" and evt.raw and isinstance(evt.raw.get("new_outputs"), list):
+            new_outputs = list(evt.raw["new_outputs"])
+
+    attachments = await _register_generated_files(
+        paths=[Path(p) for p in new_outputs], session_key=session_key, inline=False
+    )
+    final_text = result.final_text
+    if attachments:
+        final_text = _append_file_references(final_text, attachments)
+
+    envelope = _responses_envelope(
+        rreq,
+        session_key,
+        model,
+        run_model,
+        effort,
+        text=final_text,
+        status="completed",
+        input_tokens=result.input_tokens,
+        output_tokens=result.output_tokens,
+        created=int(time.time()),
+        item_id=f"msg_{uuid.uuid4().hex[:24]}",
+    )
+    return JSONResponse(content=envelope)
+
+
+async def _responses_stream(
+    rreq: ResponsesRequest, prompt: str, session_key: str, model: str
+) -> AsyncIterator[bytes]:
+    run_model, effort = split_model_effort(model)
+    created = int(time.time())
+    item_id = f"msg_{uuid.uuid4().hex[:24]}"
+    seq = 0
+
+    def ev(event_type: str, payload: dict) -> bytes:
+        nonlocal seq
+        body = {"type": event_type, "sequence_number": seq, **payload}
+        seq += 1
+        # Both an `event:` line and `type` in the data — SDKs key on one or the
+        # other depending on transport.
+        return f"event: {event_type}\ndata: {json.dumps(body)}\n\n".encode("utf-8")
+
+    def envelope(status: str, text: str, in_tok: int, out_tok: int, error: Optional[str] = None) -> dict:
+        return _responses_envelope(
+            rreq, session_key, model, run_model, effort,
+            text=text, status=status, input_tokens=in_tok, output_tokens=out_tok,
+            created=created, item_id=item_id, error=error,
+        )
+
+    # Opening events — the skeleton an SDK needs before deltas start flowing.
+    yield ev("response.created", {"response": envelope("in_progress", "", 0, 0)})
+    yield ev("response.in_progress", {"response": envelope("in_progress", "", 0, 0)})
+    yield ev(
+        "response.output_item.added",
+        {"output_index": 0, "item": {"id": item_id, "type": "message",
+                                     "status": "in_progress", "role": "assistant", "content": []}},
+    )
+    yield ev(
+        "response.content_part.added",
+        {"item_id": item_id, "output_index": 0, "content_index": 0,
+         "part": {"type": "output_text", "text": "", "annotations": []}},
+    )
+
+    # Same decoupled producer/consumer pattern as the chat stream: the pump owns
+    # the runner (and thus the subprocess + session lock); the consumer only
+    # reads the queue, so a quiet think phase times out queue.get() — emitting a
+    # keep-alive — without cancelling the run mid-flight.
+    queue: asyncio.Queue = asyncio.Queue()
+    _DONE = object()
+    text_parts: list[str] = []
+    in_tok = out_tok = 0
+    new_outputs: list[str] = []
+    errored: Optional[str] = None
+
+    async def _pump() -> None:
+        try:
+            async for evt in RUNNER.run_stream(
+                prompt=prompt, session_key=session_key, model=run_model, effort=effort
+            ):
+                await queue.put(evt)
+        except Exception as e:  # pragma: no cover - defensive
+            await queue.put(e)
+        finally:
+            await queue.put(_DONE)
+
+    producer = asyncio.create_task(_pump())
+
+    try:
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=_STREAM_HEARTBEAT_SECONDS)
+                except asyncio.TimeoutError:
+                    yield b": keep-alive\n\n"
+                    continue
+
+                if item is _DONE:
+                    break
+                if isinstance(item, Exception):
+                    errored = str(item)
+                    continue
+
+                evt = item
+                if evt.kind == "text" and evt.text:
+                    text_parts.append(evt.text)
+                    yield ev(
+                        "response.output_text.delta",
+                        {"item_id": item_id, "output_index": 0,
+                         "content_index": 0, "delta": evt.text},
+                    )
+                elif evt.kind == "final":
+                    meta = evt.raw or {}
+                    new_outputs = list(meta.get("new_outputs") or [])
+                    in_tok = int(meta.get("input_tokens") or 0)
+                    out_tok = int(meta.get("output_tokens") or 0)
+                    if meta.get("error"):
+                        errored = str(meta["error"])
+                elif evt.kind == "error":
+                    errored = evt.text or errored
+        finally:
+            if not producer.done():
+                producer.cancel()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await producer
+
+        if USAGE_LEDGER.enabled:
+            await USAGE_LEDGER.record(session_key, in_tok + out_tok)
+
+        attachments = await _register_generated_files(
+            paths=[Path(p) for p in new_outputs], session_key=session_key, inline=False
+        )
+        if attachments:
+            trailer = "\n\n" + _append_file_references("", attachments).strip()
+            text_parts.append(trailer)
+            yield ev(
+                "response.output_text.delta",
+                {"item_id": item_id, "output_index": 0, "content_index": 0, "delta": trailer},
+            )
+
+        full_text = "".join(text_parts)
+        yield ev(
+            "response.output_text.done",
+            {"item_id": item_id, "output_index": 0, "content_index": 0, "text": full_text},
+        )
+        yield ev(
+            "response.content_part.done",
+            {"item_id": item_id, "output_index": 0, "content_index": 0,
+             "part": {"type": "output_text", "text": full_text, "annotations": []}},
+        )
+        yield ev(
+            "response.output_item.done",
+            {"output_index": 0, "item": {"id": item_id, "type": "message", "status": "completed",
+                                         "role": "assistant",
+                                         "content": [{"type": "output_text", "text": full_text,
+                                                      "annotations": []}]}},
+        )
+        if errored:
+            yield ev("response.failed", {"response": envelope("failed", full_text, in_tok, out_tok, error=errored)})
+        else:
+            yield ev("response.completed", {"response": envelope("completed", full_text, in_tok, out_tok)})
+    except asyncio.CancelledError:
+        # Client disconnected — the socket is gone; just unwind.
+        raise
+    except Exception as exc:  # pragma: no cover - defensive
+        log.exception("responses streaming failed mid-stream (session=%s)", session_key)
+        with contextlib.suppress(Exception):
+            yield ev(
+                "response.failed",
+                {"response": envelope("failed", "".join(text_parts), in_tok, out_tok,
+                                      error=f"internal wrapper error: {exc}")},
+            )
+    # NOTE: the Responses streaming protocol terminates on the terminal event
+    # (response.completed/failed) — there is no chat-style `data: [DONE]`
+    # sentinel, and emitting one makes strict SDK parsers choke.
+
+
+def _responses_budget_pause(rreq: ResponsesRequest, session_key: str, state: UsageState):
+    """Render the per-conversation checkpoint in Responses shape (no Claude run)."""
+    text = _budget_message(state)
+    base_model = rreq.model if rreq.model and rreq.model != "auto" else SETTINGS.default_model
+    run_model, effort = split_model_effort(base_model)
+    if rreq.stream:
+        return StreamingResponse(
+            _responses_static_stream(rreq, session_key, base_model, run_model, effort, text),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+    envelope = _responses_envelope(
+        rreq, session_key, base_model, run_model, effort,
+        text=text, status="completed", input_tokens=0, output_tokens=0,
+        created=int(time.time()), item_id=f"msg_{uuid.uuid4().hex[:24]}",
+    )
+    return JSONResponse(content=envelope)
+
+
+async def _responses_static_stream(
+    rreq: ResponsesRequest,
+    session_key: str,
+    model: str,
+    run_model: str,
+    effort: Optional[str],
+    text: str,
+) -> AsyncIterator[bytes]:
+    """Stream a fixed, already-known message as a complete Responses event
+    sequence. Used for the budget checkpoint, where there is no Claude run."""
+    created = int(time.time())
+    item_id = f"msg_{uuid.uuid4().hex[:24]}"
+    seq = 0
+
+    def ev(event_type: str, payload: dict) -> bytes:
+        nonlocal seq
+        body = {"type": event_type, "sequence_number": seq, **payload}
+        seq += 1
+        return f"event: {event_type}\ndata: {json.dumps(body)}\n\n".encode("utf-8")
+
+    def envelope(status: str) -> dict:
+        return _responses_envelope(
+            rreq, session_key, model, run_model, effort,
+            text=text, status=status, input_tokens=0, output_tokens=0,
+            created=created, item_id=item_id,
+        )
+
+    yield ev("response.created", {"response": envelope("in_progress")})
+    yield ev(
+        "response.output_item.added",
+        {"output_index": 0, "item": {"id": item_id, "type": "message",
+                                     "status": "in_progress", "role": "assistant", "content": []}},
+    )
+    yield ev(
+        "response.content_part.added",
+        {"item_id": item_id, "output_index": 0, "content_index": 0,
+         "part": {"type": "output_text", "text": "", "annotations": []}},
+    )
+    yield ev(
+        "response.output_text.delta",
+        {"item_id": item_id, "output_index": 0, "content_index": 0, "delta": text},
+    )
+    yield ev(
+        "response.output_text.done",
+        {"item_id": item_id, "output_index": 0, "content_index": 0, "text": text},
+    )
+    yield ev("response.completed", {"response": envelope("completed")})
+
+
 # ---------- per-conversation budget gating ----------
 
 
@@ -587,11 +1011,7 @@ def _budget_pause(req: ChatCompletionRequest, session_key: str, state: UsageStat
         return StreamingResponse(
             _budget_pause_stream(req, session_key, text),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
+            headers=_SSE_HEADERS,
         )
     response = ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex[:24]}",

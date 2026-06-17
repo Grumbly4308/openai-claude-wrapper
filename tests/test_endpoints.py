@@ -299,10 +299,63 @@ def test_responses_api() -> None:
         "/v1/responses",
         json={"model": "claude-sonnet-4-6", "input": "hi"},
     )
+    body = r.json()
+    # Shape: an object response with a message item AND a flattened output_text,
+    # and an id that round-trips for chaining (resp_ prefix).
+    ok = (
+        r.status_code == 200
+        and body.get("object") == "response"
+        and body.get("output_text")
+        and body["output"][0]["content"][0]["type"] == "output_text"
+        and str(body.get("id", "")).startswith("resp_")
+    )
+    check("responses", ok, note=r.text[:200])
+
+
+def test_responses_api_chaining() -> None:
+    """The returned id, passed back as previous_response_id, must reattach to the
+    SAME session — otherwise multi-turn Responses threads silently fork."""
+    r1 = client.post("/v1/responses", json={"model": "claude-sonnet-4-6", "input": "first turn"})
+    first_id = r1.json()["id"]
+
+    r2 = client.post(
+        "/v1/responses",
+        json={
+            "model": "claude-sonnet-4-6",
+            "input": "second turn",
+            "previous_response_id": first_id,
+        },
+    )
+    # Same session => same derived response id. A fresh random id would mean the
+    # chain broke and a new Claude session was started.
+    same_session = r2.status_code == 200 and r2.json()["id"] == first_id
+    check("responses.chaining", same_session, note=f"{first_id} vs {r2.json().get('id')}")
+
+
+def test_responses_api_stream() -> None:
+    """Streaming must emit the Responses event protocol (typed events), not
+    chat.completion chunks, and must NOT use the chat-style [DONE] sentinel."""
+    with client.stream(
+        "POST",
+        "/v1/responses",
+        json={"model": "claude-sonnet-4-6", "input": "hi", "stream": True},
+    ) as r:
+        raw = r.read().decode()
+
+    has_created = '"type":"response.created"' in raw or '"type": "response.created"' in raw
+    has_delta = "response.output_text.delta" in raw
+    has_completed = "response.completed" in raw
+    # The streamed deltas must reconstruct the answer.
+    has_text = '"delta":"hello ' in raw or '"delta": "hello ' in raw
+    # Responses protocol terminates on response.completed — no chat-style [DONE],
+    # and definitely no chat.completion.chunk objects leaking through.
+    no_done = "[DONE]" not in raw
+    no_chat_chunk = "chat.completion.chunk" not in raw
     check(
-        "responses",
-        r.status_code == 200 and r.json()["output_text"],
-        note=r.text[:200],
+        "responses.stream",
+        has_created and has_delta and has_completed and has_text and no_done and no_chat_chunk,
+        note=f"created={has_created} delta={has_delta} done_ev={has_completed} "
+        f"text={has_text} no_done={no_done} no_chat={no_chat_chunk}",
     )
 
 
@@ -594,6 +647,8 @@ def main() -> int:
         test_chat_completion_stream_heartbeat,
         test_legacy_completions,
         test_responses_api,
+        test_responses_api_chaining,
+        test_responses_api_stream,
         test_embeddings,
         test_embeddings_base64,
         test_moderations,

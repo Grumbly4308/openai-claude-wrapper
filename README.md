@@ -177,9 +177,22 @@ time and reuses them afterwards. See "Delegation design" below.
 | --- | --- | --- |
 | `POST` | `/v1/chat/completions` | Streaming + non-streaming multimodal chat |
 | `POST` | `/v1/completions` | Legacy text-prompt completion |
-| `POST` | `/v1/responses` | OpenAI Responses API (maps to chat) |
+| `POST` | `/v1/responses` | OpenAI Responses API — streaming + multi-turn chaining |
 | `POST` | `/v1/embeddings` | Dense vectors via fastembed / sentence-transformers |
 | `POST` | `/v1/moderations` | Content classification via Claude |
+
+`/v1/responses` is the modern "ask and response" primitive. It accepts a
+string or structured `input` (plus optional `instructions`), and returns a
+`response` object whose `output_text` flattens the assistant message.
+
+- **Streaming** (`"stream": true`) emits the typed Responses event protocol —
+  `response.created` → `response.output_text.delta` … → `response.completed` —
+  not `chat.completion.chunk`s. There is no `[DONE]` sentinel; the stream ends
+  on the terminal `response.completed`/`response.failed` event.
+- **Multi-turn chaining**: pass a prior response's `id` back as
+  `previous_response_id` to continue the same Claude session. The id is derived
+  from the session key, so the thread deterministically reattaches rather than
+  forking a new session.
 
 ### Audio
 

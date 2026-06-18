@@ -244,6 +244,61 @@ def test_chat_completion_stream_heartbeat() -> None:
     )
 
 
+def test_chat_completion_stream_progress_and_activity() -> None:
+    """During a long no-answer-text phase the feed must show life: tool/subagent
+    activity surfaced as reasoning_content, a periodic visible 'still working'
+    tick, and the preamble that flushes buffering proxies — all without leaking
+    progress noise into the answer content."""
+    import asyncio as _asyncio
+
+    import src.main as _main
+
+    async def _busy_run_stream(self, prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None):
+        yield StreamEvent(kind="tool_use", tool_name="Bash", tool_input={"command": "pytest -q"})
+        await _asyncio.sleep(0.18)  # silent stretch -> should trigger a progress tick
+        yield StreamEvent(kind="text", text="final answer")
+        yield StreamEvent(
+            kind="final",
+            text="final answer",
+            raw={"stop_reason": "stop", "new_outputs": [], "session_uuid": "stub"},
+        )
+
+    orig_stream = ClaudeRunner.run_stream
+    orig_hb = _main._STREAM_HEARTBEAT_SECONDS
+    orig_prog = _main._STREAM_PROGRESS_SECONDS
+    ClaudeRunner.run_stream = _busy_run_stream
+    _main._STREAM_HEARTBEAT_SECONDS = 0.04
+    _main._STREAM_PROGRESS_SECONDS = 0.08
+    try:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "claude-opus-4-8 (max)",
+                "messages": [{"role": "user", "content": "hard problem"}],
+                "stream": True,
+            },
+        ) as r:
+            raw = r.read().decode()
+    finally:
+        ClaudeRunner.run_stream = orig_stream
+        _main._STREAM_HEARTBEAT_SECONDS = orig_hb
+        _main._STREAM_PROGRESS_SECONDS = orig_prog
+
+    has_preamble = raw.startswith(":  ") and "          " in raw[:2100]
+    has_tool = '"reasoning_content":"\\ud83d\\udd27 Bash: pytest -q' in raw or "🔧 Bash: pytest -q" in raw
+    has_tick = "Still working" in raw
+    has_answer = '"content":"final answer"' in raw
+    has_done = "[DONE]" in raw
+    # Progress noise rides reasoning_content, never the answer content.
+    no_progress_in_content = '"content":"⏳' not in raw and '"content":"🔧' not in raw
+    check(
+        "chat.completions.stream.progress",
+        has_preamble and has_tool and has_tick and has_answer and has_done and no_progress_in_content,
+        note=f"preamble={has_preamble} tool={has_tool} tick={has_tick} ans={has_answer} done={has_done} clean={no_progress_in_content}",
+    )
+
+
 def test_chat_completion_stream_terminates_on_post_loop_error() -> None:
     """If post-stream bookkeeping raises after bytes are on the wire, the SSE
     stream must STILL terminate with a clean error frame + [DONE] — never a
@@ -645,6 +700,7 @@ def main() -> int:
         test_chat_completion_effort_surfaced,
         test_chat_completion_stream,
         test_chat_completion_stream_heartbeat,
+        test_chat_completion_stream_progress_and_activity,
         test_legacy_completions,
         test_responses_api,
         test_responses_api_chaining,

@@ -72,6 +72,29 @@ log = logging.getLogger("claude_wrapper.api")
 # parsers but keep every idle timer in the path from firing.
 _STREAM_HEARTBEAT_SECONDS = float(os.environ.get("CLAUDE_WRAPPER_SSE_HEARTBEAT", "15"))
 
+# A bare SSE comment ("\n\n") keeps the socket warm but is invisible to the user
+# and — crucially — a response-buffering reverse proxy may not flush headers/body
+# until it has seen enough *real* bytes, leaving the client blocked reading the
+# status line until an idle timer severs the connection (aiohttp:
+# "ServerDisconnectedError" while still in resp.start). Two mitigations:
+#
+#  - A one-time preamble: a chunky comment emitted before anything else so the
+#    proxy flushes the response head immediately. ~2 KiB beats the common 1–4 KiB
+#    proxy buffer; set CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES=0 to disable.
+#  - Periodic *visible* progress: during a long silent stretch (Claude thinking
+#    or running tools/subagents on a hard problem) emit a real reasoning_content
+#    frame on a slower cadence than the heartbeat, so the feed shows life and the
+#    stream carries genuine data. Set CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS=0 off.
+_STREAM_PREAMBLE_BYTES = int(os.environ.get("CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES", "2048"))
+_STREAM_PROGRESS_SECONDS = float(os.environ.get("CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS", "25"))
+# Whether to surface tool/subagent activity in the feed (as reasoning_content).
+_STREAM_SHOW_ACTIVITY = os.environ.get("CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY", "true").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
 # Shared SSE response headers. Disabling proxy buffering (X-Accel-Buffering) and
 # caching is what lets keep-alive comments and incremental chunks actually reach
 # the client instead of being held until the response completes.
@@ -382,12 +405,24 @@ async def _stream_response(
         session_id=session_key,
         effort=_effort_info(run_model, effort),
     )
+    # Preamble first: a chunky comment flushes the response head past any
+    # buffering proxy immediately, so the client gets headers + first bytes now
+    # rather than blocking on resp.start until an idle timer kills a connection
+    # that never saw a status line.
+    if _STREAM_PREAMBLE_BYTES > 0:
+        yield b": " + b" " * _STREAM_PREAMBLE_BYTES + b"\n\n"
     yield _sse_chunk(first_chunk)
 
     finish_reason: Optional[str] = None
     new_outputs: list[str] = []
     errored: Optional[str] = None
     usage_tokens = 0
+
+    # Timing for the visible "still working" progress tick. `stream_start` anchors
+    # the elapsed display; `last_activity` is reset by any visible output, so
+    # ticks fire only during genuine silence, at _STREAM_PROGRESS_SECONDS cadence.
+    stream_start = time.monotonic()
+    last_activity = stream_start
 
     # Pump runner events through a queue so we can interleave keep-alive
     # heartbeats. The producer task owns the run_stream generator — and thus the
@@ -426,10 +461,22 @@ async def _stream_response(
                     item = await asyncio.wait_for(queue.get(), timeout=_STREAM_HEARTBEAT_SECONDS)
                 except asyncio.TimeoutError:
                     # No event for a while — Claude is thinking or running tools.
-                    # Keep the connection warm so idle-timeout proxies (and the
-                    # client's own read timeout) don't sever a stream that simply
-                    # hasn't produced visible text yet.
+                    # Always keep the socket warm with a lightweight comment so
+                    # idle-timeout proxies (and the client's own read timeout)
+                    # don't sever a stream that simply hasn't produced text yet.
                     yield b": keep-alive\n\n"
+                    now = time.monotonic()
+                    if _STREAM_PROGRESS_SECONDS > 0 and now - last_activity >= _STREAM_PROGRESS_SECONDS:
+                        # On a slower cadence than the heartbeat, emit a *visible*
+                        # progress frame: it shows the run is alive in the feed and
+                        # is real data that flushes any proxy a comment wouldn't.
+                        yield _reasoning_sse(
+                            chunk_id,
+                            created,
+                            model,
+                            f"⏳ Still working… ({_format_elapsed(now - stream_start)} elapsed)\n",
+                        )
+                        last_activity = now
                     continue
 
                 if item is _DONE:
@@ -454,23 +501,19 @@ async def _stream_response(
                         ],
                     )
                     yield _sse_chunk(chunk)
+                    last_activity = time.monotonic()
                 elif evt.kind == "thinking" and evt.text:
                     # Stream reasoning on its own channel: gives live progress
                     # during long think phases and doubles as real byte flow,
                     # while keeping the answer content clean.
-                    chunk = ChatCompletionChunk(
-                        id=chunk_id,
-                        created=created,
-                        model=model,
-                        choices=[
-                            ChatCompletionChunkChoice(
-                                index=0,
-                                delta=DeltaMessage(reasoning_content=evt.text),
-                                finish_reason=None,
-                            )
-                        ],
-                    )
-                    yield _sse_chunk(chunk)
+                    yield _reasoning_sse(chunk_id, created, model, evt.text)
+                    last_activity = time.monotonic()
+                elif evt.kind == "tool_use" and _STREAM_SHOW_ACTIVITY:
+                    # Surface what Claude is doing during the no-answer-text phase
+                    # (tool calls, subagent work) so the feed shows real progress
+                    # instead of an apparently-stalled spinner.
+                    yield _reasoning_sse(chunk_id, created, model, _format_tool_use(evt) + "\n")
+                    last_activity = time.monotonic()
                 elif evt.kind == "final":
                     meta = evt.raw or {}
                     finish_reason = meta.get("stop_reason") or "stop"
@@ -554,6 +597,53 @@ async def _stream_response(
 
 def _sse_chunk(chunk: ChatCompletionChunk) -> bytes:
     return f"data: {chunk.model_dump_json(exclude_none=True)}\n\n".encode("utf-8")
+
+
+def _reasoning_sse(chunk_id: str, created: int, model: str, text: str) -> bytes:
+    """A chat chunk carrying live progress on the reasoning channel.
+
+    Used for thinking, tool/subagent activity, and the periodic working tick —
+    all of which are progress, not answer content, so they ride reasoning_content
+    (rendered by Open WebUI as a collapsible "Thinking" section) and double as
+    real byte flow that keeps proxies and read timers happy.
+    """
+    chunk = ChatCompletionChunk(
+        id=chunk_id,
+        created=created,
+        model=model,
+        choices=[
+            ChatCompletionChunkChoice(
+                index=0,
+                delta=DeltaMessage(reasoning_content=text),
+                finish_reason=None,
+            )
+        ],
+    )
+    return _sse_chunk(chunk)
+
+
+def _format_elapsed(seconds: float) -> str:
+    secs = int(seconds)
+    if secs < 60:
+        return f"{secs}s"
+    return f"{secs // 60}m{secs % 60:02d}s"
+
+
+def _format_tool_use(evt) -> str:
+    """One-line human summary of a tool_use event for the progress feed."""
+    name = getattr(evt, "tool_name", None) or "tool"
+    inp = getattr(evt, "tool_input", None) or {}
+    summary = ""
+    if isinstance(inp, dict):
+        # Show the most informative argument for common tools.
+        for key in ("command", "file_path", "path", "pattern", "query", "url", "prompt", "description"):
+            val = inp.get(key)
+            if isinstance(val, str) and val.strip():
+                summary = " ".join(val.strip().split())
+                break
+    if len(summary) > 120:
+        summary = summary[:117] + "…"
+    return f"🔧 {name}: {summary}" if summary else f"🔧 {name}"
 
 
 def _effort_info(run_model: str, requested_effort: Optional[str]) -> dict:

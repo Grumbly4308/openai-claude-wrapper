@@ -194,6 +194,26 @@ string or structured `input` (plus optional `instructions`), and returns a
   from the session key, so the thread deterministically reattaches rather than
   forking a new session.
 
+#### Streaming feedback on long runs
+
+On a hard problem at high/max/ultracode effort, Claude may think or run
+tools for many minutes before the first answer token. To keep
+`/v1/chat/completions` streams alive and visibly *working* (rather than
+looking stalled — or being severed by a buffering proxy before any headers
+reach the client), the wrapper:
+
+- sends a one-time comment preamble to flush the response head past buffering
+  proxies immediately;
+- emits lightweight keep-alive comments, plus periodic **visible** "⏳ Still
+  working… (elapsed)" ticks on the `reasoning_content` channel during silence;
+- surfaces **tool/subagent activity** (`🔧 Bash: …`, `🔧 Read: …`) on the same
+  channel, so a tool-heavy phase shows real progress.
+
+Progress rides `reasoning_content` (Open WebUI's collapsible "Thinking"
+section), never the answer content. Tune via `CLAUDE_WRAPPER_SSE_*` (see
+`.env.example`); set `CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS=0` /
+`CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY=false` to quiet it.
+
 ### Audio
 
 | Method | Path | Purpose |

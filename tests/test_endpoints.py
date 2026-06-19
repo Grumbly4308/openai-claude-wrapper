@@ -33,7 +33,7 @@ TINY_PNG = base64.b64decode(
 )
 
 
-async def _stub_run_collect(self, prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None):
+async def _stub_run_collect(self, prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None, **_kwargs):
     cwd = self.workspace_root / session_key
     (cwd / "outputs").mkdir(parents=True, exist_ok=True)
     text = "ok"
@@ -73,7 +73,7 @@ async def _stub_run_collect(self, prompt, session_key, model=None, env_extra=Non
     )
 
 
-async def _stub_run_stream(self, prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None):
+async def _stub_run_stream(self, prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None, **_kwargs):
     yield StreamEvent(kind="text", text="hello ")
     yield StreamEvent(kind="text", text="stream")
     yield StreamEvent(
@@ -202,7 +202,7 @@ def test_chat_completion_stream_heartbeat() -> None:
 
     import src.main as _main
 
-    async def _slow_run_stream(self, prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None):
+    async def _slow_run_stream(self, prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None, **_kwargs):
         await _asyncio.sleep(0.15)  # silent "thinking" gap — should trigger heartbeats
         yield StreamEvent(kind="thinking", text="pondering")
         yield StreamEvent(kind="text", text="answer")
@@ -253,7 +253,7 @@ def test_chat_completion_stream_progress_and_activity() -> None:
 
     import src.main as _main
 
-    async def _busy_run_stream(self, prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None):
+    async def _busy_run_stream(self, prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None, **_kwargs):
         yield StreamEvent(kind="tool_use", tool_name="Bash", tool_input={"command": "pytest -q"})
         await _asyncio.sleep(0.18)  # silent stretch -> should trigger a progress tick
         yield StreamEvent(kind="text", text="final answer")

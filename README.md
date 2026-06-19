@@ -214,6 +214,25 @@ section), never the answer content. Tune via `CLAUDE_WRAPPER_SSE_*` (see
 `.env.example`); set `CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS=0` /
 `CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY=false` to quiet it.
 
+#### Clarifying questions (interactive)
+
+Headless Claude Code has no interactive question UI: its `AskUserQuestion`
+card gets auto-dismissed, so Claude proceeds on assumptions and you never get
+to answer. With the **clarification protocol** on (default), the wrapper:
+
+- injects a system prompt (`--append-system-prompt`) teaching Claude that, when
+  a decision genuinely changes the result, it should ask its questions as plain
+  numbered text **and stop** — making the questions the whole turn — so you
+  answer in your next message and the session resumes automatically;
+- disables the dead interactive tool (`--disallowedTools AskUserQuestion`) so
+  questions always arrive as answerable text.
+
+Only chat/responses opt in; delegated task endpoints (audio, images, …) never
+pause. Disable globally with `CLAUDE_WRAPPER_CLARIFY=off`, override the injected
+instruction with `CLAUDE_WRAPPER_CLARIFY_PROMPT`, or opt a single request out
+with `"clarify": false` in the request body. (No clickable option buttons —
+Open WebUI has no way to feed those back; this is well-formatted text Q&A.)
+
 ### Audio
 
 | Method | Path | Purpose |

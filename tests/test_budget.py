@@ -227,7 +227,7 @@ def test_is_continue() -> None:
 _CALLS = {"n": 0}
 
 
-async def _stub_run_collect(prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None):
+async def _stub_run_collect(prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None, **_kwargs):
     _CALLS["n"] += 1
     return ClaudeResult(
         session_uuid="stub-uuid",

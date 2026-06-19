@@ -115,12 +115,19 @@ class ClaudeRunner:
         claude_bin: str = "claude",
         request_timeout_seconds: int = 1800,
         effort: str = "",
+        clarify_system_prompt: str = "",
+        clarify_disallowed_tools: tuple[str, ...] = (),
     ):
         self.registry = registry
         self.workspace_root = workspace_root
         self.claude_bin = claude_bin
         self.request_timeout_seconds = request_timeout_seconds
         self.effort = effort
+        # Interactive clarification protocol, applied only when a caller passes
+        # clarify=True (chat/responses) AND a prompt is configured. Empty prompt
+        # ⇒ globally disabled (CLAUDE_WRAPPER_CLARIFY=off), so it's a no-op.
+        self.clarify_system_prompt = clarify_system_prompt
+        self.clarify_disallowed_tools = clarify_disallowed_tools
 
     def _session_cwd(self, session_key: str) -> Path:
         d = self.workspace_root / session_key
@@ -185,6 +192,7 @@ class ClaudeRunner:
         resume: bool,
         extra_args: Optional[list[str]] = None,
         effort: Optional[str] = None,
+        clarify: bool = False,
     ) -> list[str]:
         # Prompt is fed via stdin (not argv) to avoid E2BIG on large prompts.
         argv = [
@@ -218,6 +226,15 @@ class ClaudeRunner:
             argv += ["--settings", '{"enableWorkflows": true, "ultracode": true}']
         elif eff:
             argv += ["--effort", eff]
+        # Interactive clarification: teach Claude to pause-and-ask in plain text
+        # and disable the headless-dead question-card tool. Placed so the variadic
+        # --disallowedTools is terminated by the following --dangerously-skip-…
+        # flag rather than greedily eating a later positional.
+        if clarify:
+            if self.clarify_system_prompt:
+                argv += ["--append-system-prompt", self.clarify_system_prompt]
+            if self.clarify_disallowed_tools:
+                argv += ["--disallowedTools", *self.clarify_disallowed_tools]
         argv += ["--dangerously-skip-permissions"]
         if extra_args:
             argv += list(extra_args)
@@ -231,6 +248,7 @@ class ClaudeRunner:
         env_extra: Optional[dict[str, str]] = None,
         extra_args: Optional[list[str]] = None,
         effort: Optional[str] = None,
+        clarify: bool = False,
     ) -> AsyncIterator[StreamEvent]:
         """Yield StreamEvents as the subprocess produces them.
 
@@ -249,6 +267,7 @@ class ClaudeRunner:
                 resume=not created,
                 extra_args=extra_args,
                 effort=effort,
+                clarify=clarify,
             )
 
             env = os.environ.copy()
@@ -399,6 +418,7 @@ class ClaudeRunner:
         env_extra: Optional[dict[str, str]] = None,
         extra_args: Optional[list[str]] = None,
         effort: Optional[str] = None,
+        clarify: bool = False,
     ) -> ClaudeResult:
         result = ClaudeResult(session_uuid="", final_text="")
         text_parts: list[str] = []
@@ -410,6 +430,7 @@ class ClaudeRunner:
             env_extra=env_extra,
             extra_args=extra_args,
             effort=effort,
+            clarify=clarify,
         ):
             result.events.append(evt)
             if evt.kind == "text" and evt.text:

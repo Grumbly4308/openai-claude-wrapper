@@ -136,6 +136,16 @@ async def _startup() -> None:
             "Claude to query the OpenWebUI retrieval API."
         )
 
+    # Interactive clarification protocol state at boot.
+    if SETTINGS.clarify_enabled:
+        log.info(
+            "interactive clarification ENABLED — chat/responses pause to ask in text; "
+            "disallowed tools: %s",
+            ", ".join(SETTINGS.clarify_disallowed_tools) or "(none)",
+        )
+    else:
+        log.info("interactive clarification DISABLED (CLAUDE_WRAPPER_CLARIFY=off)")
+
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
@@ -330,7 +340,8 @@ async def _sync_response(
 ) -> JSONResponse:
     run_model, effort = split_model_effort(model)
     result = await RUNNER.run_collect(
-        prompt=prompt, session_key=session_key, model=run_model, effort=effort
+        prompt=prompt, session_key=session_key, model=run_model, effort=effort,
+        clarify=_resolve_clarify(req),
     )
 
     if result.error and not result.final_text:
@@ -390,6 +401,7 @@ async def _stream_response(
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
     run_model, effort = split_model_effort(model)
+    clarify = _resolve_clarify(req)
 
     first_chunk = ChatCompletionChunk(
         id=chunk_id,
@@ -437,7 +449,7 @@ async def _stream_response(
     async def _pump() -> None:
         try:
             async for evt in RUNNER.run_stream(
-                prompt=prompt, session_key=session_key, model=run_model, effort=effort
+                prompt=prompt, session_key=session_key, model=run_model, effort=effort, clarify=clarify
             ):
                 await queue.put(evt)
         except Exception as e:  # pragma: no cover - defensive
@@ -656,6 +668,17 @@ def _effort_info(run_model: str, requested_effort: Optional[str]) -> dict:
     return {"applied": applied or "cli-default", "source": source, "requested": requested_effort}
 
 
+def _resolve_clarify(req) -> bool:
+    """Per-request intent for the interactive clarification protocol.
+
+    Absent/None => on (the interactive default); explicit false opts a request
+    out. The server-level switch is enforced in the runner (an empty configured
+    prompt makes clarify=True a no-op), so this only governs per-request intent.
+    """
+    val = getattr(req, "clarify", None)
+    return True if val is None else bool(val)
+
+
 # ---------- responses API (/v1/responses) ----------
 #
 # OpenAI's "ask and response" primitive. Two things distinguish it from
@@ -789,7 +812,8 @@ async def _responses_sync(
 ) -> JSONResponse:
     run_model, effort = split_model_effort(model)
     result = await RUNNER.run_collect(
-        prompt=prompt, session_key=session_key, model=run_model, effort=effort
+        prompt=prompt, session_key=session_key, model=run_model, effort=effort,
+        clarify=_resolve_clarify(rreq),
     )
     if result.error and not result.final_text:
         raise HTTPException(status_code=502, detail=f"claude failed: {result.error}")
@@ -829,6 +853,7 @@ async def _responses_stream(
     rreq: ResponsesRequest, prompt: str, session_key: str, model: str
 ) -> AsyncIterator[bytes]:
     run_model, effort = split_model_effort(model)
+    clarify = _resolve_clarify(rreq)
     created = int(time.time())
     item_id = f"msg_{uuid.uuid4().hex[:24]}"
     seq = 0
@@ -876,7 +901,7 @@ async def _responses_stream(
     async def _pump() -> None:
         try:
             async for evt in RUNNER.run_stream(
-                prompt=prompt, session_key=session_key, model=run_model, effort=effort
+                prompt=prompt, session_key=session_key, model=run_model, effort=effort, clarify=clarify
             ):
                 await queue.put(evt)
         except Exception as e:  # pragma: no cover - defensive

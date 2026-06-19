@@ -77,6 +77,10 @@ class ChatCompletionRequest(BaseModel):
     # Whether to return generated files inline as base64 in the
     # final assistant message (true) or as file_id references (false).
     inline_generated_files: bool = False
+    # Per-request override for the interactive clarification protocol. None
+    # (default) follows the server setting; false opts this request out (e.g. a
+    # non-interactive/automated caller that must never pause to ask questions).
+    clarify: Optional[bool] = None
 
 
 # ---------- Chat completion response ----------

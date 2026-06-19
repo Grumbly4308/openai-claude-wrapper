@@ -29,8 +29,36 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off", "disabled")
+
+
 def _keyword_set(raw: str) -> frozenset[str]:
     return frozenset(k.strip().lower() for k in raw.split(",") if k.strip())
+
+
+# Injected (via `claude --append-system-prompt`) on interactive chat/responses
+# requests so Claude pauses for clarification at a real turn boundary the user
+# can answer, instead of either firing the headless-dead AskUserQuestion card or
+# asking-then-proceeding in one shot. Override with CLAUDE_WRAPPER_CLARIFY_PROMPT;
+# turn the whole behavior off with CLAUDE_WRAPPER_CLARIFY=off.
+DEFAULT_CLARIFY_SYSTEM_PROMPT = (
+    "Clarification protocol (you are an interactive chat assistant reached over a "
+    "headless API; there is no interactive question UI, so the only way to ask the "
+    "user something is in plain text). When a genuine ambiguity would materially "
+    "change what you build or answer, do NOT guess and proceed. Instead make your "
+    "ENTIRE reply a short list of only the blocking questions — at most 2-3, each a "
+    "numbered question with 2-4 lettered options and a recommended default — then "
+    "STOP and end your turn so the user can answer. Do not begin the work in that "
+    "same turn. End with a line like: \"Reply e.g. `1a 2b`, or in your own words — "
+    "if you don't answer I'll proceed with the defaults.\" Treat the user's next "
+    "message as the answers and continue from there. If the ambiguity is minor or "
+    "the request is already clear, just proceed, stating any assumptions in one "
+    "short line. Never ask more questions than necessary."
+)
 
 
 # Subscription-plan → per-session token allowance.
@@ -122,6 +150,9 @@ class Settings:
     session_block_percent: float
     session_plan: str
     budget_continue_keywords: frozenset[str]
+    clarify_enabled: bool
+    clarify_system_prompt: str
+    clarify_disallowed_tools: tuple[str, ...]
 
     @property
     def session_block_tokens(self) -> int:
@@ -180,6 +211,22 @@ class Settings:
                     "CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD",
                     "continue,proceed,keep going,go on,yes",
                 )
+            ),
+            # Interactive clarification protocol. On by default for chat/responses
+            # so Claude asks answerable questions and pauses, rather than firing a
+            # dead AskUserQuestion card or asking-then-proceeding. Delegated task
+            # endpoints (audio/images/etc.) never opt in.
+            clarify_enabled=_bool_env("CLAUDE_WRAPPER_CLARIFY", True),
+            clarify_system_prompt=(
+                os.environ.get("CLAUDE_WRAPPER_CLARIFY_PROMPT", "").strip()
+                or DEFAULT_CLARIFY_SYSTEM_PROMPT
+            ),
+            clarify_disallowed_tools=tuple(
+                t.strip()
+                for t in os.environ.get(
+                    "CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS", "AskUserQuestion"
+                ).split(",")
+                if t.strip()
             ),
         )
 

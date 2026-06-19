@@ -36,6 +36,9 @@ RUNNER = ClaudeRunner(
     claude_bin=SETTINGS.claude_bin,
     request_timeout_seconds=SETTINGS.request_timeout_seconds,
     effort=SETTINGS.effort,
+    # Empty when CLAUDE_WRAPPER_CLARIFY=off, which makes clarify=True a no-op.
+    clarify_system_prompt=SETTINGS.clarify_system_prompt if SETTINGS.clarify_enabled else "",
+    clarify_disallowed_tools=SETTINGS.clarify_disallowed_tools if SETTINGS.clarify_enabled else (),
 )
 PREPARER = MessagePreparer(FILE_STORE, SETTINGS.workspace_dir, registry=SESSIONS)
 DELEGATE = Delegator(RUNNER, SETTINGS.workspace_dir)

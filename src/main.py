@@ -97,18 +97,20 @@ _STREAM_SHOW_ACTIVITY = os.environ.get("CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY", "true
 
 # Which channel carries reasoning/progress frames (thinking, tool activity, the
 # periodic "still working" tick) to the client:
-#   - "think_tags" (default): inline <think>…</think> wrapped around the reasoning
-#     text in the *content* stream. Open WebUI strips the tags into its collapsible
-#     "Thinking" panel — and unlike reasoning_content this works on older OWUI
-#     builds too (which silently drop the reasoning_content field).
-#   - "reasoning_content": the DeepSeek-R1 delta field. Rendered by recent OWUI,
-#     and kept clean for non-OWUI OpenAI clients that parse it natively.
+#   - "reasoning_content" (default): the structured DeepSeek-R1 delta field.
+#     Modern Open WebUI (0.5+, incl. 0.10.x) renders it as the collapsible
+#     "Thinking" panel with a "Thought for N seconds" timer. Requires the model to
+#     actually emit thinking — use an effort-enabled model / CLAUDE_WRAPPER_EFFORT,
+#     or there is nothing to show.
+#   - "think_tags": inline <think>…</think> in the *content* stream. Legacy
+#     fallback only — OWUI 0.10.x does NOT parse inline tags (it renders them as
+#     literal text), so use this solely for pre-reasoning OWUI builds.
 #   - "none": suppress reasoning/progress frames entirely (answer text only).
-# The <think> block is opened lazily on the first reasoning frame and closed
-# before the first answer-text token (and again at stream end as a safety net),
-# so the answer content never carries an unbalanced tag.
+# In think_tags mode the <think> block is opened lazily on the first reasoning
+# frame and closed before the first answer token (and again at stream end as a
+# safety net), so the answer content never carries an unbalanced tag.
 _REASONING_CHANNEL = os.environ.get(
-    "CLAUDE_WRAPPER_REASONING_CHANNEL", "think_tags"
+    "CLAUDE_WRAPPER_REASONING_CHANNEL", "reasoning_content"
 ).strip().lower()
 
 # Shared SSE response headers. Disabling proxy buffering (X-Accel-Buffering) and

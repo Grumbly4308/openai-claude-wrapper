@@ -97,21 +97,34 @@ _STREAM_SHOW_ACTIVITY = os.environ.get("CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY", "true
 
 # Which channel carries reasoning/progress frames (thinking, tool activity, the
 # periodic "still working" tick) to the client:
-#   - "reasoning_content" (default): the structured DeepSeek-R1 delta field.
-#     Modern Open WebUI (0.5+, incl. 0.10.x) renders it as the collapsible
-#     "Thinking" panel with a "Thought for N seconds" timer. Requires the model to
-#     actually emit thinking — use an effort-enabled model / CLAUDE_WRAPPER_EFFORT,
-#     or there is nothing to show.
-#   - "think_tags": inline <think>…</think> in the *content* stream. Legacy
-#     fallback only — OWUI 0.10.x does NOT parse inline tags (it renders them as
-#     literal text), so use this solely for pre-reasoning OWUI builds.
+#   - "details" (default): wrap reasoning in a <details type="reasoning"> block on
+#     the *content* stream. This is OWUI's own internal representation of a
+#     reasoning block, so its frontend renders it as a collapsible panel
+#     REGARDLESS of provider. Necessary because OWUI classifies this wrapper as an
+#     "openai" provider, and its get_reasoning_format() returns None for openai —
+#     i.e. it ignores BOTH the reasoning_content field AND inline <think> tags, so
+#     no native reasoning channel will ever render here.
+#   - "reasoning_content": the structured DeepSeek-R1 delta field. Renders natively
+#     ONLY on providers OWUI recognizes for it (e.g. llama.cpp), not openai.
+#   - "think_tags": inline <think>…</think> in content. Ollama-provider only; OWUI
+#     does not parse it for openai connections (shows literal tags).
 #   - "none": suppress reasoning/progress frames entirely (answer text only).
-# In think_tags mode the <think> block is opened lazily on the first reasoning
-# frame and closed before the first answer token (and again at stream end as a
-# safety net), so the answer content never carries an unbalanced tag.
+# For the content-wrapped modes (details, think_tags) the block is opened lazily
+# on the first reasoning frame and closed before the first answer token (and again
+# at stream end as a safety net), so content never carries an unbalanced tag.
 _REASONING_CHANNEL = os.environ.get(
-    "CLAUDE_WRAPPER_REASONING_CHANNEL", "reasoning_content"
+    "CLAUDE_WRAPPER_REASONING_CHANNEL", "details"
 ).strip().lower()
+
+# (open, close) token pairs for the channels that wrap reasoning inside the
+# content stream. Other channels (reasoning_content, none) are not in this map.
+_CONTENT_WRAP = {
+    "details": (
+        '<details type="reasoning">\n<summary>💭 Thinking…</summary>\n\n',
+        "\n\n</details>\n\n",
+    ),
+    "think_tags": ("<think>\n", "\n</think>\n\n"),
+}
 
 # Shared SSE response headers. Disabling proxy buffering (X-Accel-Buffering) and
 # caching is what lets keep-alive comments and incremental chunks actually reach
@@ -454,27 +467,30 @@ async def _stream_response(
     stream_start = time.monotonic()
     last_activity = stream_start
 
-    # Reasoning/progress routing. In "think_tags" mode every reasoning frame is
-    # wrapped in a single <think>…</think> block on the content channel; the
+    # Reasoning/progress routing. In a content-wrapped mode (details, think_tags)
+    # every reasoning frame goes into a single block on the content channel; the
     # block is opened lazily and closed before the first answer token. `nonlocal`
     # lets the nested emitters flip this flag as they open/close the block.
-    think_open = False
+    reasoning_open = False
 
     def _reasoning_frame(text: str) -> Optional[bytes]:
-        nonlocal think_open
+        nonlocal reasoning_open
         if _REASONING_CHANNEL == "none":
             return None
-        if _REASONING_CHANNEL == "think_tags":
-            body = text if think_open else "<think>\n" + text
-            think_open = True
+        wrap = _CONTENT_WRAP.get(_REASONING_CHANNEL)
+        if wrap is not None:
+            body = text if reasoning_open else wrap[0] + text
+            reasoning_open = True
             return _content_sse(chunk_id, created, model, body)
         return _reasoning_sse(chunk_id, created, model, text)
 
-    def _close_think() -> Optional[bytes]:
-        nonlocal think_open
-        if think_open:
-            think_open = False
-            return _content_sse(chunk_id, created, model, "\n</think>\n\n")
+    def _close_reasoning() -> Optional[bytes]:
+        nonlocal reasoning_open
+        if reasoning_open:
+            reasoning_open = False
+            wrap = _CONTENT_WRAP.get(_REASONING_CHANNEL)
+            if wrap is not None:
+                return _content_sse(chunk_id, created, model, wrap[1])
         return None
 
     # Pump runner events through a queue so we can interleave keep-alive
@@ -542,7 +558,7 @@ async def _stream_response(
                 if evt.kind == "text" and evt.text:
                     # Close any open <think> block (think_tags mode) so reasoning
                     # never bleeds into the answer content.
-                    close = _close_think()
+                    close = _close_reasoning()
                     if close is not None:
                         yield close
                     chunk = ChatCompletionChunk(
@@ -597,7 +613,7 @@ async def _stream_response(
         # If the run ended while a <think> block was still open (reasoning but no
         # trailing answer text), close it before any trailer/terminator so the
         # content never ships an unbalanced tag.
-        close = _close_think()
+        close = _close_reasoning()
         if close is not None:
             yield close
 
@@ -643,7 +659,7 @@ async def _stream_response(
     try:
         # Safety net for the error path, which skips the post-loop close above:
         # never leave a <think> block unterminated in the content stream.
-        close = _close_think()
+        close = _close_reasoning()
         if close is not None:
             yield close
         final_chunk = ChatCompletionChunk(

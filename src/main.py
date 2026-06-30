@@ -95,6 +95,22 @@ _STREAM_SHOW_ACTIVITY = os.environ.get("CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY", "true
     "off",
 )
 
+# Which channel carries reasoning/progress frames (thinking, tool activity, the
+# periodic "still working" tick) to the client:
+#   - "think_tags" (default): inline <think>…</think> wrapped around the reasoning
+#     text in the *content* stream. Open WebUI strips the tags into its collapsible
+#     "Thinking" panel — and unlike reasoning_content this works on older OWUI
+#     builds too (which silently drop the reasoning_content field).
+#   - "reasoning_content": the DeepSeek-R1 delta field. Rendered by recent OWUI,
+#     and kept clean for non-OWUI OpenAI clients that parse it natively.
+#   - "none": suppress reasoning/progress frames entirely (answer text only).
+# The <think> block is opened lazily on the first reasoning frame and closed
+# before the first answer-text token (and again at stream end as a safety net),
+# so the answer content never carries an unbalanced tag.
+_REASONING_CHANNEL = os.environ.get(
+    "CLAUDE_WRAPPER_REASONING_CHANNEL", "think_tags"
+).strip().lower()
+
 # Shared SSE response headers. Disabling proxy buffering (X-Accel-Buffering) and
 # caching is what lets keep-alive comments and incremental chunks actually reach
 # the client instead of being held until the response completes.
@@ -436,6 +452,29 @@ async def _stream_response(
     stream_start = time.monotonic()
     last_activity = stream_start
 
+    # Reasoning/progress routing. In "think_tags" mode every reasoning frame is
+    # wrapped in a single <think>…</think> block on the content channel; the
+    # block is opened lazily and closed before the first answer token. `nonlocal`
+    # lets the nested emitters flip this flag as they open/close the block.
+    think_open = False
+
+    def _reasoning_frame(text: str) -> Optional[bytes]:
+        nonlocal think_open
+        if _REASONING_CHANNEL == "none":
+            return None
+        if _REASONING_CHANNEL == "think_tags":
+            body = text if think_open else "<think>\n" + text
+            think_open = True
+            return _content_sse(chunk_id, created, model, body)
+        return _reasoning_sse(chunk_id, created, model, text)
+
+    def _close_think() -> Optional[bytes]:
+        nonlocal think_open
+        if think_open:
+            think_open = False
+            return _content_sse(chunk_id, created, model, "\n</think>\n\n")
+        return None
+
     # Pump runner events through a queue so we can interleave keep-alive
     # heartbeats. The producer task owns the run_stream generator — and thus the
     # Claude subprocess and the session lock — while the consumer below only
@@ -482,12 +521,11 @@ async def _stream_response(
                         # On a slower cadence than the heartbeat, emit a *visible*
                         # progress frame: it shows the run is alive in the feed and
                         # is real data that flushes any proxy a comment wouldn't.
-                        yield _reasoning_sse(
-                            chunk_id,
-                            created,
-                            model,
-                            f"⏳ Still working… ({_format_elapsed(now - stream_start)} elapsed)\n",
+                        frame = _reasoning_frame(
+                            f"⏳ Still working… ({_format_elapsed(now - stream_start)} elapsed)\n"
                         )
+                        if frame is not None:
+                            yield frame
                         last_activity = now
                     continue
 
@@ -500,6 +538,11 @@ async def _stream_response(
 
                 evt = item
                 if evt.kind == "text" and evt.text:
+                    # Close any open <think> block (think_tags mode) so reasoning
+                    # never bleeds into the answer content.
+                    close = _close_think()
+                    if close is not None:
+                        yield close
                     chunk = ChatCompletionChunk(
                         id=chunk_id,
                         created=created,
@@ -518,13 +561,17 @@ async def _stream_response(
                     # Stream reasoning on its own channel: gives live progress
                     # during long think phases and doubles as real byte flow,
                     # while keeping the answer content clean.
-                    yield _reasoning_sse(chunk_id, created, model, evt.text)
+                    frame = _reasoning_frame(evt.text)
+                    if frame is not None:
+                        yield frame
                     last_activity = time.monotonic()
                 elif evt.kind == "tool_use" and _STREAM_SHOW_ACTIVITY:
                     # Surface what Claude is doing during the no-answer-text phase
                     # (tool calls, subagent work) so the feed shows real progress
                     # instead of an apparently-stalled spinner.
-                    yield _reasoning_sse(chunk_id, created, model, _format_tool_use(evt) + "\n")
+                    frame = _reasoning_frame(_format_tool_use(evt) + "\n")
+                    if frame is not None:
+                        yield frame
                     last_activity = time.monotonic()
                 elif evt.kind == "final":
                     meta = evt.raw or {}
@@ -544,6 +591,13 @@ async def _stream_response(
                 producer.cancel()
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 await producer
+
+        # If the run ended while a <think> block was still open (reasoning but no
+        # trailing answer text), close it before any trailer/terminator so the
+        # content never ships an unbalanced tag.
+        close = _close_think()
+        if close is not None:
+            yield close
 
         # Post-stream bookkeeping. These touch disk (the token ledger) and the
         # file store, so they can fail — but a failure here must not truncate an
@@ -585,6 +639,11 @@ async def _stream_response(
     # failure when building the final chunk still closes the stream with [DONE]
     # rather than leaving a dangling chunked body.
     try:
+        # Safety net for the error path, which skips the post-loop close above:
+        # never leave a <think> block unterminated in the content stream.
+        close = _close_think()
+        if close is not None:
+            yield close
         final_chunk = ChatCompletionChunk(
             id=chunk_id,
             created=created,
@@ -609,6 +668,28 @@ async def _stream_response(
 
 def _sse_chunk(chunk: ChatCompletionChunk) -> bytes:
     return f"data: {chunk.model_dump_json(exclude_none=True)}\n\n".encode("utf-8")
+
+
+def _content_sse(chunk_id: str, created: int, model: str, text: str) -> bytes:
+    """A chat chunk carrying text on the answer (content) channel.
+
+    Used for answer tokens, the file-reference trailer, and — when
+    CLAUDE_WRAPPER_REASONING_CHANNEL=think_tags — reasoning wrapped in
+    <think>…</think> for Open WebUI builds that don't render reasoning_content.
+    """
+    chunk = ChatCompletionChunk(
+        id=chunk_id,
+        created=created,
+        model=model,
+        choices=[
+            ChatCompletionChunkChoice(
+                index=0,
+                delta=DeltaMessage(content=text),
+                finish_reason=None,
+            )
+        ],
+    )
+    return _sse_chunk(chunk)
 
 
 def _reasoning_sse(chunk_id: str, created: int, model: str, text: str) -> bytes:

@@ -117,12 +117,18 @@ class ClaudeRunner:
         effort: str = "",
         clarify_system_prompt: str = "",
         clarify_disallowed_tools: tuple[str, ...] = (),
+        stream_partial_messages: bool = True,
     ):
         self.registry = registry
         self.workspace_root = workspace_root
         self.claude_bin = claude_bin
         self.request_timeout_seconds = request_timeout_seconds
         self.effort = effort
+        # Emit incremental text/thinking deltas (live streaming) via
+        # `--include-partial-messages`. When on, the consolidated assistant
+        # text/thinking blocks are suppressed in _normalize_stream_event to avoid
+        # double-emitting what the deltas already streamed.
+        self.stream_partial_messages = stream_partial_messages
         # Interactive clarification protocol, applied only when a caller passes
         # clarify=True (chat/responses) AND a prompt is configured. Empty prompt
         # ⇒ globally disabled (CLAUDE_WRAPPER_CLARIFY=off), so it's a no-op.
@@ -202,6 +208,10 @@ class ClaudeRunner:
             "stream-json",
             "--verbose",
         ]
+        if self.stream_partial_messages:
+            # Incremental message deltas (content_block_delta) so text and
+            # thinking stream token-by-token rather than one block at a time.
+            argv += ["--include-partial-messages"]
         if resume:
             argv += ["--resume", session_uuid]
         else:
@@ -328,7 +338,7 @@ class ClaudeRunner:
                     except json.JSONDecodeError:
                         continue
 
-                    for normalized in _normalize_stream_event(evt):
+                    for normalized in _normalize_stream_event(evt, partial=self.stream_partial_messages):
                         if normalized.kind == "text" and normalized.text:
                             final_text_parts.append(normalized.text)
                         yield normalized
@@ -505,9 +515,35 @@ async def _drain_stderr(stream: Optional[asyncio.StreamReader]) -> str:
     return text
 
 
-def _normalize_stream_event(evt: dict) -> list[StreamEvent]:
-    """Convert a raw Claude Code stream-json event into StreamEvents."""
+def _normalize_stream_event(evt: dict, partial: bool = False) -> list[StreamEvent]:
+    """Convert a raw Claude Code stream-json event into StreamEvents.
+
+    When ``partial`` is True the run was launched with
+    ``--include-partial-messages``, so live text/thinking arrive as incremental
+    ``stream_event`` deltas (handled below). In that mode the *consolidated*
+    assistant ``text``/``thinking`` blocks are suppressed — they would otherwise
+    re-emit, in one chunk, exactly what the deltas already streamed. tool_use is
+    still taken from the consolidated block (its input doesn't stream usefully).
+    """
     etype = evt.get("type")
+
+    if etype == "stream_event":
+        # Incremental Anthropic streaming event (only present with
+        # --include-partial-messages). We care about content_block_delta for
+        # text and thinking; block start/stop, tool input fragments, signatures,
+        # and message-level deltas are not needed for the client stream.
+        inner = evt.get("event") or {}
+        if inner.get("type") != "content_block_delta":
+            return []
+        delta = inner.get("delta") or {}
+        dtype = delta.get("type")
+        if dtype == "text_delta":
+            text = delta.get("text") or ""
+            return [StreamEvent(kind="text", text=text, raw=inner)] if text else []
+        if dtype == "thinking_delta":
+            thinking = delta.get("thinking") or ""
+            return [StreamEvent(kind="thinking", text=thinking, raw=inner)] if thinking else []
+        return []
 
     if etype == "system":
         return [StreamEvent(kind="system", raw=evt)]
@@ -519,10 +555,14 @@ def _normalize_stream_event(evt: dict) -> list[StreamEvent]:
         for block in content:
             btype = block.get("type")
             if btype == "text":
+                if partial:
+                    continue  # already streamed via text_delta
                 text = block.get("text") or ""
                 if text:
                     out.append(StreamEvent(kind="text", text=text, raw=block))
             elif btype == "thinking":
+                if partial:
+                    continue  # already streamed via thinking_delta
                 out.append(StreamEvent(kind="thinking", text=block.get("thinking") or "", raw=block))
             elif btype == "tool_use":
                 out.append(

@@ -214,8 +214,10 @@ def test_chat_completion_stream_heartbeat() -> None:
 
     orig_run_stream = ClaudeRunner.run_stream
     orig_hb = _main._STREAM_HEARTBEAT_SECONDS
+    orig_channel = _main._REASONING_CHANNEL
     ClaudeRunner.run_stream = _slow_run_stream
     _main._STREAM_HEARTBEAT_SECONDS = 0.05
+    _main._REASONING_CHANNEL = "reasoning_content"  # exercise the reasoning_content channel
     try:
         with client.stream(
             "POST",
@@ -230,6 +232,7 @@ def test_chat_completion_stream_heartbeat() -> None:
     finally:
         ClaudeRunner.run_stream = orig_run_stream
         _main._STREAM_HEARTBEAT_SECONDS = orig_hb
+        _main._REASONING_CHANNEL = orig_channel
 
     has_heartbeat = ": keep-alive" in raw
     has_reasoning = '"reasoning_content":"pondering"' in raw
@@ -266,9 +269,11 @@ def test_chat_completion_stream_progress_and_activity() -> None:
     orig_stream = ClaudeRunner.run_stream
     orig_hb = _main._STREAM_HEARTBEAT_SECONDS
     orig_prog = _main._STREAM_PROGRESS_SECONDS
+    orig_channel = _main._REASONING_CHANNEL
     ClaudeRunner.run_stream = _busy_run_stream
     _main._STREAM_HEARTBEAT_SECONDS = 0.04
     _main._STREAM_PROGRESS_SECONDS = 0.08
+    _main._REASONING_CHANNEL = "reasoning_content"  # exercise the reasoning_content channel
     try:
         with client.stream(
             "POST",
@@ -284,6 +289,7 @@ def test_chat_completion_stream_progress_and_activity() -> None:
         ClaudeRunner.run_stream = orig_stream
         _main._STREAM_HEARTBEAT_SECONDS = orig_hb
         _main._STREAM_PROGRESS_SECONDS = orig_prog
+        _main._REASONING_CHANNEL = orig_channel
 
     has_preamble = raw.startswith(":  ") and "          " in raw[:2100]
     has_tool = '"reasoning_content":"\\ud83d\\udd27 Bash: pytest -q' in raw or "🔧 Bash: pytest -q" in raw
@@ -296,6 +302,122 @@ def test_chat_completion_stream_progress_and_activity() -> None:
         "chat.completions.stream.progress",
         has_preamble and has_tool and has_tick and has_answer and has_done and no_progress_in_content,
         note=f"preamble={has_preamble} tool={has_tool} tick={has_tick} ans={has_answer} done={has_done} clean={no_progress_in_content}",
+    )
+
+
+def test_chat_completion_stream_think_tags() -> None:
+    """With CLAUDE_WRAPPER_REASONING_CHANNEL=think_tags, reasoning rides the
+    *content* channel wrapped in a single <think>…</think> block (for Open WebUI
+    builds that don't render reasoning_content), closed before the first answer
+    token. No reasoning_content frames are emitted in this mode."""
+    import asyncio as _asyncio
+
+    import src.main as _main
+
+    async def _run(self, prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None, **_kwargs):
+        yield StreamEvent(kind="tool_use", tool_name="Bash", tool_input={"command": "ls"})
+        yield StreamEvent(kind="thinking", text="pondering")
+        yield StreamEvent(kind="text", text="answer")
+        yield StreamEvent(
+            kind="final",
+            text="answer",
+            raw={"stop_reason": "stop", "new_outputs": [], "session_uuid": "stub"},
+        )
+        await _asyncio.sleep(0)
+
+    orig_run_stream = ClaudeRunner.run_stream
+    orig_channel = _main._REASONING_CHANNEL
+    ClaudeRunner.run_stream = _run
+    _main._REASONING_CHANNEL = "think_tags"
+    try:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ) as r:
+            raw = r.read().decode()
+    finally:
+        ClaudeRunner.run_stream = orig_run_stream
+        _main._REASONING_CHANNEL = orig_channel
+
+    opened = '"content":"<think>' in raw
+    has_thought = "pondering" in raw
+    closed = "</think>" in raw
+    has_answer = '"content":"answer"' in raw
+    # No reasoning_content channel is used in think_tags mode.
+    no_reasoning_channel = "reasoning_content" not in raw
+    # Block is balanced and closed before the answer token.
+    ordered = (
+        opened
+        and closed
+        and has_answer
+        and raw.index("<think>") < raw.index("</think>") < raw.index('"content":"answer"')
+    )
+    has_done = "[DONE]" in raw
+    check(
+        "chat.completions.stream.think_tags",
+        opened and has_thought and closed and has_answer and no_reasoning_channel and ordered and has_done,
+        note=f"open={opened} thought={has_thought} close={closed} ans={has_answer} "
+        f"no_rc={no_reasoning_channel} ordered={ordered} done={has_done}",
+    )
+
+
+def test_partial_stream_normalization() -> None:
+    """With --include-partial-messages: incremental text/thinking deltas are
+    surfaced from stream_event, and the consolidated assistant text/thinking
+    blocks are suppressed (so they don't double-emit what the deltas already
+    streamed) while tool_use is still taken from the consolidated block."""
+    from src.claude_runner import _normalize_stream_event
+
+    think_delta = {
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "hmm"},
+        },
+    }
+    text_delta = {
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "text_delta", "text": "hi"},
+        },
+    }
+    consolidated = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "thinking", "thinking": "hmm"},
+                {"type": "text", "text": "hi"},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+            ]
+        },
+    }
+
+    td = _normalize_stream_event(think_delta, partial=True)
+    xd = _normalize_stream_event(text_delta, partial=True)
+    cons_kinds = [e.kind for e in _normalize_stream_event(consolidated, partial=True)]
+    whole_kinds = [e.kind for e in _normalize_stream_event(consolidated, partial=False)]
+
+    delta_thinking = len(td) == 1 and td[0].kind == "thinking" and td[0].text == "hmm"
+    delta_text = len(xd) == 1 and xd[0].kind == "text" and xd[0].text == "hi"
+    # Partial mode: consolidated text/thinking suppressed, tool_use kept.
+    suppressed = "text" not in cons_kinds and "thinking" not in cons_kinds
+    tool_kept = "tool_use" in cons_kinds
+    # Whole-block mode (no --include-partial-messages): all three still emit.
+    whole_ok = {"text", "thinking", "tool_use"} <= set(whole_kinds)
+
+    check(
+        "claude_runner.partial_stream_normalization",
+        delta_thinking and delta_text and suppressed and tool_kept and whole_ok,
+        note=f"think={delta_thinking} text={delta_text} suppressed={suppressed} "
+        f"tool={tool_kept} whole={whole_ok}",
     )
 
 

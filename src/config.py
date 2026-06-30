@@ -153,6 +153,7 @@ class Settings:
     clarify_enabled: bool
     clarify_system_prompt: str
     clarify_disallowed_tools: tuple[str, ...]
+    stream_partial_messages: bool
 
     @property
     def session_block_tokens(self) -> int:
@@ -228,6 +229,11 @@ class Settings:
                 ).split(",")
                 if t.strip()
             ),
+            # Add `--include-partial-messages` so Claude Code emits incremental
+            # text/thinking deltas (live token-by-token streaming) instead of one
+            # whole block per step. On by default; set CLAUDE_WRAPPER_STREAM_PARTIAL
+            # =off to fall back to whole-block events.
+            stream_partial_messages=_bool_env("CLAUDE_WRAPPER_STREAM_PARTIAL", True),
         )
 
 

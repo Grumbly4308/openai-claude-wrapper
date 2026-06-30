@@ -91,11 +91,16 @@ class _FakeProc:
         pass
 
 
-def _runner(tag: str) -> ClaudeRunner:
+def _runner(tag: str, stream_partial_messages: bool = False) -> ClaudeRunner:
+    # Default to whole-block mode: most tests here feed consolidated assistant
+    # stdout. With --include-partial-messages the same answer text would instead
+    # arrive (and be counted) as content_block_delta events — exercised by the
+    # partial-mode test below.
     return ClaudeRunner(
         registry=SessionRegistry(Path(_TMP) / f"sessions-{tag}"),
         workspace_root=Path(_TMP) / f"workspace-{tag}",
         claude_bin="claude",
+        stream_partial_messages=stream_partial_messages,
     )
 
 
@@ -171,9 +176,27 @@ def test_late_error_after_output_keeps_mapping() -> None:
           "a late error after real output should not reset the session")
 
 
+def test_partial_mode_delta_output_keeps_mapping() -> None:
+    """In --include-partial-messages mode the answer arrives as content_block_delta
+    events (not a consolidated block). A late error after such deltas must still
+    count as real output and keep the mapping — proving the self-heal guard works
+    on the live-streaming path."""
+    runner = _runner("partial", stream_partial_messages=True)
+    key = "conv-partial"
+    text_delta = (
+        b'{"type":"stream_event","event":{"type":"content_block_delta","index":0,'
+        b'"delta":{"type":"text_delta","text":"streamed answer"}}}\n'
+    )
+    result = b'{"type":"result","subtype":"error_during_execution","error":"late","usage":{}}\n'
+    asyncio.run(_drain_resume(runner, key, [text_delta, result], returncode=0))
+    check("partial_mode.delta_output.mapping_kept", runner.registry.has(key),
+          "text_delta output should count toward final_text and preserve the session")
+
+
 if __name__ == "__main__":
     test_dead_resume_drops_mapping()
     test_nonzero_resume_no_output_drops_mapping()
     test_healthy_resume_keeps_mapping()
     test_late_error_after_output_keeps_mapping()
+    test_partial_mode_delta_output_keeps_mapping()
     print(f"\n{_PASS} passed, {_FAIL} failed")

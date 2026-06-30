@@ -305,6 +305,64 @@ def test_chat_completion_stream_progress_and_activity() -> None:
     )
 
 
+def test_chat_completion_stream_details() -> None:
+    """Default channel: reasoning is wrapped in a <details type="reasoning"> block
+    on the content stream (OWUI's own reasoning representation, which renders for
+    any provider — including the "openai" connection OWUI assigns this wrapper),
+    closed before the first answer token. No reasoning_content frames."""
+    import asyncio as _asyncio
+
+    import src.main as _main
+
+    async def _run(self, prompt, session_key, model=None, env_extra=None, extra_args=None, effort=None, **_kwargs):
+        yield StreamEvent(kind="thinking", text="pondering")
+        yield StreamEvent(kind="text", text="answer")
+        yield StreamEvent(
+            kind="final",
+            text="answer",
+            raw={"stop_reason": "stop", "new_outputs": [], "session_uuid": "stub"},
+        )
+        await _asyncio.sleep(0)
+
+    orig_run_stream = ClaudeRunner.run_stream
+    orig_channel = _main._REASONING_CHANNEL
+    ClaudeRunner.run_stream = _run
+    _main._REASONING_CHANNEL = "details"
+    try:
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ) as r:
+            raw = r.read().decode()
+    finally:
+        ClaudeRunner.run_stream = orig_run_stream
+        _main._REASONING_CHANNEL = orig_channel
+
+    opened = '<details type=\\"reasoning\\">' in raw
+    has_thought = "pondering" in raw
+    closed = "</details>" in raw
+    has_answer = '"content":"answer"' in raw
+    no_reasoning_channel = "reasoning_content" not in raw
+    ordered = (
+        opened
+        and closed
+        and has_answer
+        and raw.index("<details") < raw.index("</details>") < raw.index('"content":"answer"')
+    )
+    has_done = "[DONE]" in raw
+    check(
+        "chat.completions.stream.details",
+        opened and has_thought and closed and has_answer and no_reasoning_channel and ordered and has_done,
+        note=f"open={opened} thought={has_thought} close={closed} ans={has_answer} "
+        f"no_rc={no_reasoning_channel} ordered={ordered} done={has_done}",
+    )
+
+
 def test_chat_completion_stream_think_tags() -> None:
     """With CLAUDE_WRAPPER_REASONING_CHANNEL=think_tags, reasoning rides the
     *content* channel wrapped in a single <think>…</think> block (for Open WebUI

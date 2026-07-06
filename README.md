@@ -286,6 +286,7 @@ Open WebUI has no way to feed those back; this is well-formatted text Q&A.)
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET`  | `/v1/models`, `/v1/models/{id}` | Advertise supported Claude models |
+| `GET`  | `/v1/usage/{session_id}` | Per-conversation token spend + remaining allowance (see usage cap) |
 | `GET`  | `/healthz` | Liveness probe |
 
 ## Delegation design
@@ -455,6 +456,27 @@ How it works:
   > to reset.
 - Replying with a continue keyword grants one more block and proceeds. Starting
   a **new chat** (new session) begins with a fresh budget.
+
+### Checking usage: `stats` / `context`
+
+Send **`stats`** or **`context`** (or `/stats`, `/context`) as the whole chat
+message and the wrapper answers **instantly, without spawning Claude** — even
+while the conversation is paused at a checkpoint, and at zero token cost:
+
+> 📊 **Usage stats**
+> - **Spent (this conversation):** 412,300 tokens across 7 requests (5.5% of the session allowance)
+> - **Remaining before the next checkpoint:** 337,700 of 750,000 tokens (2 × 375,000-token blocks)
+> - **Session allowance:** 7,500,000 tokens (max_5x plan), 5% per block
+> - **Session key:** `conv-1a2b3c…`
+
+Only a message that *is* the command triggers it — a prompt that merely
+mentions "stats" goes to Claude as usual. The same numbers are exposed
+programmatically at `GET /v1/usage/{session_id}` (the session key that chat
+responses return in their `session_id` field):
+
+```bash
+curl -fsS -H "Authorization: Bearer $KEY" http://localhost:8000/v1/usage/conv-1a2b3c | jq
+```
 
 Because the check happens before Claude is spawned, a paused conversation costs
 nothing until you confirm. The cap ships **enabled** at the Max 5× plan; set

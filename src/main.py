@@ -217,6 +217,29 @@ async def retrieve_model(model_id: str) -> ModelInfo:
     return ModelInfo(id=model_id, created=int(time.time()))
 
 
+@app.get("/v1/usage/{session_id}", dependencies=[Depends(auth_dependency)])
+async def session_usage(session_id: str) -> dict:
+    """Programmatic twin of the `stats`/`context` chat commands: one
+    conversation's token spend and remaining allowance, straight from the
+    ledger. `session_id` is the session key the chat endpoints return."""
+    state = await USAGE_LEDGER.snapshot(session_id)
+    return {
+        "object": "usage.session",
+        "session_id": session_id,
+        "tracking_enabled": USAGE_LEDGER.enabled,
+        "spent_tokens": state.spent_tokens,
+        "requests": state.requests,
+        "blocks_granted": state.grants,
+        "block_tokens": state.block_tokens,
+        "allowance_tokens": state.allowance_tokens,
+        "remaining_tokens": max(0, state.allowance_tokens - state.spent_tokens),
+        "over_budget": state.over_budget,
+        "session_allowance_tokens": SETTINGS.session_token_allowance,
+        "session_plan": SETTINGS.session_plan,
+        "block_percent": SETTINGS.session_block_percent,
+    }
+
+
 # ---------- files API ----------
 
 
@@ -294,30 +317,40 @@ async def download_file(file_id: str) -> StreamingResponse:
 # ---------- chat completions ----------
 
 
-class _BudgetPause:
-    """Sentinel returned by _prepare_run when a conversation hit its token cap.
+class _InstantReply:
+    """Sentinel returned by _prepare_run when the wrapper answers a turn itself.
 
-    Carries the bookkeeping each endpoint shape needs to render its own
-    checkpoint message (chat-shaped vs Responses-shaped) without running Claude.
+    Used for the budget checkpoint and for the instant `stats` / `context` chat
+    commands. Carries the already-rendered message so each endpoint shape
+    (chat-shaped vs Responses-shaped) can wrap it without running Claude.
     """
 
-    __slots__ = ("session_key", "state")
+    __slots__ = ("session_key", "text")
 
-    def __init__(self, session_key: str, state: UsageState) -> None:
+    def __init__(self, session_key: str, text: str) -> None:
         self.session_key = session_key
-        self.state = state
+        self.text = text
 
 
 async def _prepare_run(req: ChatCompletionRequest):
     """Shared prelude for every text-generation endpoint.
 
-    Resolves the session key, enforces the per-conversation token budget, builds
-    the prompt, and resolves the model. Returns either ``(prompt, session_key,
-    model)`` ready to run, or a ``_BudgetPause`` the caller renders in its own
-    response shape. Used by /v1/chat/completions, /v1/completions, /v1/responses,
-    and the batches worker.
+    Resolves the session key, answers instant chat commands, enforces the
+    per-conversation token budget, builds the prompt, and resolves the model.
+    Returns either ``(prompt, session_key, model)`` ready to run, or an
+    ``_InstantReply`` the caller renders in its own response shape. Used by
+    /v1/chat/completions, /v1/completions, /v1/responses, and the batches worker.
     """
     session_key = derive_session_id(req.messages, req.session_id, req.user)
+
+    # Instant chat commands: a message that is exactly `stats` or `context`
+    # (optionally /-prefixed) is answered by the wrapper itself — current token
+    # spend and remaining allowance, straight from the ledger. Checked before
+    # the budget gate so the report stays reachable (and free) even while a
+    # conversation is paused at a checkpoint.
+    if _usage_command(req.messages):
+        state = await USAGE_LEDGER.snapshot(session_key)
+        return _InstantReply(session_key, _usage_report(session_key, state))
 
     # Per-conversation token budget. If this conversation has already spent its
     # current allowance, pause *before* spawning Claude and ask the user to
@@ -329,7 +362,7 @@ async def _prepare_run(req: ChatCompletionRequest):
             if _is_continue(req.messages):
                 await USAGE_LEDGER.grant(session_key)
             else:
-                return _BudgetPause(session_key, state)
+                return _InstantReply(session_key, _budget_message(state))
 
     prompt, _attachments = await PREPARER.prepare_messages(req.messages, session_key)
     model = req.model if req.model and req.model != "auto" else SETTINGS.default_model
@@ -344,8 +377,8 @@ async def run_chat_completion(req: ChatCompletionRequest):
     """Shared implementation reused by /v1/chat/completions, /v1/completions,
     and the batches worker."""
     prep = await _prepare_run(req)
-    if isinstance(prep, _BudgetPause):
-        return _budget_pause(req, prep.session_key, prep.state)
+    if isinstance(prep, _InstantReply):
+        return _instant_reply(req, prep.session_key, prep.text)
     prompt, session_key, model = prep
 
     if req.stream:
@@ -893,8 +926,8 @@ async def run_responses(rreq: ResponsesRequest, messages: list[ChatMessage]):
     )
 
     prep = await _prepare_run(chat_req)
-    if isinstance(prep, _BudgetPause):
-        return _responses_budget_pause(rreq, prep.session_key, prep.state)
+    if isinstance(prep, _InstantReply):
+        return _responses_instant_reply(rreq, prep.session_key, prep.text)
     prompt, session_key, model = prep
 
     if rreq.stream:
@@ -1099,9 +1132,9 @@ async def _responses_stream(
     # sentinel, and emitting one makes strict SDK parsers choke.
 
 
-def _responses_budget_pause(rreq: ResponsesRequest, session_key: str, state: UsageState):
-    """Render the per-conversation checkpoint in Responses shape (no Claude run)."""
-    text = _budget_message(state)
+def _responses_instant_reply(rreq: ResponsesRequest, session_key: str, text: str):
+    """Render a wrapper-authored message (budget checkpoint, `stats`/`context`
+    report) in Responses shape, without a Claude run."""
     base_model = rreq.model if rreq.model and rreq.model != "auto" else SETTINGS.default_model
     run_model, effort = split_model_effort(base_model)
     if rreq.stream:
@@ -1127,7 +1160,8 @@ async def _responses_static_stream(
     text: str,
 ) -> AsyncIterator[bytes]:
     """Stream a fixed, already-known message as a complete Responses event
-    sequence. Used for the budget checkpoint, where there is no Claude run."""
+    sequence. Used for wrapper-authored replies (budget checkpoint,
+    `stats`/`context` report), where there is no Claude run."""
     created = int(time.time())
     item_id = f"msg_{uuid.uuid4().hex[:24]}"
     seq = 0
@@ -1167,7 +1201,7 @@ async def _responses_static_stream(
     yield ev("response.completed", {"response": envelope("completed")})
 
 
-# ---------- per-conversation budget gating ----------
+# ---------- per-conversation budget gating & instant chat commands ----------
 
 
 def _last_user_text(messages: list[ChatMessage]) -> str:
@@ -1208,6 +1242,47 @@ def _is_continue(messages: list[ChatMessage]) -> bool:
     return False
 
 
+_USAGE_COMMANDS = frozenset({"stats", "context"})
+
+
+def _usage_command(messages: list[ChatMessage]) -> Optional[str]:
+    """The usage command named by the latest user message, or None.
+
+    Only a message that IS the command ("stats", "/context", "Stats!") matches —
+    never one that merely contains the word — so ordinary prompts can't be
+    short-circuited by accident.
+    """
+    text = _normalize_keyword(_last_user_text(messages)).lstrip("/")
+    return text if text in _USAGE_COMMANDS else None
+
+
+def _usage_report(session_key: str, state: UsageState) -> str:
+    """Instant usage summary for the `stats` / `context` chat commands."""
+    if not USAGE_LEDGER.enabled:
+        return (
+            "📊 **Usage stats** — token accounting is disabled on this server "
+            "(no session allowance configured), so there is nothing to report. "
+            "Set `CLAUDE_WRAPPER_SESSION_PLAN` (or "
+            "`CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE`) to enable it."
+        )
+    remaining = max(0, state.allowance_tokens - state.spent_tokens)
+    session_pct = 100.0 * state.spent_tokens / SETTINGS.session_token_allowance
+    plan = SETTINGS.session_plan or "custom"
+    req_s = "s" if state.requests != 1 else ""
+    block_s = "s" if state.grants != 1 else ""
+    return (
+        f"📊 **Usage stats**\n"
+        f"- **Spent (this conversation):** {state.spent_tokens:,} tokens across "
+        f"{state.requests} request{req_s} ({session_pct:.1f}% of the session allowance)\n"
+        f"- **Remaining before the next checkpoint:** {remaining:,} of "
+        f"{state.allowance_tokens:,} tokens "
+        f"({state.grants} × {state.block_tokens:,}-token block{block_s})\n"
+        f"- **Session allowance:** {SETTINGS.session_token_allowance:,} tokens "
+        f"({plan} plan), {SETTINGS.session_block_percent:g}% per block\n"
+        f"- **Session key:** `{session_key}`"
+    )
+
+
 def _budget_message(state: UsageState) -> str:
     pct = f"{SETTINGS.session_block_percent:g}"
     return (
@@ -1218,12 +1293,12 @@ def _budget_message(state: UsageState) -> str:
     )
 
 
-def _budget_pause(req: ChatCompletionRequest, session_key: str, state: UsageState):
-    """Return a checkpoint message in the request's shape without running Claude."""
-    text = _budget_message(state)
+def _instant_reply(req: ChatCompletionRequest, session_key: str, text: str):
+    """Return a wrapper-authored message in the request's shape without running
+    Claude (budget checkpoint, `stats`/`context` report)."""
     if req.stream:
         return StreamingResponse(
-            _budget_pause_stream(req, session_key, text),
+            _instant_reply_stream(req, session_key, text),
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
         )
@@ -1244,7 +1319,7 @@ def _budget_pause(req: ChatCompletionRequest, session_key: str, state: UsageStat
     return JSONResponse(content=response.model_dump(exclude_none=True))
 
 
-async def _budget_pause_stream(
+async def _instant_reply_stream(
     req: ChatCompletionRequest, session_key: str, text: str
 ) -> AsyncIterator[bytes]:
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"

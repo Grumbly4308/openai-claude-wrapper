@@ -6,8 +6,9 @@ one place the full set lives is the CLI binary itself: a ~250 MB bundled
 executable whose embedded JS contains every model id it understands.
 
 We scan that binary once at startup, keep only the canonical model ids — the
-versioned families (``<opus|sonnet|haiku>-<major>-<minor>``) and the single-
-version codename families (``<fable|mythos>-<n>``), optionally with the ``[1m]``
+versioned families (``<opus|sonnet|haiku>-<major>-<minor>``), the minor-less
+Claude 5+ ids (``claude-opus-5``, ``claude-sonnet-5``), and the single-version
+codename families (``<fable|mythos>-<n>``), optionally with the ``[1m]``
 long-context variant — and hand the result to ``config.supported_models()``.
 The bundle also contains
 dated snapshots (``…-20251101``), internal routing ids (``…-v1``), deployment
@@ -37,6 +38,12 @@ _MODEL_TOKEN = re.compile(
 # bounded to 1-2 digits so an 8-digit dated snapshot like "claude-opus-4-20250514"
 # (date read as a "minor") doesn't slip through.
 _CANONICAL = re.compile(r"^claude-(opus|sonnet|haiku)-(\d+)-(\d{1,2})(\[1m\])?$")
+
+# From the Claude 5 family on, opus/sonnet ids drop the minor entirely
+# (claude-opus-5, claude-sonnet-5). Below _SINGLE_MIN_MAJOR a bare
+# "claude-opus-4" is a family alias, not a model — those stay dropped.
+_SINGLE = re.compile(r"^claude-(opus|sonnet|haiku)-(\d{1,2})(\[1m\])?$")
+_SINGLE_MIN_MAJOR = 5
 
 # Codename families carry a single version, e.g. claude-fable-5 / claude-mythos-5.
 _CODENAME = re.compile(r"^claude-(fable|mythos)-(\d{1,2})(\[1m\])?$")
@@ -104,6 +111,8 @@ def filter_canonical(ids: set[str]) -> list[str]:
         if m:
             if int(m.group(2)) < _MIN_MAJOR:
                 continue
+            keep.append(mid)
+        elif (m := _SINGLE.match(mid)) and int(m.group(2)) >= _SINGLE_MIN_MAJOR:
             keep.append(mid)
         elif _CODENAME.match(mid):
             keep.append(mid)

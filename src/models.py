@@ -62,6 +62,18 @@ class ChatMessage(BaseModel):
     name: Optional[str] = None
 
 
+class ResponseFormat(BaseModel):
+    """OpenAI structured-output request (the ``response_format`` parameter).
+
+    ``json_schema`` holds the OpenAI envelope ({"name", "schema", "strict"})
+    or, from lenient clients, the bare JSON Schema itself.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    type: str = "text"  # "text" | "json_object" | "json_schema"
+    json_schema: Optional[dict[str, Any]] = None
+
+
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str
@@ -81,6 +93,11 @@ class ChatCompletionRequest(BaseModel):
     # (default) follows the server setting; false opts this request out (e.g. a
     # non-interactive/automated caller that must never pause to ask questions).
     clarify: Optional[bool] = None
+    # OpenAI structured output: when type is json_object/json_schema the
+    # response content is guaranteed to be a raw JSON value — no markdown
+    # fences, no prose, no file-reference trailer. Sent by e.g. the Vercel
+    # AI SDK's generateObject (Vane, and other OpenAI-compatible clients).
+    response_format: Optional[ResponseFormat] = None
 
 
 # ---------- Chat completion response ----------

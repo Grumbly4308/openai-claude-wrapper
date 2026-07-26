@@ -27,6 +27,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from . import tool_bridge
 from .config import SETTINGS, advertised_models, split_model_effort, supported_models
 from .converters import derive_session_id
 from .deps import FILE_STORE, PREPARER, RUNNER, USAGE_LEDGER, auth_dependency
@@ -248,6 +249,7 @@ async def _startup() -> None:
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     await PREPARER.aclose()
+    await tool_bridge.aclose()
 
 
 app.include_router(text_router)
@@ -445,6 +447,13 @@ async def _prepare_run(req: ChatCompletionRequest):
 async def run_chat_completion(req: ChatCompletionRequest):
     """Shared implementation reused by /v1/chat/completions, /v1/completions,
     and the batches worker."""
+    # Function calling: a request that declares tools is owned by the CLIENT's
+    # agent loop, which is the opposite of the wrapper's agentic default. It is
+    # served by the tool bridge (a direct Messages API call — no Claude Code
+    # CLI, no built-in tools, no internal loop) and returns tool_calls for the
+    # client to execute. Requests without tools are untouched by this branch.
+    if req.tools:
+        return await _tool_bridge_completion(req)
     prep = await _prepare_run(req)
     if isinstance(prep, _InstantReply):
         return _instant_reply(req, prep.session_key, prep.text)
@@ -463,6 +472,76 @@ async def run_chat_completion(req: ChatCompletionRequest):
 @app.post("/v1/chat/completions", dependencies=[Depends(auth_dependency)])
 async def chat_completions(req: ChatCompletionRequest):
     return await run_chat_completion(req)
+
+
+async def _tool_bridge_completion(req: ChatCompletionRequest):
+    """Serve a function-calling request via the tool bridge.
+
+    Keeps the wrapper-level conveniences (session_id echo, per-conversation
+    budget gate, usage ledger) but none of the agentic machinery — no prompt
+    flattening, no CLI session, no KB addendum, no built-in tools.
+    """
+    session_key = derive_session_id(req.messages, req.session_id, req.user)
+
+    if USAGE_LEDGER.enabled:
+        state = await USAGE_LEDGER.snapshot(session_key)
+        if state.over_budget:
+            if _is_continue(req.messages):
+                await USAGE_LEDGER.grant(session_key)
+            else:
+                return _instant_reply(req, session_key, _budget_message(state))
+
+    model = req.model if req.model and req.model != "auto" else SETTINGS.default_model
+    run_model, effort = split_model_effort(model)
+    # Effort is a Claude Code CLI concept; the direct Messages API call has no
+    # equivalent, so it is reported as unapplied rather than silently claimed.
+    effort_info = {"applied": "api-default", "source": "tool-bridge", "requested": effort}
+
+    if req.stream:
+        async def _record(in_tok: int, out_tok: int) -> None:
+            if USAGE_LEDGER.enabled:
+                await USAGE_LEDGER.record(session_key, in_tok + out_tok)
+
+        return StreamingResponse(
+            tool_bridge.stream(
+                req, run_model, model, session_key, effort_info, on_usage=_record
+            ),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+
+    result = await tool_bridge.complete(req, run_model)
+    if USAGE_LEDGER.enabled:
+        await USAGE_LEDGER.record(session_key, result.input_tokens + result.output_tokens)
+
+    response = ChatCompletionResponse(
+        id=f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        created=int(time.time()),
+        model=model,
+        choices=[
+            ChatCompletionChoice(
+                index=0,
+                message=ChoiceMessage(
+                    role="assistant",
+                    content=result.content,
+                    tool_calls=result.tool_calls,
+                ),
+                finish_reason=result.finish_reason,
+            )
+        ],
+        usage=Usage(
+            prompt_tokens=result.input_tokens,
+            completion_tokens=result.output_tokens,
+            total_tokens=result.input_tokens + result.output_tokens,
+        ),
+        session_id=session_key,
+        effort=effort_info,
+    )
+    data = response.model_dump(exclude_none=True)
+    # Per the OpenAI spec a tool-call message carries an explicit null content,
+    # not an absent key (and never "") — exclude_none above would drop it.
+    data["choices"][0]["message"].setdefault("content", None)
+    return JSONResponse(content=data)
 
 
 async def _sync_response(

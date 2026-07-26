@@ -1,0 +1,467 @@
+"""Function-calling (tools) tests for the tool bridge.
+
+The Anthropic Messages API is mocked with httpx.MockTransport, so every test
+also captures the exact outbound payload and asserts the OpenAI→Anthropic
+translation, not just the response shape. The agentic path is stubbed the same
+way test_endpoints.py does, to prove tools-absent requests never touch the
+bridge.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+# ---- environment setup before importing anything from src ----
+_TMP = tempfile.mkdtemp(prefix="claude-wrapper-test-tools-")
+os.environ.setdefault("CLAUDE_WRAPPER_DATA", _TMP)
+os.environ.setdefault("CLAUDE_WRAPPER_DEFAULT_MODEL", "claude-sonnet-4-6")
+os.environ.setdefault("CLAUDE_WRAPPER_MODEL_DISCOVERY", "off")
+os.environ.pop("CLAUDE_WRAPPER_API_KEYS", None)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from src import tool_bridge
+from src.claude_runner import ClaudeResult
+from src.deps import RUNNER
+from src.main import app
+
+client = TestClient(app)
+
+_seq = 0
+
+
+def _post(body: dict):
+    """POST a chat completion with a unique session_id per request.
+
+    The usage ledger is a process-wide singleton that test_budget.py enables
+    (with a tiny block) for the whole pytest run; without a fresh session each
+    request, the budget checkpoint fires instead of the bridge.
+    """
+    global _seq
+    _seq += 1
+    return client.post("/v1/chat/completions", json={"session_id": f"toolbridge-{_seq}", **body})
+
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": "Search the web",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def _anthropic_tool_use_response() -> dict:
+    return {
+        "id": "msg_01",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-4-5",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "toolu_abc123",
+                "name": "web_search",
+                "input": {"query": "weather in Paris"},
+            }
+        ],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 100, "output_tokens": 20},
+    }
+
+
+class _Capture:
+    """MockTransport handler that records outbound requests."""
+
+    def __init__(self, responses):
+        self.requests: list[dict] = []
+        self._responses = list(responses)
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(json.loads(request.content))
+        self.last_headers = dict(request.headers)
+        body = self._responses.pop(0)
+        if isinstance(body, bytes):
+            return httpx.Response(
+                200, content=body, headers={"content-type": "text/event-stream"}
+            )
+        return httpx.Response(200, json=body)
+
+
+@pytest.fixture
+def bridge(monkeypatch):
+    """Install a capture transport and an env API key; restore afterwards."""
+
+    def _install(*responses):
+        capture = _Capture(responses)
+        monkeypatch.setattr(
+            tool_bridge, "_client", httpx.AsyncClient(transport=httpx.MockTransport(capture))
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        return capture
+
+    yield _install
+    tool_bridge._client = None
+
+
+# ---------- request translation ----------
+
+
+def test_tool_call_non_streaming(bridge):
+    capture = bridge(_anthropic_tool_use_response())
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "temperature": 0,
+            "messages": [{"role": "user", "content": "What is the weather in Paris right now?"}],
+            "tools": [WEB_SEARCH_TOOL],
+        },
+    )
+    assert r.status_code == 200
+    choice = r.json()["choices"][0]
+
+    # tool_calls populated, finish_reason tool_calls, content explicit null
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] is None
+    (tc,) = choice["message"]["tool_calls"]
+    assert tc["id"] == "toolu_abc123"
+    assert tc["type"] == "function"
+    assert tc["function"]["name"] == "web_search"
+    # arguments MUST be a serialized JSON string, not an object
+    assert isinstance(tc["function"]["arguments"], str)
+    assert json.loads(tc["function"]["arguments"]) == {"query": "weather in Paris"}
+
+    # outbound: parameters -> input_schema verbatim, default tool_choice auto
+    (sent,) = capture.requests
+    assert sent["tools"] == [
+        {
+            "name": "web_search",
+            "description": "Search the web",
+            "input_schema": WEB_SEARCH_TOOL["function"]["parameters"],
+        }
+    ]
+    assert sent["tool_choice"] == {"type": "auto"}
+    assert sent["model"] == "claude-haiku-4-5"
+    assert sent["temperature"] == 0
+    # api-key auth: x-api-key header, no oauth beta
+    assert capture.last_headers.get("x-api-key") == "test-key"
+    assert "anthropic-beta" not in capture.last_headers
+    # usage + wrapper parity fields survive
+    body = r.json()
+    assert body["usage"]["total_tokens"] == 120
+    assert body["session_id"]
+    assert body["effort"]["source"] == "tool-bridge"
+
+
+def test_two_turn_round_trip(bridge):
+    final = {
+        "id": "msg_02",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-4-5",
+        "content": [{"type": "text", "text": "It is sunny, 19C."}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 150, "output_tokens": 12},
+    }
+    capture = bridge(final)
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [
+                {"role": "user", "content": "What is the weather in Paris right now?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "toolu_abc123",
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": "{\"query\": \"weather in Paris\"}",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "toolu_abc123",
+                    "content": "Paris: sunny, 19C",
+                },
+            ],
+            "tools": [WEB_SEARCH_TOOL],
+        },
+    )
+    assert r.status_code == 200
+    choice = r.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] == "It is sunny, 19C."
+    assert "tool_calls" not in choice["message"]
+
+    (sent,) = capture.requests
+    user, assistant, tool_result = sent["messages"]
+    assert assistant["role"] == "assistant"
+    (tu,) = assistant["content"]
+    # id round-trips losslessly and arguments were parsed to an object
+    assert tu == {
+        "type": "tool_use",
+        "id": "toolu_abc123",
+        "name": "web_search",
+        "input": {"query": "weather in Paris"},
+    }
+    assert tool_result["role"] == "user"
+    (tr,) = tool_result["content"]
+    assert tr["type"] == "tool_result"
+    assert tr["tool_use_id"] == "toolu_abc123"
+    assert tr["content"] == "Paris: sunny, 19C"
+
+
+def test_parallel_tool_calls(bridge):
+    resp = _anthropic_tool_use_response()
+    resp["content"].append(
+        {
+            "type": "tool_use",
+            "id": "toolu_def456",
+            "name": "web_search",
+            "input": {"query": "Paris humidity"},
+        }
+    )
+    capture = bridge(resp, resp)
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "Weather and humidity in Paris?"}],
+            "tools": [WEB_SEARCH_TOOL],
+        },
+    )
+    tcs = r.json()["choices"][0]["message"]["tool_calls"]
+    assert [t["id"] for t in tcs] == ["toolu_abc123", "toolu_def456"]
+    assert all(isinstance(t["function"]["arguments"], str) for t in tcs)
+
+    # Round-trip: both results must merge into ONE user message.
+    r2 = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [
+                {"role": "user", "content": "Weather and humidity in Paris?"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "toolu_abc123", "type": "function",
+                         "function": {"name": "web_search", "arguments": "{\"query\": \"a\"}"}},
+                        {"id": "toolu_def456", "type": "function",
+                         "function": {"name": "web_search", "arguments": "{\"query\": \"b\"}"}},
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "toolu_abc123", "content": "sunny"},
+                {"role": "tool", "tool_call_id": "toolu_def456", "content": "60%"},
+            ],
+            "tools": [WEB_SEARCH_TOOL],
+        },
+    )
+    assert r2.status_code == 200
+    sent = capture.requests[1]
+    assert [m["role"] for m in sent["messages"]] == ["user", "assistant", "user"]
+    results = sent["messages"][2]["content"]
+    assert [b["tool_use_id"] for b in results] == ["toolu_abc123", "toolu_def456"]
+
+
+def test_forced_and_none_tool_choice(bridge):
+    capture = bridge(_anthropic_tool_use_response(), _anthropic_tool_use_response(),
+                     _anthropic_tool_use_response())
+    base = {
+        "model": "claude-haiku-4-5",
+        "messages": [{"role": "user", "content": "Population of Tokyo?"}],
+        "tools": [WEB_SEARCH_TOOL],
+    }
+    _post({**base, "tool_choice": {"type": "function", "function": {"name": "web_search"}}})
+    assert capture.requests[0]["tool_choice"] == {"type": "tool", "name": "web_search"}
+
+    _post({**base, "tool_choice": "required"})
+    assert capture.requests[1]["tool_choice"] == {"type": "any"}
+
+    _post({**base, "tool_choice": "none"})
+    assert "tools" not in capture.requests[2]
+    assert "tool_choice" not in capture.requests[2]
+
+
+def test_parallel_tool_calls_disabled(bridge):
+    capture = bridge(_anthropic_tool_use_response())
+    _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+            "parallel_tool_calls": False,
+        },
+    )
+    assert capture.requests[0]["tool_choice"] == {
+        "type": "auto",
+        "disable_parallel_tool_use": True,
+    }
+
+
+def test_system_message_and_model_mapping(bridge):
+    capture = bridge(_anthropic_tool_use_response())
+    _post(
+        {
+            "model": "claude-opus-4-8[1m] (xhigh)",
+            "messages": [
+                {"role": "system", "content": "You are a researcher."},
+                {"role": "user", "content": "hi"},
+            ],
+            "tools": [WEB_SEARCH_TOOL],
+        },
+    )
+    sent = capture.requests[0]
+    assert sent["model"] == "claude-opus-4-8"
+    assert {"type": "text", "text": "You are a researcher."} in sent["system"]
+    assert "context-1m-2025-08-07" in capture.last_headers.get("anthropic-beta", "")
+
+
+# ---------- streaming ----------
+
+
+def _sse(events: list[dict]) -> bytes:
+    return b"".join(
+        f"event: {e['type']}\ndata: {json.dumps(e)}\n\n".encode() for e in events
+    )
+
+
+def test_streaming_tool_call_deltas(bridge):
+    events = [
+        {"type": "message_start",
+         "message": {"id": "msg_01", "usage": {"input_tokens": 50, "output_tokens": 1}}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "Searching."}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "content_block_start", "index": 1,
+         "content_block": {"type": "tool_use", "id": "toolu_xyz", "name": "web_search", "input": {}}},
+        {"type": "content_block_delta", "index": 1,
+         "delta": {"type": "input_json_delta", "partial_json": "{\"query\": "}},
+        {"type": "content_block_delta", "index": 1,
+         "delta": {"type": "input_json_delta", "partial_json": "\"Tokyo population\"}"}},
+        {"type": "content_block_stop", "index": 1},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+         "usage": {"output_tokens": 30}},
+        {"type": "message_stop"},
+    ]
+    bridge(_sse(events))
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "claude-haiku-4-5",
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "messages": [{"role": "user", "content": "Population of Tokyo? Use web_search."}],
+            "tools": [WEB_SEARCH_TOOL],
+        },
+    ) as r:
+        assert r.status_code == 200
+        lines = [l for l in r.iter_lines() if l.startswith("data:")]
+
+    payloads = [l[5:].strip() for l in lines]
+    assert payloads[-1] == "[DONE]"
+    chunks = [json.loads(p) for p in payloads[:-1] if p != "[DONE]"]
+
+    tc_frames = [
+        c["choices"][0]["delta"]["tool_calls"]
+        for c in chunks
+        if c.get("choices") and c["choices"][0]["delta"].get("tool_calls")
+    ]
+    # First frame: index, id, type, name, empty arguments.
+    first = tc_frames[0][0]
+    assert first == {
+        "index": 0,
+        "id": "toolu_xyz",
+        "type": "function",
+        "function": {"name": "web_search", "arguments": ""},
+    }
+    # Later frames: only index + argument fragment; assemble into valid JSON.
+    assembled = "".join(f[0]["function"]["arguments"] for f in tc_frames)
+    assert all(f[0]["index"] == 0 for f in tc_frames)
+    assert json.loads(assembled) == {"query": "Tokyo population"}
+
+    # Text alongside the call still streams as content.
+    contents = [
+        c["choices"][0]["delta"].get("content", "")
+        for c in chunks
+        if c.get("choices")
+    ]
+    assert "Searching." in contents
+
+    finish = [
+        c["choices"][0]["finish_reason"]
+        for c in chunks
+        if c.get("choices") and c["choices"][0].get("finish_reason")
+    ]
+    assert finish == ["tool_calls"]
+
+    usage_chunks = [c for c in chunks if not c.get("choices")]
+    assert usage_chunks and usage_chunks[0]["usage"]["total_tokens"] == 80
+
+
+# ---------- tools absent: the agentic path is untouched ----------
+
+
+def test_no_tools_uses_agentic_path(bridge):
+    capture = bridge()  # would raise IndexError if the bridge were hit
+
+    async def _stub_run_collect(prompt, session_key, **_kwargs):
+        return ClaudeResult(session_uuid="u", final_text="agentic ok", input_tokens=1, output_tokens=1)
+
+    # Instance attribute on the RUNNER singleton (restored below): other test
+    # modules replace ClaudeRunner methods at class level on import, so a
+    # class-level monkeypatch here could be shadowed or shadow them.
+    had_own = "run_collect" in RUNNER.__dict__
+    prev = RUNNER.__dict__.get("run_collect")
+    RUNNER.run_collect = _stub_run_collect
+    try:
+        for body in (
+            {"model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}]},
+            {"model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}], "tools": []},
+        ):
+            r = _post(body)
+            assert r.status_code == 200
+            msg = r.json()["choices"][0]["message"]
+            assert msg["content"] == "agentic ok"
+            assert "tool_calls" not in msg
+    finally:
+        if had_own:
+            RUNNER.run_collect = prev
+        else:
+            del RUNNER.run_collect
+    assert capture.requests == []
+
+
+def test_oauth_auth_headers(bridge, monkeypatch, tmp_path):
+    capture = bridge(_anthropic_tool_use_response())
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-token-123")
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+        },
+    )
+    assert r.status_code == 200
+    assert capture.last_headers["authorization"] == "Bearer oauth-token-123"
+    assert "oauth-2025-04-20" in capture.last_headers["anthropic-beta"]
+    # Claude Code identity line injected as the FIRST system block.
+    assert capture.requests[0]["system"][0]["text"].startswith("You are Claude Code")

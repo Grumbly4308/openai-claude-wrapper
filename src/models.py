@@ -55,11 +55,48 @@ class FileContent(BaseModel):
 ContentPart = Union[TextContent, ImageContent, InputAudioContent, FileContent]
 
 
+# ---------- OpenAI function calling (tools) ----------
+
+
+class ToolFunctionDef(BaseModel):
+    """The ``function`` member of a ``tools[]`` entry: a caller-defined tool."""
+
+    model_config = ConfigDict(extra="allow")
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[dict[str, Any]] = None  # JSON Schema, passed verbatim
+
+
+class ToolDef(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    type: str = "function"
+    function: ToolFunctionDef
+
+
+class ToolCallFunction(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    name: Optional[str] = None
+    arguments: Optional[str] = None  # serialized JSON string, per OpenAI spec
+
+
+class ToolCall(BaseModel):
+    """An assistant-emitted tool call, echoed back by clients in history."""
+
+    model_config = ConfigDict(extra="allow")
+    id: Optional[str] = None
+    type: str = "function"
+    function: ToolCallFunction
+
+
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
     role: Literal["system", "user", "assistant", "tool", "developer"]
     content: Union[str, list[ContentPart], None] = None
     name: Optional[str] = None
+    # Function-calling history fields: an assistant turn that requested tool
+    # calls, and the tool turn carrying a result (keyed by tool_call_id).
+    tool_calls: Optional[list[ToolCall]] = None
+    tool_call_id: Optional[str] = None
 
 
 class ResponseFormat(BaseModel):
@@ -98,6 +135,17 @@ class ChatCompletionRequest(BaseModel):
     # fences, no prose, no file-reference trailer. Sent by e.g. the Vercel
     # AI SDK's generateObject (Vane, and other OpenAI-compatible clients).
     response_format: Optional[ResponseFormat] = None
+    # OpenAI function calling. When `tools` is a non-empty list the CLIENT owns
+    # the agent loop: the request bypasses the Claude Code CLI entirely (no
+    # built-in tools, no internal loop) and is served by the tool bridge, which
+    # calls the Anthropic Messages API directly and returns tool_calls for the
+    # client to execute.
+    tools: Optional[list[ToolDef]] = None
+    tool_choice: Optional[Union[str, dict[str, Any]]] = None
+    parallel_tool_calls: Optional[bool] = None
+    # {"include_usage": true} => streaming responses append a usage chunk
+    # before [DONE] (Vercel AI SDK sends this).
+    stream_options: Optional[dict[str, Any]] = None
 
 
 # ---------- Chat completion response ----------
@@ -107,6 +155,9 @@ class ChoiceMessage(BaseModel):
     role: str = "assistant"
     content: Optional[str] = None
     attachments: Optional[list[dict[str, Any]]] = None
+    # Function calls requested by the model (tool-bridge path only). Each entry
+    # is {"id", "type": "function", "function": {"name", "arguments": <str>}}.
+    tool_calls: Optional[list[dict[str, Any]]] = None
 
 
 class Usage(BaseModel):
@@ -145,6 +196,10 @@ class DeltaMessage(BaseModel):
     # "thinking" block (OpenWebUI et al.) instead of being concatenated into the
     # answer. Clients that don't understand the field simply ignore it.
     reasoning_content: Optional[str] = None
+    # Incremental tool-call frames (tool-bridge path only). First frame per call
+    # carries {"index", "id", "type", "function": {"name", "arguments": ""}};
+    # later frames carry only {"index", "function": {"arguments": <fragment>}}.
+    tool_calls: Optional[list[dict[str, Any]]] = None
 
 
 class ChatCompletionChunkChoice(BaseModel):
@@ -163,6 +218,9 @@ class ChatCompletionChunk(BaseModel):
     # Non-standard: resolved reasoning effort (emitted on the first chunk only),
     # same shape as ChatCompletionResponse.effort.
     effort: Optional[dict[str, Any]] = None
+    # Populated only on the trailing usage chunk when the client asked for it
+    # via stream_options.include_usage (that chunk carries empty choices).
+    usage: Optional[Usage] = None
 
 
 # ---------- Models list ----------

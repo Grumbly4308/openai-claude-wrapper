@@ -213,6 +213,32 @@ e.g. Vane, whose `JSON.parse` chokes on ` ```json `-fenced replies
 the model produces no parseable JSON at all, the reply passes through
 unchanged rather than masking what it said.
 
+#### Function calling (`tools`)
+
+`/v1/chat/completions` implements OpenAI function calling. When a request
+declares a non-empty `tools` list, **the client owns the agent loop**: the
+wrapper does not execute anything, does not use its own built-in tools, and
+does not answer the question. It returns the model's `tool_calls` (with
+`arguments` as a serialized JSON string and `finish_reason: "tool_calls"`)
+and stops; the client executes the tool and sends the result back as a
+`role: "tool"` message (`tool_call_id` matching the emitted `toolu_…` id) on
+the next request. Parallel tool calls, forced
+`tool_choice: {"type":"function","function":{"name":…}}`, `"required"`,
+`"none"`, `parallel_tool_calls: false`, and streaming tool-call deltas
+(incremental `arguments` fragments, per the OpenAI chunk format, honoring
+`stream_options.include_usage`) are all supported. This is what
+`streamText({tools})` clients like Vane's research agent need.
+
+Because that behavior is the opposite of the wrapper's agentic default, tools
+requests bypass the Claude Code CLI entirely and call the Anthropic Messages
+API directly, authenticating (in order) with `ANTHROPIC_API_KEY`,
+`CLAUDE_CODE_OAUTH_TOKEN`, or the CLI's own saved login
+(`~/.claude/.credentials.json`). Requests **without** `tools` are completely
+unaffected and keep the full agentic behavior. Effort suffixes don't apply on
+this path (`effort.source: "tool-bridge"` in the response); `[1m]` model
+variants map to the 1M-context beta. `max_tokens` defaults to
+`CLAUDE_WRAPPER_TOOLS_MAX_TOKENS` (8192).
+
 #### Streaming feedback on long runs
 
 On a hard problem at high/max/ultracode effort, Claude may think or run

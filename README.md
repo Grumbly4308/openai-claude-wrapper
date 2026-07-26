@@ -194,6 +194,25 @@ string or structured `input` (plus optional `instructions`), and returns a
   from the session key, so the thread deterministically reattaches rather than
   forking a new session.
 
+#### Structured output (`response_format`)
+
+`/v1/chat/completions` honors the OpenAI `response_format` parameter. With
+`{"type": "json_object"}` or `{"type": "json_schema", "json_schema": {…}}` the
+wrapper appends a raw-JSON-only instruction to the prompt (including the schema
+for `json_schema`) and reduces the reply to the bare JSON value before it
+leaves the wrapper — markdown fences and any surrounding prose are stripped,
+and the file-reference trailer is suppressed. Streamed JSON-mode requests
+buffer the answer (fences can span chunk deltas) and deliver the cleaned JSON
+as a single content chunk before the terminator; reasoning/progress frames are
+suppressed so the concatenated content is pure JSON.
+
+This is what clients built on the Vercel AI SDK's `generateObject` expect —
+e.g. Vane, whose `JSON.parse` chokes on ` ```json `-fenced replies
+([Vane#959](https://github.com/ItzCrazyKns/Vane/issues/959)). Requests without
+`response_format` (or with `{"type": "text"}`) are completely unaffected. If
+the model produces no parseable JSON at all, the reply passes through
+unchanged rather than masking what it said.
+
 #### Streaming feedback on long runs
 
 On a hard problem at high/max/ultracode effort, Claude may think or run

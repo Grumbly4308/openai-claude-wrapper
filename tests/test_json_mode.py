@@ -36,11 +36,13 @@ _STATE = {
     "final_text": "",
     "stream_texts": [],
     "last_prompt": "",
+    "last_clarify": None,
 }
 
 
 async def _stub_run_collect(self, prompt, session_key, model=None, effort=None, **_kwargs):
     _STATE["last_prompt"] = prompt
+    _STATE["last_clarify"] = _kwargs.get("clarify")
     return ClaudeResult(
         session_uuid="stub-uuid",
         final_text=_STATE["final_text"],
@@ -53,6 +55,7 @@ async def _stub_run_collect(self, prompt, session_key, model=None, effort=None, 
 
 async def _stub_run_stream(self, prompt, session_key, model=None, effort=None, **_kwargs):
     _STATE["last_prompt"] = prompt
+    _STATE["last_clarify"] = _kwargs.get("clarify")
     yield StreamEvent(kind="thinking", text="pondering the JSON...")
     for piece in _STATE["stream_texts"]:
         yield StreamEvent(kind="text", text=piece)
@@ -163,14 +166,23 @@ def test_sync_json_schema_in_prompt() -> None:
     check("schema.body_in_prompt", '"suggestions"' in _STATE["last_prompt"])
 
 
-def test_sync_json_unparseable_passthrough() -> None:
+def test_sync_json_unparseable_errors() -> None:
+    """No JSON at all => 502 quoting the model, never a 200 the client chokes on.
+
+    Handing prose back with a 200 makes the client die in JSON.parse on the
+    first character, which tells nobody anything. The error carries the reply.
+    """
     _STATE["final_text"] = "I could not produce JSON, sorry."
-    r = _chat(
-        [{"role": "user", "content": "suggest things (unparseable test)"}],
-        response_format={"type": "json_object"},
-    )
-    content = r.json()["choices"][0]["message"]["content"]
-    check("sync.passthrough", content == "I could not produce JSON, sorry.", note=content)
+    body = {
+        "model": "claude-opus-4-8",
+        "messages": [{"role": "user", "content": "suggest things (unparseable test)"}],
+        "response_format": {"type": "json_object"},
+    }
+    r = client.post("/v1/chat/completions", json=body)
+    check("sync.unparseable_status", r.status_code == 502, note=str(r.status_code))
+    detail = r.json().get("detail", "")
+    check("sync.unparseable_quotes_reply", "I could not produce JSON, sorry." in detail, note=detail)
+    check("sync.unparseable_names_mode", "json_object" in detail, note=detail)
 
 
 def test_sync_without_response_format_untouched() -> None:
@@ -193,6 +205,54 @@ def test_response_format_text_is_not_json_mode() -> None:
     check("text_mode.content_verbatim", content == fenced, note=content)
 
 
+# ---------- clarification protocol ----------
+#
+# The clarify protocol tells Claude to make its ENTIRE reply a list of questions
+# when it hits an ambiguity. That is pure prose with no JSON in it, so it
+# reaches a generateObject client as an unparseable body and dies in
+# JSON.parse — and nobody is on the far end to answer it anyway. JSON mode must
+# therefore force clarify OFF, even when the client explicitly asked for it.
+
+
+def test_json_mode_disables_clarify() -> None:
+    _STATE["final_text"] = '{"a": 1}'
+    _STATE["last_clarify"] = None
+    _chat(
+        [{"role": "user", "content": "extract fields (clarify off test)"}],
+        response_format={"type": "json_object"},
+    )
+    check("clarify.off_in_json_mode", _STATE["last_clarify"] is False, note=str(_STATE["last_clarify"]))
+
+
+def test_json_mode_overrides_explicit_clarify() -> None:
+    _STATE["final_text"] = '{"a": 1}'
+    _STATE["last_clarify"] = None
+    _chat(
+        [{"role": "user", "content": "extract fields (explicit clarify test)"}],
+        response_format={"type": "json_schema", "json_schema": {"name": "r", "schema": {"type": "object"}}},
+        clarify=True,
+    )
+    check("clarify.json_wins_over_explicit", _STATE["last_clarify"] is False, note=str(_STATE["last_clarify"]))
+
+
+def test_plain_chat_keeps_clarify() -> None:
+    _STATE["final_text"] = "hi"
+    _STATE["last_clarify"] = None
+    _chat([{"role": "user", "content": "normal chat (clarify stays on)"}])
+    check("clarify.on_without_json", _STATE["last_clarify"] is True, note=str(_STATE["last_clarify"]))
+
+
+def test_json_mode_disables_clarify_streaming() -> None:
+    _STATE["stream_texts"] = ['{"a": 1}']
+    _STATE["last_clarify"] = None
+    _chat(
+        [{"role": "user", "content": "extract fields (stream clarify test)"}],
+        response_format={"type": "json_object"},
+        stream=True,
+    )
+    check("clarify.off_in_json_stream", _STATE["last_clarify"] is False, note=str(_STATE["last_clarify"]))
+
+
 # ---------- streaming path ----------
 
 
@@ -209,6 +269,27 @@ def test_stream_json_buffers_and_strips() -> None:
     check("stream.no_reasoning_field", reasoning == "")
     check("stream.no_details_block", "<details" not in content and "<think>" not in content)
     check("stream.finish", finish == "stop")
+
+
+def test_stream_json_unparseable_errors() -> None:
+    """Streaming can't 502 (head already sent) => error frame, and no content."""
+    _STATE["stream_texts"] = ["I could not ", "produce JSON, sorry."]
+    r = _chat(
+        [{"role": "user", "content": "suggest things (stream unparseable test)"}],
+        response_format={"type": "json_object"},
+        stream=True,
+    )
+    content, _reasoning, _finish = _parse_sse(r.text)
+    check("stream.unparseable_no_content", content == "", note=content)
+    errors = [
+        json.loads(line[len("data: "):])["error"]["message"]
+        for line in r.text.splitlines()
+        if line.startswith("data: ")
+        and line[len("data: "):].strip() != "[DONE]"
+        and "error" in json.loads(line[len("data: "):])
+    ]
+    check("stream.unparseable_error_frame", len(errors) == 1, note=str(errors))
+    check("stream.unparseable_quotes_reply", "produce JSON, sorry." in errors[0], note=errors[0])
 
 
 def test_stream_without_response_format_untouched() -> None:
@@ -233,9 +314,14 @@ def main() -> int:
         test_extract_raw_json,
         test_sync_json_object_strips_fences,
         test_sync_json_schema_in_prompt,
-        test_sync_json_unparseable_passthrough,
+        test_sync_json_unparseable_errors,
+        test_stream_json_unparseable_errors,
         test_sync_without_response_format_untouched,
         test_response_format_text_is_not_json_mode,
+        test_json_mode_disables_clarify,
+        test_json_mode_overrides_explicit_clarify,
+        test_plain_chat_keeps_clarify,
+        test_json_mode_disables_clarify_streaming,
         test_stream_json_buffers_and_strips,
         test_stream_without_response_format_untouched,
     ]

@@ -465,3 +465,184 @@ def test_oauth_auth_headers(bridge, monkeypatch, tmp_path):
     assert "oauth-2025-04-20" in capture.last_headers["anthropic-beta"]
     # Claude Code identity line injected as the FIRST system block.
     assert capture.requests[0]["system"][0]["text"].startswith("You are Claude Code")
+
+
+# ---------- tools + response_format together ----------
+#
+# A request may declare tools AND response_format: AI SDK clients do this when a
+# structured-output call is allowed to call tools first. The bridge path is
+# chosen before the agentic path's JSON-mode handling ever runs, so it has to
+# apply the output-format instruction and the raw-JSON reduction itself —
+# otherwise the client JSON.parses a fenced or prose-wrapped body and dies.
+
+
+def _anthropic_text_response(text: str) -> dict:
+    return {
+        "id": "msg_json",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-4-5",
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+
+
+def test_json_mode_instruction_and_strip(bridge):
+    capture = bridge(_anthropic_text_response('```json\n{"answer": 42}\n```'))
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "answer as json"}],
+            "tools": [WEB_SEARCH_TOOL],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "result",
+                    "schema": {"type": "object", "properties": {"answer": {"type": "number"}}},
+                },
+            },
+        },
+    )
+    assert r.status_code == 200
+    content = r.json()["choices"][0]["message"]["content"]
+    # Fence stripped: the client can JSON.parse this verbatim.
+    assert json.loads(content) == {"answer": 42}
+
+    # The instruction reached the model, as the LAST system block, with schema.
+    (sent,) = capture.requests
+    assert "Output format" in sent["system"][-1]["text"]
+    assert "JSON Schema" in sent["system"][-1]["text"]
+    assert '"answer"' in sent["system"][-1]["text"]
+
+
+def test_json_mode_no_instruction_without_response_format(bridge):
+    capture = bridge(_anthropic_text_response('```json\n{"answer": 42}\n```'))
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "answer"}],
+            "tools": [WEB_SEARCH_TOOL],
+        },
+    )
+    assert r.status_code == 200
+    # Untouched without response_format — fence and all.
+    assert r.json()["choices"][0]["message"]["content"] == '```json\n{"answer": 42}\n```'
+    (sent,) = capture.requests
+    assert not any("Output format" in b["text"] for b in sent.get("system", []))
+
+
+def test_json_mode_leaves_tool_calls_alone(bridge):
+    """Content next to a tool call is commentary, not the structured answer."""
+    bridge(_anthropic_tool_use_response())
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "search then answer as json"}],
+            "tools": [WEB_SEARCH_TOOL],
+            "response_format": {"type": "json_object"},
+        },
+    )
+    assert r.status_code == 200
+    choice = r.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    (tc,) = choice["message"]["tool_calls"]
+    assert json.loads(tc["function"]["arguments"]) == {"query": "weather in Paris"}
+
+
+def test_json_mode_streaming_buffers_and_strips(bridge):
+    # Fence split across chunk boundaries: only whole-stream stripping works.
+    events = [
+        {"type": "message_start",
+         "message": {"id": "msg_01", "usage": {"input_tokens": 5, "output_tokens": 1}}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": '```json\n{"answer": '}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": '42}\n```'}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"output_tokens": 9}},
+        {"type": "message_stop"},
+    ]
+    bridge(_sse(events))
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "session_id": "toolbridge-json-stream",
+            "model": "claude-haiku-4-5",
+            "stream": True,
+            "messages": [{"role": "user", "content": "answer as json"}],
+            "tools": [WEB_SEARCH_TOOL],
+            "response_format": {"type": "json_object"},
+        },
+    ) as r:
+        assert r.status_code == 200
+        payloads = [l[5:].strip() for l in r.iter_lines() if l.startswith("data:")]
+
+    chunks = [json.loads(p) for p in payloads if p != "[DONE]"]
+    content = "".join(
+        c["choices"][0]["delta"].get("content", "") for c in chunks if c.get("choices")
+    )
+    assert json.loads(content) == {"answer": 42}
+
+
+def test_json_mode_unparseable_errors(bridge):
+    """Prose in JSON mode => 502 quoting the model, not a 200 that breaks parse."""
+    bridge(_anthropic_text_response("I need more details before I can build that."))
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "answer as json"}],
+            "tools": [WEB_SEARCH_TOOL],
+            "response_format": {"type": "json_object"},
+        },
+    )
+    assert r.status_code == 502
+    detail = r.json()["detail"]
+    assert "I need more details" in detail
+    assert "json_object" in detail
+
+
+def test_json_mode_streaming_unparseable_errors(bridge):
+    events = [
+        {"type": "message_start",
+         "message": {"id": "msg_01", "usage": {"input_tokens": 5, "output_tokens": 1}}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "I need more "}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "details first."}},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"output_tokens": 9}},
+        {"type": "message_stop"},
+    ]
+    bridge(_sse(events))
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "session_id": "toolbridge-json-stream-err",
+            "model": "claude-haiku-4-5",
+            "stream": True,
+            "messages": [{"role": "user", "content": "answer as json"}],
+            "tools": [WEB_SEARCH_TOOL],
+            "response_format": {"type": "json_object"},
+        },
+    ) as r:
+        assert r.status_code == 200
+        payloads = [l[5:].strip() for l in r.iter_lines() if l.startswith("data:")]
+
+    chunks = [json.loads(p) for p in payloads if p != "[DONE]"]
+    # No prose leaked onto the content channel...
+    content = "".join(
+        c["choices"][0]["delta"].get("content", "") for c in chunks if c.get("choices")
+    )
+    assert content == ""
+    # ...it came back on the error channel instead, quoting the reply.
+    errors = [c["error"]["message"] for c in chunks if "error" in c]
+    assert len(errors) == 1
+    assert "I need more details first." in errors[0]

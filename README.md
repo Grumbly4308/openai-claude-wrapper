@@ -209,9 +209,25 @@ suppressed so the concatenated content is pure JSON.
 This is what clients built on the Vercel AI SDK's `generateObject` expect —
 e.g. Vane, whose `JSON.parse` chokes on ` ```json `-fenced replies
 ([Vane#959](https://github.com/ItzCrazyKns/Vane/issues/959)). Requests without
-`response_format` (or with `{"type": "text"}`) are completely unaffected. If
-the model produces no parseable JSON at all, the reply passes through
-unchanged rather than masking what it said.
+`response_format` (or with `{"type": "text"}`) are completely unaffected.
+
+Two things keep prose from reaching a structured-output client:
+
+- **The clarification protocol is forced off in JSON mode**, whatever the
+  request or server default says. It instructs Claude to make its entire reply
+  a list of questions when it hits an ambiguity — prose with no JSON in it, and
+  nobody on the far end who can answer, since `generateObject` is a one-shot
+  machine call.
+- **A reply with no parseable JSON is a `502`**, not a `200`. The error quotes
+  what the model actually said (`model returned no JSON in json_schema mode; it
+  replied with prose instead: "…"`), so the client surfaces a real API error
+  instead of dying in `JSON.parse` at character 0. On a streamed request the
+  response head is already sent, so the same message arrives on the stream's
+  error channel and no content is emitted.
+
+`response_format` is honored on the `tools` path too — a request may carry both,
+and the tool bridge applies the same instruction and reduction to its final text
+answer. Tool-call arguments are never touched.
 
 #### Function calling (`tools`)
 

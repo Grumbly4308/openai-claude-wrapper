@@ -7,7 +7,6 @@ import json
 import logging
 import mimetypes
 import os
-import re
 import time
 import uuid
 from pathlib import Path
@@ -31,6 +30,14 @@ from . import tool_bridge
 from .config import SETTINGS, advertised_models, split_model_effort, supported_models
 from .converters import derive_session_id
 from .deps import FILE_STORE, PREPARER, RUNNER, USAGE_LEDGER, auth_dependency
+# Re-exported under the historical private names (and `extract_raw_json`, which
+# tests import from here) — see json_mode.py for why it is a separate module.
+from .json_mode import (
+    extract_raw_json,
+    json_instruction as _json_instruction,
+    json_mode_error as _json_mode_error,
+    wants_json as _wants_json,
+)
 from .models import (
     ChatCompletionChoice,
     ChatCompletionChunk,
@@ -128,71 +135,6 @@ _CONTENT_WRAP = {
     "think_tags": ("<think>\n", "\n</think>\n\n"),
 }
 
-
-# ---------- JSON mode (response_format) ----------
-#
-# Structured-output clients (Vercel AI SDK generateObject → Vane, etc.) send
-# response_format {"type": "json_object"|"json_schema"} and JSON.parse the
-# returned content verbatim — a ```json fence or any surrounding prose breaks
-# them. Claude habitually fences JSON when it's only asked for via prompt, so
-# JSON mode both instructs the model (raw JSON only) and strips whatever
-# wrapping slips through before the content leaves the wrapper.
-
-
-def _wants_json(req: ChatCompletionRequest) -> bool:
-    rf = getattr(req, "response_format", None)
-    return rf is not None and rf.type in ("json_object", "json_schema")
-
-
-def _json_instruction(req: ChatCompletionRequest) -> str:
-    lines = [
-        "## Output format",
-        "Respond with a single raw JSON value. Do not wrap it in markdown "
-        "code fences and do not add any text before or after the JSON.",
-    ]
-    rf = req.response_format
-    if rf is not None and rf.type == "json_schema" and rf.json_schema:
-        schema = rf.json_schema.get("schema") or rf.json_schema
-        lines.append("The JSON MUST validate against this JSON Schema:")
-        lines.append(json.dumps(schema, indent=2))
-    return "\n".join(lines)
-
-
-_JSON_FENCE_RE = re.compile(r"```[a-zA-Z0-9]*\s*(.*?)\s*```", re.DOTALL)
-
-
-def extract_raw_json(text: str) -> Optional[str]:
-    """Best-effort recovery of a raw JSON value from a model reply.
-
-    Tries, in order: the reply as-is, each fenced code block, then the first
-    parseable JSON object/array found anywhere in the text (handles preamble
-    like "Here is the JSON:"). Returns None when nothing parses — callers
-    should then pass the original text through rather than mask the reply.
-    """
-    s = (text or "").strip()
-    if not s:
-        return None
-    try:
-        json.loads(s)
-        return s
-    except json.JSONDecodeError:
-        pass
-    for m in _JSON_FENCE_RE.finditer(s):
-        candidate = m.group(1).strip()
-        try:
-            json.loads(candidate)
-            return candidate
-        except json.JSONDecodeError:
-            continue
-    decoder = json.JSONDecoder()
-    for i, ch in enumerate(s):
-        if ch in "{[":
-            try:
-                _, end = decoder.raw_decode(s, i)
-                return s[i:end]
-            except json.JSONDecodeError:
-                continue
-    return None
 
 # Shared SSE response headers. Disabling proxy buffering (X-Accel-Buffering) and
 # caching is what lets keep-alive comments and incremental chunks actually reach
@@ -577,11 +519,12 @@ async def _sync_response(
     if _wants_json(req):
         # JSON mode: the client will JSON.parse the content verbatim. Reduce
         # the reply to the raw JSON value and never append the markdown file
-        # trailer. If no JSON parses at all, pass the reply through unchanged
-        # rather than mask what the model actually said.
+        # trailer. If no JSON parses at all, fail loudly with the model's own
+        # words rather than hand the client a body that dies in JSON.parse.
         cleaned = extract_raw_json(final_text)
-        if cleaned is not None:
-            final_text = cleaned
+        if cleaned is None:
+            raise HTTPException(status_code=502, detail=_json_mode_error(req, final_text))
+        final_text = cleaned
     elif attachments and not req.inline_generated_files:
         final_text = _append_file_references(final_text, attachments)
 
@@ -864,22 +807,29 @@ async def _stream_response(
             yield close
         # JSON mode: flush the buffered answer as one content chunk, reduced to
         # the raw JSON value. Emitted here (not in the post-loop section) so the
-        # buffer also reaches the client on the mid-stream error path.
+        # buffer also reaches the client on the mid-stream error path. When
+        # nothing parses, the response head is already sent so a 502 is no
+        # longer possible — report it on the stream's error channel instead,
+        # and emit no content at all rather than prose the client will choke on.
         if json_parts:
             body = "".join(json_parts)
-            json_chunk = ChatCompletionChunk(
-                id=chunk_id,
-                created=created,
-                model=model,
-                choices=[
-                    ChatCompletionChunkChoice(
-                        index=0,
-                        delta=DeltaMessage(content=extract_raw_json(body) or body),
-                        finish_reason=None,
-                    )
-                ],
-            )
-            yield _sse_chunk(json_chunk)
+            cleaned = extract_raw_json(body)
+            if cleaned is None:
+                errored = errored or _json_mode_error(req, body)
+            else:
+                json_chunk = ChatCompletionChunk(
+                    id=chunk_id,
+                    created=created,
+                    model=model,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            index=0,
+                            delta=DeltaMessage(content=cleaned),
+                            finish_reason=None,
+                        )
+                    ],
+                )
+                yield _sse_chunk(json_chunk)
         final_chunk = ChatCompletionChunk(
             id=chunk_id,
             created=created,
@@ -991,7 +941,18 @@ def _resolve_clarify(req) -> bool:
     Absent/None => on (the interactive default); explicit false opts a request
     out. The server-level switch is enforced in the runner (an empty configured
     prompt makes clarify=True a no-op), so this only governs per-request intent.
+
+    JSON mode forces it OFF regardless of what the client asked for. The
+    clarification protocol tells Claude to make its ENTIRE reply a list of
+    questions when it hits an ambiguity, which is pure prose with no JSON in it
+    — so the reply reaches a structured-output client (Vercel AI SDK
+    generateObject → Vane) as an unparseable body and dies in JSON.parse. There
+    is also nobody on the far end who *can* answer: a generateObject call is a
+    one-shot machine request, not a chat turn. Asking is never the right move
+    there, so the wire contract wins over the interactive default.
     """
+    if _wants_json(req):
+        return False
     val = getattr(req, "clarify", None)
     return True if val is None else bool(val)
 

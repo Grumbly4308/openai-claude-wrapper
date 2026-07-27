@@ -36,6 +36,7 @@ import httpx
 from fastapi import HTTPException
 
 from .config import SETTINGS
+from .json_mode import extract_raw_json, json_instruction, json_mode_error, wants_json
 from .models import (
     ChatCompletionChunk,
     ChatCompletionChunkChoice,
@@ -312,6 +313,12 @@ def build_request(
     if is_oauth:
         system_blocks.append({"type": "text", "text": _CLAUDE_CODE_IDENTITY})
     system_blocks.extend({"type": "text", "text": t} for t in system_texts)
+    # A request may declare tools AND response_format (AI SDK clients do this
+    # when a structured-output call is allowed to call tools first). The
+    # instruction goes last so it wins over any caller system prompt, and only
+    # governs the final text answer — tool_use blocks are unaffected.
+    if wants_json(req):
+        system_blocks.append({"type": "text", "text": json_instruction(req)})
 
     payload: dict[str, Any] = {
         "model": model,
@@ -392,6 +399,16 @@ async def complete(req: ChatCompletionRequest, run_model: str) -> BridgeResult:
 
     usage = data.get("usage") or {}
     content = "".join(text_parts)
+    # JSON mode: the client JSON.parses the content verbatim. Reduce it to the
+    # raw JSON value. Skipped when the turn produced tool calls — there the
+    # content is incidental commentary, not the structured answer, and the
+    # client reads tool_calls instead. If nothing parses, fail loudly with the
+    # model's own words rather than return a body that dies in JSON.parse.
+    if not tool_calls and wants_json(req):
+        cleaned = extract_raw_json(content)
+        if cleaned is None:
+            raise HTTPException(status_code=502, detail=json_mode_error(req, content))
+        content = cleaned
     return BridgeResult(
         content=content if content else None,
         tool_calls=tool_calls or None,
@@ -437,6 +454,12 @@ async def stream(
 
     # Anthropic content-block index -> position in the OpenAI tool_calls array.
     tc_index_of: dict[int, int] = {}
+    # JSON mode: the client parses the concatenated content as JSON, so answer
+    # deltas are buffered (a ```json fence can span chunk boundaries) and
+    # emitted as one cleaned chunk right before the terminator. Tool-call
+    # argument fragments still stream through untouched.
+    json_mode = wants_json(req)
+    json_parts: list[str] = []
     stop_reason: Optional[str] = None
     input_tokens = output_tokens = 0
     errored: Optional[str] = None
@@ -488,7 +511,10 @@ async def stream(
                         delta = evt.get("delta") or {}
                         dtype = delta.get("type")
                         if dtype == "text_delta" and delta.get("text"):
-                            yield chunk(DeltaMessage(content=delta["text"]))
+                            if json_mode:
+                                json_parts.append(delta["text"])
+                            else:
+                                yield chunk(DeltaMessage(content=delta["text"]))
                         elif dtype == "input_json_delta":
                             fragment = delta.get("partial_json") or ""
                             idx = tc_index_of.get(int(evt.get("index") or 0))
@@ -521,6 +547,22 @@ async def stream(
             await on_usage(input_tokens, output_tokens)
         except Exception:  # pragma: no cover
             log.exception("usage recording failed (session=%s)", session_key)
+
+    # Flush the buffered JSON-mode answer. Emitted here (not inside the loop) so
+    # it also reaches the client on the mid-stream error path. Cleaned only when
+    # the turn produced no tool calls — see the same guard in complete(). With
+    # the response head already sent a 502 is impossible, so an unparseable
+    # reply goes out on the stream's error channel instead of as content.
+    if json_parts:
+        body = "".join(json_parts)
+        if tc_index_of:
+            yield chunk(DeltaMessage(content=body))
+        else:
+            cleaned = extract_raw_json(body)
+            if cleaned is None:
+                errored = errored or json_mode_error(req, body)
+            else:
+                yield chunk(DeltaMessage(content=cleaned))
 
     yield chunk(DeltaMessage(), finish=_finish_reason(stop_reason, bool(tc_index_of)))
     if (req.stream_options or {}).get("include_usage"):

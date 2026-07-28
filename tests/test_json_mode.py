@@ -75,6 +75,7 @@ from src.json_mode import (  # noqa: E402
     prompt_requests_json as _prompt_requests_json,
     responses_text_format,
     unfence_json as _unfence_json,
+    unfence_sole_json_block as _unfence_sole_json_block,
 )
 from src.main import app, extract_raw_json  # noqa: E402
 
@@ -459,6 +460,57 @@ def test_unfence_json_unit() -> None:
     code = "```python\nprint('hi')\n```"
     check("unfence.code_untouched", _unfence_json(code) == code)
     check("unfence.unfenced_passthrough", _unfence_json(raw) == raw)
+
+
+def test_unfence_sole_json_block_unit() -> None:
+    """The escalation: a lone JSON fence is unwrapped even with prose around it.
+
+    `unfence_json` alone matches a fence and nothing else, so the single
+    trailing sentence Claude habitually adds was enough to ship backticks to
+    a client whose next move is JSON.parse.
+    """
+    raw = '{"title": "x"}'
+    check("sole.trailer", _unfence_sole_json_block(f"```json\n{raw}\n```\n\nLet me know!") == raw)
+    check("sole.preamble", _unfence_sole_json_block(f"Here you go:\n```json\n{raw}\n```") == raw)
+    check("sole.both_sides", _unfence_sole_json_block(f"Sure:\n```json\n{raw}\n```\nHope that helps!") == raw)
+    check("sole.bare_fence", _unfence_sole_json_block(f"```json\n{raw}\n```") == raw)
+    check("sole.no_lang", _unfence_sole_json_block(f"```\n{raw}\n```") == raw)
+
+    # Narrower than extract_raw_json on purpose. Two fenced blocks is a reply
+    # weighing options, not a structured-output answer — picking one would be
+    # a guess, so it is left alone.
+    two = f"Option A:\n```json\n{raw}\n```\nOption B:\n```json\n{{\"title\": \"y\"}}\n```"
+    check("sole.two_blocks_untouched", _unfence_sole_json_block(two) == two)
+    # A fence that isn't JSON is a code block, whatever the prompt asked for.
+    code = "Try this:\n```python\nprint('hi')\n```"
+    check("sole.non_json_untouched", _unfence_sole_json_block(code) == code)
+    # No fence at all: nothing to unwrap.
+    prose = "A JSON schema describes the shape of a document."
+    check("sole.no_fence_untouched", _unfence_sole_json_block(prose) == prose)
+
+
+def test_sniffed_reply_with_trailer_is_unfenced() -> None:
+    """End-to-end regression for the reported bug.
+
+    Vane's generateObject died on `Unexpected token '`'` because the reply was
+    a fence plus a sign-off, which strict unfencing left completely alone.
+    """
+    _STATE["final_text"] = '```json\n{"title": "x"}\n```\n\nLet me know if you need changes.'
+    r = _chat([{"role": "user", "content": _SNIFFED}])
+    content = r.json()["choices"][0]["message"]["content"]
+    check("sniff.trailer_status", r.status_code == 200, note=str(r.status_code))
+    check("sniff.trailer_parses", json.loads(content) == {"title": "x"}, note=content)
+
+
+def test_responses_sniffed_reply_with_trailer_is_unfenced() -> None:
+    """Same escalation on /v1/responses, the other sniffed path."""
+    _STATE["final_text"] = 'Here you go:\n```json\n{"title": "x"}\n```'
+    r = _responses(_SNIFFED)
+    check(
+        "sniff.responses_trailer",
+        json.loads(r.json()["output_text"]) == {"title": "x"},
+        note=r.text,
+    )
 
 
 def test_sniffed_reply_is_unfenced() -> None:

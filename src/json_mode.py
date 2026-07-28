@@ -73,6 +73,70 @@ def json_instruction(req: Any) -> str:
     return "\n".join(lines)
 
 
+# ---------- prompt-declared JSON (no response_format on the wire) ----------
+#
+# Some structured-output clients never declare anything the wrapper can see:
+# they put the schema in the PROMPT and JSON.parse the reply anyway. That is
+# what Vane does — its requests arrive with no response_format and no tools
+# (`json_mode=off` in the request log) — and Claude, asked for JSON in prose
+# with nothing forbidding markdown, fences it: ```json\n{…}\n``` → the client
+# dies on the backtick.
+#
+# The wrapper cannot turn on real JSON mode for these turns: a false positive
+# there would 502 an ordinary chat answer. What it can do is two things that
+# are harmless when the guess is wrong:
+#
+#   1. Ask for the JSON unfenced (a formatting-only hint, conditional on the
+#      answer being JSON at all — it cannot turn a prose answer into JSON).
+#   2. Unwrap a reply that is *nothing but* one fenced JSON block. A reply with
+#      prose around the fence is left exactly as it is, so a chat answer that
+#      merely contains a JSON snippet is never touched.
+
+_SCHEMA_MARKER_RE = re.compile(r"json[\s_-]?schema", re.IGNORECASE)
+_JSON_DIRECTIVE_RE = re.compile(
+    r"\b(respond|reply|answer|output|return)\b[^.\n]{0,60}\bjson\b", re.IGNORECASE
+)
+
+FENCE_HINT = (
+    "## Output format\n"
+    "If your reply is a JSON value, output it raw — no markdown code fences "
+    "around it and no text before or after it."
+)
+
+
+def prompt_requests_json(prompt: str) -> bool:
+    """Does this prompt look like a machine asking for a JSON-only reply?
+
+    Deliberately requires BOTH a schema marker and an imperative ("respond
+    with JSON"), because either alone matches ordinary chat about JSON. Even
+    so this is a guess, so both things it gates are no-ops when it guesses
+    wrong — see the module note above.
+    """
+    text = prompt or ""
+    return bool(_SCHEMA_MARKER_RE.search(text) and _JSON_DIRECTIVE_RE.search(text))
+
+
+_FENCE_ONLY_RE = re.compile(r"\A```[a-zA-Z0-9]*[ \t]*\n?(.*?)\n?[ \t]*```\Z", re.DOTALL)
+
+
+def unfence_json(text: str) -> str:
+    """Unwrap a reply that is one fenced JSON block and nothing else.
+
+    Returns `text` unchanged for anything else — prose around the fence, a
+    fence whose contents are not JSON, no fence at all.
+    """
+    s = (text or "").strip()
+    m = _FENCE_ONLY_RE.match(s)
+    if m is None:
+        return text
+    inner = m.group(1).strip()
+    try:
+        json.loads(inner)
+    except json.JSONDecodeError:
+        return text
+    return inner
+
+
 # How much of the model's reply to quote back in the error. Enough to see what
 # it actually said (a clarifying question, a refusal) without pasting an essay
 # into an error field.

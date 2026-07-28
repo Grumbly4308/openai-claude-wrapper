@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .json_mode import responses_text_format
 
 
 # ---------- Chat completion request ----------
@@ -288,6 +290,20 @@ class ResponsesRequest(BaseModel):
     max_output_tokens: Optional[int] = None
     user: Optional[str] = None
     metadata: Optional[dict[str, Any]] = None
+    # Structured output, Responses-API spelling: {"format": {"type":
+    # "json_schema", "name": …, "schema": {…}}}. Normalized below into the same
+    # `response_format` the chat path uses, so one JSON-mode implementation
+    # covers both endpoints.
+    text: Optional[dict[str, Any]] = None
+    response_format: Optional[ResponseFormat] = None
+
+    @model_validator(mode="after")
+    def _adopt_text_format(self) -> "ResponsesRequest":
+        if self.response_format is None:
+            kwargs = responses_text_format(self.text)
+            if kwargs is not None:
+                self.response_format = ResponseFormat(**kwargs)
+        return self
 
 
 # ---------- Embeddings ----------

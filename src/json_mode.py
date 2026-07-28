@@ -20,9 +20,43 @@ import re
 from typing import Any, Optional
 
 
+_JSON_TYPES = ("json_object", "json_schema")
+
+
 def wants_json(req: Any) -> bool:
     rf = getattr(req, "response_format", None)
-    return rf is not None and rf.type in ("json_object", "json_schema")
+    return rf is not None and rf.type in _JSON_TYPES
+
+
+def responses_text_format(text: Any) -> Optional[dict[str, Any]]:
+    """Normalize a Responses-API ``text.format`` block into ResponseFormat kwargs.
+
+    /v1/responses carries structured output in a different shape than
+    /v1/chat/completions: `text: {"format": {"type": "json_schema", "name": …,
+    "schema": {…}, "strict": true}}` — the schema inlined, not nested under a
+    `json_schema` key. This is not an exotic corner: the Vercel AI SDK's
+    `openai(model)` resolves to the Responses model by default, so a
+    generateObject call lands on /v1/responses and declares its schema *only*
+    this way. Reading `response_format` alone would see nothing and treat the
+    turn as free-text prose.
+
+    Returns kwargs for models.ResponseFormat, or None when the request isn't
+    asking for structured output.
+    """
+    if not isinstance(text, dict):
+        return None
+    fmt = text.get("format")
+    if not isinstance(fmt, dict) or fmt.get("type") not in _JSON_TYPES:
+        return None
+    if fmt["type"] == "json_object":
+        return {"type": "json_object"}
+    # Lenient clients sometimes nest the chat-style envelope instead of
+    # inlining; take it as-is when present, otherwise treat the format block
+    # itself (minus `type`) as the envelope.
+    envelope = fmt.get("json_schema")
+    if not isinstance(envelope, dict):
+        envelope = {k: v for k, v in fmt.items() if k != "type"}
+    return {"type": "json_schema", "json_schema": envelope}
 
 
 def json_instruction(req: Any) -> str:
@@ -45,6 +79,15 @@ def json_instruction(req: Any) -> str:
 _ERROR_SNIPPET_CHARS = 500
 
 
+def _mode_and_snippet(req: Any, text: str) -> tuple[str, str]:
+    rf = getattr(req, "response_format", None)
+    mode = getattr(rf, "type", None) or "json"
+    snippet = (text or "").strip()
+    if len(snippet) > _ERROR_SNIPPET_CHARS:
+        snippet = snippet[:_ERROR_SNIPPET_CHARS] + "…"
+    return mode, snippet or "(empty reply)"
+
+
 def json_mode_error(req: Any, text: str) -> str:
     """Error message for a JSON-mode reply that contains no JSON at all.
 
@@ -55,15 +98,27 @@ def json_mode_error(req: Any, text: str) -> str:
     upstream error keeps the model's actual words (a clarifying question, a
     refusal to fabricate) while letting the client surface a real API error.
     """
-    rf = getattr(req, "response_format", None)
-    mode = getattr(rf, "type", None) or "json"
-    snippet = (text or "").strip()
-    if len(snippet) > _ERROR_SNIPPET_CHARS:
-        snippet = snippet[:_ERROR_SNIPPET_CHARS] + "…"
-    if not snippet:
-        snippet = "(empty reply)"
+    mode, snippet = _mode_and_snippet(req, text)
     return (
         f"model returned no JSON in {mode} mode; it replied with prose instead: {snippet!r}"
+    )
+
+
+def instant_reply_error(req: Any, text: str) -> str:
+    """Error message for a wrapper-authored reply that lands in JSON mode.
+
+    Some turns never reach Claude: the per-conversation token-budget checkpoint
+    and the instant `stats`/`context` chat commands are answered by the wrapper
+    itself, in prose. That is right for a chat UI and unusable for a
+    structured-output client, which JSON.parses the body — and the budget
+    checkpoint in particular is *sticky*, so every subsequent generateObject
+    call would fail the same way with nothing in the logs explaining why. Name
+    the cause in the error instead.
+    """
+    mode, snippet = _mode_and_snippet(req, text)
+    return (
+        f"wrapper answered this turn itself (token-budget checkpoint or chat command) "
+        f"and its reply is prose, which cannot be returned in {mode} mode: {snippet!r}"
     )
 
 

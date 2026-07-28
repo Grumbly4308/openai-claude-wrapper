@@ -33,10 +33,13 @@ from .deps import FILE_STORE, PREPARER, RUNNER, USAGE_LEDGER, auth_dependency
 # Re-exported under the historical private names (and `extract_raw_json`, which
 # tests import from here) — see json_mode.py for why it is a separate module.
 from .json_mode import (
+    FENCE_HINT as _FENCE_HINT,
     extract_raw_json,
     instant_reply_error as _instant_reply_error,
     json_instruction as _json_instruction,
     json_mode_error as _json_mode_error,
+    prompt_requests_json as _prompt_requests_json,
+    unfence_json as _unfence_json,
     wants_json as _wants_json,
 )
 from .models import (
@@ -125,6 +128,16 @@ _STREAM_SHOW_ACTIVITY = os.environ.get("CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY", "true
 _REASONING_CHANNEL = os.environ.get(
     "CLAUDE_WRAPPER_REASONING_CHANNEL", "details"
 ).strip().lower()
+
+# Whether to sniff prompt-declared JSON requests (a client that puts its schema
+# in the prompt and sends no response_format — see json_mode.py). Both effects
+# are no-ops on a false positive; set to off to disable the sniffing entirely.
+_JSON_SNIFF = os.environ.get("CLAUDE_WRAPPER_JSON_SNIFF", "on").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 
 # (open, close) token pairs for the channels that wrap reasoning inside the
 # content stream. Other channels (reasoning_content, none) are not in this map.
@@ -379,6 +392,11 @@ async def _prepare_run(req: ChatCompletionRequest):
     prompt, _attachments = await PREPARER.prepare_messages(req.messages, session_key)
     if _wants_json(req):
         prompt = f"{prompt}\n\n{_json_instruction(req)}"
+    elif _JSON_SNIFF and _prompt_requests_json(prompt):
+        # No response_format on the wire, but the prompt itself asks for JSON
+        # against a schema. Ask for it unfenced; the hint is conditional on the
+        # answer being JSON, so a mis-sniffed chat turn is unaffected.
+        prompt = f"{prompt}\n\n{_FENCE_HINT}"
     model = req.model if req.model and req.model != "auto" else SETTINGS.default_model
 
     if not prompt.strip():
@@ -549,8 +567,18 @@ async def _sync_response(
         if cleaned is None:
             raise HTTPException(status_code=502, detail=_json_mode_error(req, final_text))
         final_text = cleaned
-    elif attachments and not req.inline_generated_files:
-        final_text = _append_file_references(final_text, attachments)
+    else:
+        unfenced = final_text
+        if _JSON_SNIFF and _prompt_requests_json(prompt):
+            unfenced = _unfence_json(final_text)
+        if unfenced != final_text:
+            # A prompt-declared JSON reply, unwrapped. The trailer would put
+            # markdown right back on the end of it, so it is suppressed here
+            # exactly as in real JSON mode.
+            log.info("unfenced a prompt-declared JSON reply (session=%s)", session_key)
+            final_text = unfenced
+        elif attachments and not req.inline_generated_files:
+            final_text = _append_file_references(final_text, attachments)
 
     choice_msg = ChoiceMessage(
         role="assistant",
@@ -1148,8 +1176,15 @@ async def _responses_sync(
         if cleaned is None:
             raise HTTPException(status_code=502, detail=_json_mode_error(rreq, final_text))
         final_text = cleaned
-    elif attachments:
-        final_text = _append_file_references(final_text, attachments)
+    else:
+        unfenced = final_text
+        if _JSON_SNIFF and _prompt_requests_json(prompt):
+            unfenced = _unfence_json(final_text)
+        if unfenced != final_text:
+            log.info("unfenced a prompt-declared JSON reply (session=%s)", session_key)
+            final_text = unfenced
+        elif attachments:
+            final_text = _append_file_references(final_text, attachments)
 
     envelope = _responses_envelope(
         rreq,

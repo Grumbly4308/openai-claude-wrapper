@@ -137,6 +137,42 @@ def unfence_json(text: str) -> str:
     return inner
 
 
+def unfence_sole_json_block(text: str) -> str:
+    """Unwrap a lone fenced JSON block, even with prose around it.
+
+    The escalation from :func:`unfence_json`, which matches only when the
+    reply is a fence and *nothing* else. That exact match loses to how
+    Claude actually answers: it routinely signs off after the JSON ("Let me
+    know if you'd like any changes"), and a single trailing sentence was
+    enough to send the fenced body — backticks and all — to a client whose
+    very next move is ``JSON.parse``. That is the ``SyntaxError: Unexpected
+    token '`'`` this whole path exists to prevent.
+
+    Still deliberately narrower than :func:`extract_raw_json`, which takes
+    the first of several fences and will also dig a bare JSON value out of
+    running prose. The requirement here is exactly ONE fenced block whose
+    contents parse as JSON: a reply weighing up two candidate objects, or
+    an explanation that happens to quote some JSON among other snippets, is
+    not a structured-output answer and is returned untouched.
+
+    Only ever called once :func:`prompt_requests_json` has matched, i.e.
+    when the prompt carried both a schema marker and an imperative — so the
+    caller is a machine that will parse this verbatim. The residual risk is
+    a mis-sniffed chat turn losing its prose around a lone JSON block;
+    ``CLAUDE_WRAPPER_JSON_SNIFF=off`` disables the whole path.
+    """
+    s = text or ""
+    blocks = _JSON_FENCE_RE.findall(s)
+    if len(blocks) != 1:
+        return text
+    inner = blocks[0].strip()
+    try:
+        json.loads(inner)
+    except json.JSONDecodeError:
+        return text
+    return inner
+
+
 # How much of the model's reply to quote back in the error. Enough to see what
 # it actually said (a clarifying question, a refusal) without pasting an essay
 # into an error field.

@@ -71,6 +71,7 @@ ClaudeRunner.run_stream = _stub_run_stream
 # ---- now import the app ----
 from fastapi.testclient import TestClient  # noqa: E402
 
+from src.json_mode import responses_text_format  # noqa: E402
 from src.main import app, extract_raw_json  # noqa: E402
 
 client = TestClient(app)
@@ -306,6 +307,149 @@ def test_stream_without_response_format_untouched() -> None:
     check("stream.plain_finish", finish == "stop")
 
 
+# ---------- /v1/responses ----------
+#
+# The Responses API declares structured output as `text: {"format": {…}}`, with
+# the schema inlined rather than nested under `json_schema`. This is the shape
+# the Vercel AI SDK sends by default — `openai(model)` resolves to its Responses
+# model — so a generateObject call lands here, not on /v1/chat/completions. The
+# same contract must hold: instruction in the prompt, raw JSON out, a real error
+# instead of prose.
+
+
+def _responses(input_text: str, **extra):
+    body = {"model": "claude-opus-4-8", "input": input_text, **extra}
+    return client.post("/v1/responses", json=body)
+
+
+def _parse_responses_sse(body: str):
+    """-> (concatenated deltas, terminal event type, terminal response object)."""
+    deltas, terminal_type, terminal = [], None, None
+    for line in body.splitlines():
+        if not line.startswith("data: "):
+            continue
+        obj = json.loads(line[len("data: "):])
+        if obj.get("type") == "response.output_text.delta":
+            deltas.append(obj.get("delta") or "")
+        elif obj.get("type") in ("response.completed", "response.failed"):
+            terminal_type = obj["type"]
+            terminal = obj.get("response") or {}
+    return "".join(deltas), terminal_type, terminal
+
+
+_TEXT_FORMAT = {
+    "format": {
+        "type": "json_schema",
+        "name": "suggestions",
+        "schema": {
+            "type": "object",
+            "properties": {"suggestions": {"type": "array", "items": {"type": "string"}}},
+            "required": ["suggestions"],
+        },
+        "strict": True,
+    }
+}
+
+
+def test_responses_text_format_normalization() -> None:
+    """The Responses `text.format` shape maps onto chat's `response_format`."""
+    norm = responses_text_format(_TEXT_FORMAT)
+    check("respfmt.type", norm["type"] == "json_schema", note=str(norm))
+    check("respfmt.schema_kept", norm["json_schema"]["schema"]["required"] == ["suggestions"], note=str(norm))
+    check("respfmt.json_object", responses_text_format({"format": {"type": "json_object"}}) == {"type": "json_object"})
+    # Chat-style nesting from a lenient client is taken as-is.
+    nested = responses_text_format({"format": {"type": "json_schema", "json_schema": {"schema": {"type": "object"}}}})
+    check("respfmt.nested_envelope", nested["json_schema"] == {"schema": {"type": "object"}}, note=str(nested))
+    check("respfmt.plain_text", responses_text_format({"format": {"type": "text"}}) is None)
+    check("respfmt.absent", responses_text_format(None) is None)
+
+
+def test_responses_sync_json_strips_fences() -> None:
+    _STATE["final_text"] = '```json\n{"suggestions": ["x", "y"]}\n```'
+    r = _responses("suggest things (responses json test)", text=_TEXT_FORMAT)
+    check("responses.status", r.status_code == 200, note=r.text)
+    out = r.json()["output_text"]
+    check("responses.raw_json", json.loads(out) == {"suggestions": ["x", "y"]}, note=out)
+    check("responses.instruction_in_prompt", "Output format" in _STATE["last_prompt"])
+    check("responses.schema_in_prompt", "JSON Schema" in _STATE["last_prompt"])
+    check("responses.clarify_off", _STATE["last_clarify"] is False, note=str(_STATE["last_clarify"]))
+
+
+def test_responses_sync_unparseable_errors() -> None:
+    _STATE["final_text"] = "Before diving into the data, I need to know which fields matter."
+    r = _responses("extract fields (responses unparseable test)", text=_TEXT_FORMAT)
+    check("responses.unparseable_status", r.status_code == 502, note=str(r.status_code))
+    detail = r.json().get("detail", "")
+    check("responses.unparseable_quotes_reply", "Before diving into the data" in detail, note=detail)
+
+
+def test_responses_plain_untouched() -> None:
+    fenced = 'Here you go:\n```json\n{"a": 1}\n```'
+    _STATE["final_text"] = fenced
+    r = _responses("normal responses turn (no structured output)")
+    check("responses.plain_verbatim", r.json()["output_text"] == fenced, note=r.text)
+    check("responses.plain_no_instruction", "Output format" not in _STATE["last_prompt"])
+
+
+def test_responses_stream_json_buffers_and_strips() -> None:
+    _STATE["stream_texts"] = ['```json\n{"suggestions": [', '"x", "y"]}\n```']
+    r = _responses("suggest things (responses stream json test)", text=_TEXT_FORMAT, stream=True)
+    deltas, terminal_type, terminal = _parse_responses_sse(r.text)
+    check("responses.stream_raw_json", json.loads(deltas) == {"suggestions": ["x", "y"]}, note=deltas)
+    check("responses.stream_completed", terminal_type == "response.completed", note=str(terminal_type))
+    check(
+        "responses.stream_output_text",
+        json.loads(terminal["output_text"]) == {"suggestions": ["x", "y"]},
+        note=str(terminal.get("output_text")),
+    )
+
+
+def test_responses_stream_json_unparseable_fails() -> None:
+    """Head already sent => fail on the stream's own channel, emit no text."""
+    _STATE["stream_texts"] = ["Before diving in, ", "which fields matter?"]
+    r = _responses("extract fields (responses stream unparseable)", text=_TEXT_FORMAT, stream=True)
+    deltas, terminal_type, terminal = _parse_responses_sse(r.text)
+    check("responses.stream_bad_no_text", deltas == "", note=deltas)
+    check("responses.stream_bad_failed", terminal_type == "response.failed", note=str(terminal_type))
+    check(
+        "responses.stream_bad_quotes_reply",
+        "Before diving in" in (terminal.get("error") or {}).get("message", ""),
+        note=str(terminal.get("error")),
+    )
+
+
+# ---------- wrapper-authored replies ----------
+#
+# Some turns never reach Claude: the `stats`/`context` commands and the
+# token-budget checkpoint are answered by the wrapper in prose. In JSON mode
+# that prose is just as unparseable to the client as a prose model reply, so it
+# must not go out with a 200.
+
+
+def test_instant_command_errors_in_json_mode() -> None:
+    body = {
+        "model": "claude-opus-4-8",
+        "messages": [{"role": "user", "content": "stats"}],
+        "response_format": {"type": "json_object"},
+    }
+    r = client.post("/v1/chat/completions", json=body)
+    check("instant.chat_status", r.status_code == 502, note=str(r.status_code))
+    check("instant.chat_names_cause", "wrapper answered this turn" in r.json().get("detail", ""), note=r.text)
+
+
+def test_instant_command_ok_without_json_mode() -> None:
+    body = {"model": "claude-opus-4-8", "messages": [{"role": "user", "content": "stats"}]}
+    r = client.post("/v1/chat/completions", json=body)
+    check("instant.chat_plain_200", r.status_code == 200, note=str(r.status_code))
+    check("instant.chat_plain_text", "Usage stats" in r.json()["choices"][0]["message"]["content"], note=r.text)
+
+
+def test_responses_instant_command_errors_in_json_mode() -> None:
+    r = _responses("stats", text=_TEXT_FORMAT)
+    check("instant.responses_status", r.status_code == 502, note=str(r.status_code))
+    check("instant.responses_names_cause", "wrapper answered this turn" in r.json().get("detail", ""), note=r.text)
+
+
 # ---------- runner ----------
 
 
@@ -324,6 +468,15 @@ def main() -> int:
         test_json_mode_disables_clarify_streaming,
         test_stream_json_buffers_and_strips,
         test_stream_without_response_format_untouched,
+        test_responses_text_format_normalization,
+        test_responses_sync_json_strips_fences,
+        test_responses_sync_unparseable_errors,
+        test_responses_plain_untouched,
+        test_responses_stream_json_buffers_and_strips,
+        test_responses_stream_json_unparseable_fails,
+        test_instant_command_errors_in_json_mode,
+        test_instant_command_ok_without_json_mode,
+        test_responses_instant_command_errors_in_json_mode,
     ]
     for t in tests:
         try:

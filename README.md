@@ -194,7 +194,7 @@ string or structured `input` (plus optional `instructions`), and returns a
   from the session key, so the thread deterministically reattaches rather than
   forking a new session.
 
-#### Structured output (`response_format`)
+#### Structured output (`response_format` / `text.format`)
 
 `/v1/chat/completions` honors the OpenAI `response_format` parameter. With
 `{"type": "json_object"}` or `{"type": "json_schema", "json_schema": {…}}` the
@@ -225,9 +225,36 @@ Two things keep prose from reaching a structured-output client:
   response head is already sent, so the same message arrives on the stream's
   error channel and no content is emitted.
 
+- **A wrapper-authored reply is a `502` too.** Some turns never reach Claude:
+  the `stats`/`context` chat commands and the per-conversation token-budget
+  checkpoint are answered by the wrapper itself, in prose. In JSON mode that is
+  just as unreadable to the client, and the budget checkpoint is *sticky* — it
+  would fail every later request the same way — so the error names the cause
+  (`wrapper answered this turn itself (token-budget checkpoint or chat
+  command) …`).
+
 `response_format` is honored on the `tools` path too — a request may carry both,
 and the tool bridge applies the same instruction and reduction to its final text
 answer. Tool-call arguments are never touched.
+
+**`/v1/responses` gets the same treatment**, via the Responses-API spelling:
+`text: {"format": {"type": "json_schema", "name": …, "schema": {…}}}` (schema
+inlined, not nested under `json_schema`; `{"type": "json_object"}` also works).
+This matters because the Vercel AI SDK's `openai(model)` resolves to its
+**Responses** model by default, so a `generateObject` call lands on
+`/v1/responses` rather than `/v1/chat/completions` and declares its schema only
+this way. The request is normalized to the same internal `response_format`, so
+instruction, clarify-off, raw-JSON reduction, suppressed file trailer and the
+`502`/`response.failed` behavior are identical on both endpoints. Streamed
+Responses turns buffer the answer and emit one cleaned `response.output_text.delta`
+before the terminal event; if nothing parses, the turn ends in `response.failed`
+carrying the model's words, with no text emitted.
+
+Every generation request logs one line — `chat/completions: model=… stream=…
+json_mode=json_schema tools=0` or `responses: … json_mode=off …` — so a
+client-side `Unexpected token` can be traced to the surface that served it and
+to whether the structured-output declaration was seen at all (`json_mode=off`
+on a turn the client thought was structured is the whole diagnosis).
 
 #### Function calling (`tools`)
 

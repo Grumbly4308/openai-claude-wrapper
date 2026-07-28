@@ -250,6 +250,28 @@ Responses turns buffer the answer and emit one cleaned `response.output_text.del
 before the terminal event; if nothing parses, the turn ends in `response.failed`
 carrying the model's words, with no text emitted.
 
+**Clients that declare nothing.** Some structured-output clients send neither
+`response_format` nor `tools` — they put the schema in the *prompt* and
+`JSON.parse` the reply anyway (this is what Vane does; its requests log as
+`json_mode=off`). Claude, asked for JSON in prose with nothing forbidding
+markdown, fences it, and the client dies on the backtick. The wrapper cannot
+switch real JSON mode on for these turns — a false positive would turn a `502`
+on an ordinary chat answer — so when a prompt carries *both* a JSON-schema
+marker and a "respond with JSON" imperative it does only the two things that
+are harmless when the guess is wrong:
+
+1. appends a formatting-only hint (output JSON raw, no fences — conditional on
+   the answer being JSON at all, so it cannot reshape a prose answer), and
+2. unwraps a reply that is *nothing but* one fenced JSON block, on the sync
+   path. Prose around the fence, or a fence that isn't JSON, is left alone, so
+   a chat answer that merely contains a JSON snippet keeps its markdown.
+
+A prose reply on a sniffed turn is still a plain `200`, and the clarification
+protocol is left alone — unlike real JSON mode, this is a guess. Set
+`CLAUDE_WRAPPER_JSON_SNIFF=off` to disable it. The durable fix belongs on the
+client: send `response_format` (or `text.format`) and all of the above becomes
+an exact contract rather than an inference.
+
 Every generation request logs one line — `chat/completions: model=… stream=…
 json_mode=json_schema tools=0` or `responses: … json_mode=off …` — so a
 client-side `Unexpected token` can be traced to the surface that served it and

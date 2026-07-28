@@ -71,7 +71,11 @@ ClaudeRunner.run_stream = _stub_run_stream
 # ---- now import the app ----
 from fastapi.testclient import TestClient  # noqa: E402
 
-from src.json_mode import responses_text_format  # noqa: E402
+from src.json_mode import (  # noqa: E402
+    prompt_requests_json as _prompt_requests_json,
+    responses_text_format,
+    unfence_json as _unfence_json,
+)
 from src.main import app, extract_raw_json  # noqa: E402
 
 client = TestClient(app)
@@ -418,6 +422,81 @@ def test_responses_stream_json_unparseable_fails() -> None:
     )
 
 
+# ---------- prompt-declared JSON (no response_format on the wire) ----------
+#
+# Vane sends neither response_format nor tools — its request logs as
+# `json_mode=off` — and puts the schema in the prompt, then JSON.parses the
+# reply. Claude fences the JSON, and the client dies on the backtick. The
+# wrapper cannot switch on real JSON mode for these turns (a false positive
+# would 502 an ordinary chat answer), so it does the two things that are
+# harmless when the guess is wrong: ask for it unfenced, and unwrap a reply
+# that is nothing but a fence.
+
+_SNIFFED = (
+    "Extract the fields from this article.\n\n"
+    "JSON schema:\n"
+    '{"type":"object","properties":{"title":{"type":"string"}}}\n'
+    "You MUST respond with a JSON object matching the schema above."
+)
+
+
+def test_prompt_sniff_detection() -> None:
+    check("sniff.detects", _prompt_requests_json(_SNIFFED))
+    # Either half alone is ordinary chat about JSON, not a machine request.
+    check("sniff.marker_only", not _prompt_requests_json("What is a JSON schema, in plain English?"))
+    check("sniff.directive_only", not _prompt_requests_json("Answer in JSON if you feel like it."))
+    check("sniff.plain_chat", not _prompt_requests_json("Tell me about the Battle of Hastings."))
+
+
+def test_unfence_json_unit() -> None:
+    raw = '{"title": "x"}'
+    check("unfence.fenced", _unfence_json(f"```json\n{raw}\n```") == raw)
+    check("unfence.fenced_nolang", _unfence_json(f"```\n{raw}\n```") == raw)
+    # Prose around the fence => a chat answer that merely contains JSON. Untouched.
+    prose = f"Here you go:\n```json\n{raw}\n```\nHope that helps!"
+    check("unfence.prose_untouched", _unfence_json(prose) == prose)
+    # A fence that isn't JSON is a code block. Untouched.
+    code = "```python\nprint('hi')\n```"
+    check("unfence.code_untouched", _unfence_json(code) == code)
+    check("unfence.unfenced_passthrough", _unfence_json(raw) == raw)
+
+
+def test_sniffed_reply_is_unfenced() -> None:
+    _STATE["final_text"] = '```json\n{"title": "x"}\n```'
+    r = _chat([{"role": "user", "content": _SNIFFED}])
+    content = r.json()["choices"][0]["message"]["content"]
+    check("sniff.unfenced", json.loads(content) == {"title": "x"}, note=content)
+    check("sniff.hint_in_prompt", "no markdown code fences" in _STATE["last_prompt"])
+    # Prompt-declared JSON is a guess, so it must NOT take the hard-mode paths:
+    # clarify stays on and a prose reply is still a 200, not a 502.
+    check("sniff.clarify_untouched", _STATE["last_clarify"] is True, note=str(_STATE["last_clarify"]))
+
+
+def test_sniffed_prose_reply_still_passes_through() -> None:
+    """A mis-sniffed chat turn must be delivered verbatim, never turned into an error."""
+    _STATE["final_text"] = "A JSON schema describes the shape of a JSON document."
+    r = _chat([{"role": "user", "content": "What is a JSON schema? Respond with JSON examples."}])
+    content = r.json()["choices"][0]["message"]["content"]
+    check("sniff.prose_200", r.status_code == 200)
+    check("sniff.prose_verbatim", content == _STATE["final_text"], note=content)
+
+
+def test_unsniffed_chat_keeps_its_fences() -> None:
+    """An ordinary chat turn keeps markdown fences — OWUI renders them."""
+    fenced = '```json\n{"a": 1}\n```'
+    _STATE["final_text"] = fenced
+    r = _chat([{"role": "user", "content": "show me an example config block"}])
+    content = r.json()["choices"][0]["message"]["content"]
+    check("sniff.chat_fence_kept", content == fenced, note=content)
+    check("sniff.no_hint_in_prompt", "no markdown code fences" not in _STATE["last_prompt"])
+
+
+def test_responses_sniffed_reply_is_unfenced() -> None:
+    _STATE["final_text"] = '```json\n{"title": "x"}\n```'
+    r = _responses(_SNIFFED)
+    check("sniff.responses_unfenced", json.loads(r.json()["output_text"]) == {"title": "x"}, note=r.text)
+
+
 # ---------- wrapper-authored replies ----------
 #
 # Some turns never reach Claude: the `stats`/`context` commands and the
@@ -474,6 +553,12 @@ def main() -> int:
         test_responses_plain_untouched,
         test_responses_stream_json_buffers_and_strips,
         test_responses_stream_json_unparseable_fails,
+        test_prompt_sniff_detection,
+        test_unfence_json_unit,
+        test_sniffed_reply_is_unfenced,
+        test_sniffed_prose_reply_still_passes_through,
+        test_unsniffed_chat_keeps_its_fences,
+        test_responses_sniffed_reply_is_unfenced,
         test_instant_command_errors_in_json_mode,
         test_instant_command_ok_without_json_mode,
         test_responses_instant_command_errors_in_json_mode,

@@ -225,58 +225,9 @@ Two things keep prose from reaching a structured-output client:
   response head is already sent, so the same message arrives on the stream's
   error channel and no content is emitted.
 
-- **A wrapper-authored reply is a `502` too.** Some turns never reach Claude:
-  the `stats`/`context` chat commands and the per-conversation token-budget
-  checkpoint are answered by the wrapper itself, in prose. In JSON mode that is
-  just as unreadable to the client, and the budget checkpoint is *sticky* — it
-  would fail every later request the same way — so the error names the cause
-  (`wrapper answered this turn itself (token-budget checkpoint or chat
-  command) …`).
-
 `response_format` is honored on the `tools` path too — a request may carry both,
 and the tool bridge applies the same instruction and reduction to its final text
 answer. Tool-call arguments are never touched.
-
-**`/v1/responses` gets the same treatment**, via the Responses-API spelling:
-`text: {"format": {"type": "json_schema", "name": …, "schema": {…}}}` (schema
-inlined, not nested under `json_schema`; `{"type": "json_object"}` also works).
-This matters because the Vercel AI SDK's `openai(model)` resolves to its
-**Responses** model by default, so a `generateObject` call lands on
-`/v1/responses` rather than `/v1/chat/completions` and declares its schema only
-this way. The request is normalized to the same internal `response_format`, so
-instruction, clarify-off, raw-JSON reduction, suppressed file trailer and the
-`502`/`response.failed` behavior are identical on both endpoints. Streamed
-Responses turns buffer the answer and emit one cleaned `response.output_text.delta`
-before the terminal event; if nothing parses, the turn ends in `response.failed`
-carrying the model's words, with no text emitted.
-
-**Clients that declare nothing.** Some structured-output clients send neither
-`response_format` nor `tools` — they put the schema in the *prompt* and
-`JSON.parse` the reply anyway (this is what Vane does; its requests log as
-`json_mode=off`). Claude, asked for JSON in prose with nothing forbidding
-markdown, fences it, and the client dies on the backtick. The wrapper cannot
-switch real JSON mode on for these turns — a false positive would turn a `502`
-on an ordinary chat answer — so when a prompt carries *both* a JSON-schema
-marker and a "respond with JSON" imperative it does only the two things that
-are harmless when the guess is wrong:
-
-1. appends a formatting-only hint (output JSON raw, no fences — conditional on
-   the answer being JSON at all, so it cannot reshape a prose answer), and
-2. unwraps a reply that is *nothing but* one fenced JSON block, on the sync
-   path. Prose around the fence, or a fence that isn't JSON, is left alone, so
-   a chat answer that merely contains a JSON snippet keeps its markdown.
-
-A prose reply on a sniffed turn is still a plain `200`, and the clarification
-protocol is left alone — unlike real JSON mode, this is a guess. Set
-`CLAUDE_WRAPPER_JSON_SNIFF=off` to disable it. The durable fix belongs on the
-client: send `response_format` (or `text.format`) and all of the above becomes
-an exact contract rather than an inference.
-
-Every generation request logs one line — `chat/completions: model=… stream=…
-json_mode=json_schema tools=0` or `responses: … json_mode=off …` — so a
-client-side `Unexpected token` can be traced to the surface that served it and
-to whether the structured-output declaration was seen at all (`json_mode=off`
-on a turn the client thought was structured is the whole diagnosis).
 
 #### Function calling (`tools`)
 

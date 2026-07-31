@@ -33,14 +33,9 @@ from .deps import FILE_STORE, PREPARER, RUNNER, USAGE_LEDGER, auth_dependency
 # Re-exported under the historical private names (and `extract_raw_json`, which
 # tests import from here) — see json_mode.py for why it is a separate module.
 from .json_mode import (
-    FENCE_HINT as _FENCE_HINT,
     extract_raw_json,
-    instant_reply_error as _instant_reply_error,
     json_instruction as _json_instruction,
     json_mode_error as _json_mode_error,
-    prompt_requests_json as _prompt_requests_json,
-    unfence_json as _unfence_json,
-    unfence_sole_json_block as _unfence_sole_json_block,
     wants_json as _wants_json,
 )
 from .models import (
@@ -568,25 +563,8 @@ async def _sync_response(
         if cleaned is None:
             raise HTTPException(status_code=502, detail=_json_mode_error(req, final_text))
         final_text = cleaned
-    else:
-        unfenced = final_text
-        if _JSON_SNIFF and _prompt_requests_json(prompt):
-            unfenced = _unfence_json(final_text)
-            if unfenced == final_text:
-                # Strict unfencing matches only a reply that is a fence and
-                # nothing else. Claude habitually adds a closing sentence,
-                # and that alone used to send the backticks through to a
-                # client about to JSON.parse them. Escalate to the lone-block
-                # rule before giving up.
-                unfenced = _unfence_sole_json_block(final_text)
-        if unfenced != final_text:
-            # A prompt-declared JSON reply, unwrapped. The trailer would put
-            # markdown right back on the end of it, so it is suppressed here
-            # exactly as in real JSON mode.
-            log.info("unfenced a prompt-declared JSON reply (session=%s)", session_key)
-            final_text = unfenced
-        elif attachments and not req.inline_generated_files:
-            final_text = _append_file_references(final_text, attachments)
+    elif attachments and not req.inline_generated_files:
+        final_text = _append_file_references(final_text, attachments)
 
     choice_msg = ChoiceMessage(
         role="assistant",

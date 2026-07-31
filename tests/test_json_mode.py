@@ -71,6 +71,12 @@ ClaudeRunner.run_stream = _stub_run_stream
 # ---- now import the app ----
 from fastapi.testclient import TestClient  # noqa: E402
 
+from src.json_mode import (  # noqa: E402
+    prompt_requests_json as _prompt_requests_json,
+    responses_text_format,
+    unfence_json as _unfence_json,
+    unfence_sole_json_block as _unfence_sole_json_block,
+)
 from src.main import app, extract_raw_json  # noqa: E402
 
 client = TestClient(app)
@@ -306,6 +312,275 @@ def test_stream_without_response_format_untouched() -> None:
     check("stream.plain_finish", finish == "stop")
 
 
+# ---------- /v1/responses ----------
+#
+# The Responses API declares structured output as `text: {"format": {…}}`, with
+# the schema inlined rather than nested under `json_schema`. This is the shape
+# the Vercel AI SDK sends by default — `openai(model)` resolves to its Responses
+# model — so a generateObject call lands here, not on /v1/chat/completions. The
+# same contract must hold: instruction in the prompt, raw JSON out, a real error
+# instead of prose.
+
+
+def _responses(input_text: str, **extra):
+    body = {"model": "claude-opus-4-8", "input": input_text, **extra}
+    return client.post("/v1/responses", json=body)
+
+
+def _parse_responses_sse(body: str):
+    """-> (concatenated deltas, terminal event type, terminal response object)."""
+    deltas, terminal_type, terminal = [], None, None
+    for line in body.splitlines():
+        if not line.startswith("data: "):
+            continue
+        obj = json.loads(line[len("data: "):])
+        if obj.get("type") == "response.output_text.delta":
+            deltas.append(obj.get("delta") or "")
+        elif obj.get("type") in ("response.completed", "response.failed"):
+            terminal_type = obj["type"]
+            terminal = obj.get("response") or {}
+    return "".join(deltas), terminal_type, terminal
+
+
+_TEXT_FORMAT = {
+    "format": {
+        "type": "json_schema",
+        "name": "suggestions",
+        "schema": {
+            "type": "object",
+            "properties": {"suggestions": {"type": "array", "items": {"type": "string"}}},
+            "required": ["suggestions"],
+        },
+        "strict": True,
+    }
+}
+
+
+def test_responses_text_format_normalization() -> None:
+    """The Responses `text.format` shape maps onto chat's `response_format`."""
+    norm = responses_text_format(_TEXT_FORMAT)
+    check("respfmt.type", norm["type"] == "json_schema", note=str(norm))
+    check("respfmt.schema_kept", norm["json_schema"]["schema"]["required"] == ["suggestions"], note=str(norm))
+    check("respfmt.json_object", responses_text_format({"format": {"type": "json_object"}}) == {"type": "json_object"})
+    # Chat-style nesting from a lenient client is taken as-is.
+    nested = responses_text_format({"format": {"type": "json_schema", "json_schema": {"schema": {"type": "object"}}}})
+    check("respfmt.nested_envelope", nested["json_schema"] == {"schema": {"type": "object"}}, note=str(nested))
+    check("respfmt.plain_text", responses_text_format({"format": {"type": "text"}}) is None)
+    check("respfmt.absent", responses_text_format(None) is None)
+
+
+def test_responses_sync_json_strips_fences() -> None:
+    _STATE["final_text"] = '```json\n{"suggestions": ["x", "y"]}\n```'
+    r = _responses("suggest things (responses json test)", text=_TEXT_FORMAT)
+    check("responses.status", r.status_code == 200, note=r.text)
+    out = r.json()["output_text"]
+    check("responses.raw_json", json.loads(out) == {"suggestions": ["x", "y"]}, note=out)
+    check("responses.instruction_in_prompt", "Output format" in _STATE["last_prompt"])
+    check("responses.schema_in_prompt", "JSON Schema" in _STATE["last_prompt"])
+    check("responses.clarify_off", _STATE["last_clarify"] is False, note=str(_STATE["last_clarify"]))
+
+
+def test_responses_sync_unparseable_errors() -> None:
+    _STATE["final_text"] = "Before diving into the data, I need to know which fields matter."
+    r = _responses("extract fields (responses unparseable test)", text=_TEXT_FORMAT)
+    check("responses.unparseable_status", r.status_code == 502, note=str(r.status_code))
+    detail = r.json().get("detail", "")
+    check("responses.unparseable_quotes_reply", "Before diving into the data" in detail, note=detail)
+
+
+def test_responses_plain_untouched() -> None:
+    fenced = 'Here you go:\n```json\n{"a": 1}\n```'
+    _STATE["final_text"] = fenced
+    r = _responses("normal responses turn (no structured output)")
+    check("responses.plain_verbatim", r.json()["output_text"] == fenced, note=r.text)
+    check("responses.plain_no_instruction", "Output format" not in _STATE["last_prompt"])
+
+
+def test_responses_stream_json_buffers_and_strips() -> None:
+    _STATE["stream_texts"] = ['```json\n{"suggestions": [', '"x", "y"]}\n```']
+    r = _responses("suggest things (responses stream json test)", text=_TEXT_FORMAT, stream=True)
+    deltas, terminal_type, terminal = _parse_responses_sse(r.text)
+    check("responses.stream_raw_json", json.loads(deltas) == {"suggestions": ["x", "y"]}, note=deltas)
+    check("responses.stream_completed", terminal_type == "response.completed", note=str(terminal_type))
+    check(
+        "responses.stream_output_text",
+        json.loads(terminal["output_text"]) == {"suggestions": ["x", "y"]},
+        note=str(terminal.get("output_text")),
+    )
+
+
+def test_responses_stream_json_unparseable_fails() -> None:
+    """Head already sent => fail on the stream's own channel, emit no text."""
+    _STATE["stream_texts"] = ["Before diving in, ", "which fields matter?"]
+    r = _responses("extract fields (responses stream unparseable)", text=_TEXT_FORMAT, stream=True)
+    deltas, terminal_type, terminal = _parse_responses_sse(r.text)
+    check("responses.stream_bad_no_text", deltas == "", note=deltas)
+    check("responses.stream_bad_failed", terminal_type == "response.failed", note=str(terminal_type))
+    check(
+        "responses.stream_bad_quotes_reply",
+        "Before diving in" in (terminal.get("error") or {}).get("message", ""),
+        note=str(terminal.get("error")),
+    )
+
+
+# ---------- prompt-declared JSON (no response_format on the wire) ----------
+#
+# Vane sends neither response_format nor tools — its request logs as
+# `json_mode=off` — and puts the schema in the prompt, then JSON.parses the
+# reply. Claude fences the JSON, and the client dies on the backtick. The
+# wrapper cannot switch on real JSON mode for these turns (a false positive
+# would 502 an ordinary chat answer), so it does the two things that are
+# harmless when the guess is wrong: ask for it unfenced, and unwrap a reply
+# that is nothing but a fence.
+
+_SNIFFED = (
+    "Extract the fields from this article.\n\n"
+    "JSON schema:\n"
+    '{"type":"object","properties":{"title":{"type":"string"}}}\n'
+    "You MUST respond with a JSON object matching the schema above."
+)
+
+
+def test_prompt_sniff_detection() -> None:
+    check("sniff.detects", _prompt_requests_json(_SNIFFED))
+    # Either half alone is ordinary chat about JSON, not a machine request.
+    check("sniff.marker_only", not _prompt_requests_json("What is a JSON schema, in plain English?"))
+    check("sniff.directive_only", not _prompt_requests_json("Answer in JSON if you feel like it."))
+    check("sniff.plain_chat", not _prompt_requests_json("Tell me about the Battle of Hastings."))
+
+
+def test_unfence_json_unit() -> None:
+    raw = '{"title": "x"}'
+    check("unfence.fenced", _unfence_json(f"```json\n{raw}\n```") == raw)
+    check("unfence.fenced_nolang", _unfence_json(f"```\n{raw}\n```") == raw)
+    # Prose around the fence => a chat answer that merely contains JSON. Untouched.
+    prose = f"Here you go:\n```json\n{raw}\n```\nHope that helps!"
+    check("unfence.prose_untouched", _unfence_json(prose) == prose)
+    # A fence that isn't JSON is a code block. Untouched.
+    code = "```python\nprint('hi')\n```"
+    check("unfence.code_untouched", _unfence_json(code) == code)
+    check("unfence.unfenced_passthrough", _unfence_json(raw) == raw)
+
+
+def test_unfence_sole_json_block_unit() -> None:
+    """The escalation: a lone JSON fence is unwrapped even with prose around it.
+
+    `unfence_json` alone matches a fence and nothing else, so the single
+    trailing sentence Claude habitually adds was enough to ship backticks to
+    a client whose next move is JSON.parse.
+    """
+    raw = '{"title": "x"}'
+    check("sole.trailer", _unfence_sole_json_block(f"```json\n{raw}\n```\n\nLet me know!") == raw)
+    check("sole.preamble", _unfence_sole_json_block(f"Here you go:\n```json\n{raw}\n```") == raw)
+    check("sole.both_sides", _unfence_sole_json_block(f"Sure:\n```json\n{raw}\n```\nHope that helps!") == raw)
+    check("sole.bare_fence", _unfence_sole_json_block(f"```json\n{raw}\n```") == raw)
+    check("sole.no_lang", _unfence_sole_json_block(f"```\n{raw}\n```") == raw)
+
+    # Narrower than extract_raw_json on purpose. Two fenced blocks is a reply
+    # weighing options, not a structured-output answer — picking one would be
+    # a guess, so it is left alone.
+    two = f"Option A:\n```json\n{raw}\n```\nOption B:\n```json\n{{\"title\": \"y\"}}\n```"
+    check("sole.two_blocks_untouched", _unfence_sole_json_block(two) == two)
+    # A fence that isn't JSON is a code block, whatever the prompt asked for.
+    code = "Try this:\n```python\nprint('hi')\n```"
+    check("sole.non_json_untouched", _unfence_sole_json_block(code) == code)
+    # No fence at all: nothing to unwrap.
+    prose = "A JSON schema describes the shape of a document."
+    check("sole.no_fence_untouched", _unfence_sole_json_block(prose) == prose)
+
+
+def test_sniffed_reply_with_trailer_is_unfenced() -> None:
+    """End-to-end regression for the reported bug.
+
+    Vane's generateObject died on `Unexpected token '`'` because the reply was
+    a fence plus a sign-off, which strict unfencing left completely alone.
+    """
+    _STATE["final_text"] = '```json\n{"title": "x"}\n```\n\nLet me know if you need changes.'
+    r = _chat([{"role": "user", "content": _SNIFFED}])
+    content = r.json()["choices"][0]["message"]["content"]
+    check("sniff.trailer_status", r.status_code == 200, note=str(r.status_code))
+    check("sniff.trailer_parses", json.loads(content) == {"title": "x"}, note=content)
+
+
+def test_responses_sniffed_reply_with_trailer_is_unfenced() -> None:
+    """Same escalation on /v1/responses, the other sniffed path."""
+    _STATE["final_text"] = 'Here you go:\n```json\n{"title": "x"}\n```'
+    r = _responses(_SNIFFED)
+    check(
+        "sniff.responses_trailer",
+        json.loads(r.json()["output_text"]) == {"title": "x"},
+        note=r.text,
+    )
+
+
+def test_sniffed_reply_is_unfenced() -> None:
+    _STATE["final_text"] = '```json\n{"title": "x"}\n```'
+    r = _chat([{"role": "user", "content": _SNIFFED}])
+    content = r.json()["choices"][0]["message"]["content"]
+    check("sniff.unfenced", json.loads(content) == {"title": "x"}, note=content)
+    check("sniff.hint_in_prompt", "no markdown code fences" in _STATE["last_prompt"])
+    # Prompt-declared JSON is a guess, so it must NOT take the hard-mode paths:
+    # clarify stays on and a prose reply is still a 200, not a 502.
+    check("sniff.clarify_untouched", _STATE["last_clarify"] is True, note=str(_STATE["last_clarify"]))
+
+
+def test_sniffed_prose_reply_still_passes_through() -> None:
+    """A mis-sniffed chat turn must be delivered verbatim, never turned into an error."""
+    _STATE["final_text"] = "A JSON schema describes the shape of a JSON document."
+    r = _chat([{"role": "user", "content": "What is a JSON schema? Respond with JSON examples."}])
+    content = r.json()["choices"][0]["message"]["content"]
+    check("sniff.prose_200", r.status_code == 200)
+    check("sniff.prose_verbatim", content == _STATE["final_text"], note=content)
+
+
+def test_unsniffed_chat_keeps_its_fences() -> None:
+    """An ordinary chat turn keeps markdown fences — OWUI renders them."""
+    fenced = '```json\n{"a": 1}\n```'
+    _STATE["final_text"] = fenced
+    r = _chat([{"role": "user", "content": "show me an example config block"}])
+    content = r.json()["choices"][0]["message"]["content"]
+    check("sniff.chat_fence_kept", content == fenced, note=content)
+    check("sniff.no_hint_in_prompt", "no markdown code fences" not in _STATE["last_prompt"])
+
+
+def test_responses_sniffed_reply_is_unfenced() -> None:
+    _STATE["final_text"] = '```json\n{"title": "x"}\n```'
+    r = _responses(_SNIFFED)
+    check("sniff.responses_unfenced", json.loads(r.json()["output_text"]) == {"title": "x"}, note=r.text)
+
+
+# ---------- wrapper-authored replies ----------
+#
+# Some turns never reach Claude: the `stats`/`context` commands and the
+# token-budget checkpoint are answered by the wrapper in prose. In JSON mode
+# that prose is just as unparseable to the client as a prose model reply, so it
+# must not go out with a 200.
+
+
+def test_instant_command_errors_in_json_mode() -> None:
+    body = {
+        "model": "claude-opus-4-8",
+        "messages": [{"role": "user", "content": "stats"}],
+        "response_format": {"type": "json_object"},
+    }
+    r = client.post("/v1/chat/completions", json=body)
+    check("instant.chat_status", r.status_code == 502, note=str(r.status_code))
+    check("instant.chat_names_cause", "wrapper answered this turn" in r.json().get("detail", ""), note=r.text)
+
+
+def test_instant_command_ok_without_json_mode() -> None:
+    body = {"model": "claude-opus-4-8", "messages": [{"role": "user", "content": "stats"}]}
+    r = client.post("/v1/chat/completions", json=body)
+    check("instant.chat_plain_200", r.status_code == 200, note=str(r.status_code))
+    check("instant.chat_plain_text", "Usage stats" in r.json()["choices"][0]["message"]["content"], note=r.text)
+
+
+def test_responses_instant_command_errors_in_json_mode() -> None:
+    r = _responses("stats", text=_TEXT_FORMAT)
+    check("instant.responses_status", r.status_code == 502, note=str(r.status_code))
+    check("instant.responses_names_cause", "wrapper answered this turn" in r.json().get("detail", ""), note=r.text)
+
+
 # ---------- runner ----------
 
 
@@ -324,6 +599,21 @@ def main() -> int:
         test_json_mode_disables_clarify_streaming,
         test_stream_json_buffers_and_strips,
         test_stream_without_response_format_untouched,
+        test_responses_text_format_normalization,
+        test_responses_sync_json_strips_fences,
+        test_responses_sync_unparseable_errors,
+        test_responses_plain_untouched,
+        test_responses_stream_json_buffers_and_strips,
+        test_responses_stream_json_unparseable_fails,
+        test_prompt_sniff_detection,
+        test_unfence_json_unit,
+        test_sniffed_reply_is_unfenced,
+        test_sniffed_prose_reply_still_passes_through,
+        test_unsniffed_chat_keeps_its_fences,
+        test_responses_sniffed_reply_is_unfenced,
+        test_instant_command_errors_in_json_mode,
+        test_instant_command_ok_without_json_mode,
+        test_responses_instant_command_errors_in_json_mode,
     ]
     for t in tests:
         try:

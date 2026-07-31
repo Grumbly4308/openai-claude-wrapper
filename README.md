@@ -194,7 +194,7 @@ string or structured `input` (plus optional `instructions`), and returns a
   from the session key, so the thread deterministically reattaches rather than
   forking a new session.
 
-#### Structured output (`response_format`)
+#### Structured output (`response_format` / `text.format`)
 
 `/v1/chat/completions` honors the OpenAI `response_format` parameter. With
 `{"type": "json_object"}` or `{"type": "json_schema", "json_schema": {…}}` the

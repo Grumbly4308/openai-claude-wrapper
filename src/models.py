@@ -113,6 +113,18 @@ class ResponseFormat(BaseModel):
     json_schema: Optional[dict[str, Any]] = None
 
 
+class ResponseFormat(BaseModel):
+    """OpenAI structured-output request (the ``response_format`` parameter).
+
+    ``json_schema`` holds the OpenAI envelope ({"name", "schema", "strict"})
+    or, from lenient clients, the bare JSON Schema itself.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    type: str = "text"  # "text" | "json_object" | "json_schema"
+    json_schema: Optional[dict[str, Any]] = None
+
+
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str
@@ -137,17 +149,6 @@ class ChatCompletionRequest(BaseModel):
     # fences, no prose, no file-reference trailer. Sent by e.g. the Vercel
     # AI SDK's generateObject (Vane, and other OpenAI-compatible clients).
     response_format: Optional[ResponseFormat] = None
-    # OpenAI function calling. When `tools` is a non-empty list the CLIENT owns
-    # the agent loop: the request bypasses the Claude Code CLI entirely (no
-    # built-in tools, no internal loop) and is served by the tool bridge, which
-    # calls the Anthropic Messages API directly and returns tool_calls for the
-    # client to execute.
-    tools: Optional[list[ToolDef]] = None
-    tool_choice: Optional[Union[str, dict[str, Any]]] = None
-    parallel_tool_calls: Optional[bool] = None
-    # {"include_usage": true} => streaming responses append a usage chunk
-    # before [DONE] (Vercel AI SDK sends this).
-    stream_options: Optional[dict[str, Any]] = None
 
 
 # ---------- Chat completion response ----------

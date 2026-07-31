@@ -194,7 +194,7 @@ string or structured `input` (plus optional `instructions`), and returns a
   from the session key, so the thread deterministically reattaches rather than
   forking a new session.
 
-#### Structured output (`response_format` / `text.format`)
+#### Structured output (`response_format`)
 
 `/v1/chat/completions` honors the OpenAI `response_format` parameter. With
 `{"type": "json_object"}` or `{"type": "json_schema", "json_schema": {…}}` the
@@ -209,51 +209,9 @@ suppressed so the concatenated content is pure JSON.
 This is what clients built on the Vercel AI SDK's `generateObject` expect —
 e.g. Vane, whose `JSON.parse` chokes on ` ```json `-fenced replies
 ([Vane#959](https://github.com/ItzCrazyKns/Vane/issues/959)). Requests without
-`response_format` (or with `{"type": "text"}`) are completely unaffected.
-
-Two things keep prose from reaching a structured-output client:
-
-- **The clarification protocol is forced off in JSON mode**, whatever the
-  request or server default says. It instructs Claude to make its entire reply
-  a list of questions when it hits an ambiguity — prose with no JSON in it, and
-  nobody on the far end who can answer, since `generateObject` is a one-shot
-  machine call.
-- **A reply with no parseable JSON is a `502`**, not a `200`. The error quotes
-  what the model actually said (`model returned no JSON in json_schema mode; it
-  replied with prose instead: "…"`), so the client surfaces a real API error
-  instead of dying in `JSON.parse` at character 0. On a streamed request the
-  response head is already sent, so the same message arrives on the stream's
-  error channel and no content is emitted.
-
-`response_format` is honored on the `tools` path too — a request may carry both,
-and the tool bridge applies the same instruction and reduction to its final text
-answer. Tool-call arguments are never touched.
-
-#### Function calling (`tools`)
-
-`/v1/chat/completions` implements OpenAI function calling. When a request
-declares a non-empty `tools` list, **the client owns the agent loop**: the
-wrapper does not execute anything, does not use its own built-in tools, and
-does not answer the question. It returns the model's `tool_calls` (with
-`arguments` as a serialized JSON string and `finish_reason: "tool_calls"`)
-and stops; the client executes the tool and sends the result back as a
-`role: "tool"` message (`tool_call_id` matching the emitted `toolu_…` id) on
-the next request. Parallel tool calls, forced
-`tool_choice: {"type":"function","function":{"name":…}}`, `"required"`,
-`"none"`, `parallel_tool_calls: false`, and streaming tool-call deltas
-(incremental `arguments` fragments, per the OpenAI chunk format, honoring
-`stream_options.include_usage`) are all supported. This is what
-`streamText({tools})` clients like Vane's research agent need.
-
-Because that behavior is the opposite of the wrapper's agentic default, tools
-requests bypass the Claude Code CLI entirely and call the Anthropic Messages
-API directly, authenticating (in order) with `ANTHROPIC_API_KEY`,
-`CLAUDE_CODE_OAUTH_TOKEN`, or the CLI's own saved login
-(`~/.claude/.credentials.json`). Requests **without** `tools` are completely
-unaffected and keep the full agentic behavior. Effort suffixes don't apply on
-this path (`effort.source: "tool-bridge"` in the response); `[1m]` model
-variants map to the 1M-context beta. `max_tokens` defaults to
-`CLAUDE_WRAPPER_TOOLS_MAX_TOKENS` (8192).
+`response_format` (or with `{"type": "text"}`) are completely unaffected. If
+the model produces no parseable JSON at all, the reply passes through
+unchanged rather than masking what it said.
 
 #### Streaming feedback on long runs
 

@@ -177,9 +177,80 @@ time and reuses them afterwards. See "Delegation design" below.
 | --- | --- | --- |
 | `POST` | `/v1/chat/completions` | Streaming + non-streaming multimodal chat |
 | `POST` | `/v1/completions` | Legacy text-prompt completion |
-| `POST` | `/v1/responses` | OpenAI Responses API (maps to chat) |
+| `POST` | `/v1/responses` | OpenAI Responses API — streaming + multi-turn chaining |
 | `POST` | `/v1/embeddings` | Dense vectors via fastembed / sentence-transformers |
 | `POST` | `/v1/moderations` | Content classification via Claude |
+
+`/v1/responses` is the modern "ask and response" primitive. It accepts a
+string or structured `input` (plus optional `instructions`), and returns a
+`response` object whose `output_text` flattens the assistant message.
+
+- **Streaming** (`"stream": true`) emits the typed Responses event protocol —
+  `response.created` → `response.output_text.delta` … → `response.completed` —
+  not `chat.completion.chunk`s. There is no `[DONE]` sentinel; the stream ends
+  on the terminal `response.completed`/`response.failed` event.
+- **Multi-turn chaining**: pass a prior response's `id` back as
+  `previous_response_id` to continue the same Claude session. The id is derived
+  from the session key, so the thread deterministically reattaches rather than
+  forking a new session.
+
+#### Structured output (`response_format`)
+
+`/v1/chat/completions` honors the OpenAI `response_format` parameter. With
+`{"type": "json_object"}` or `{"type": "json_schema", "json_schema": {…}}` the
+wrapper appends a raw-JSON-only instruction to the prompt (including the schema
+for `json_schema`) and reduces the reply to the bare JSON value before it
+leaves the wrapper — markdown fences and any surrounding prose are stripped,
+and the file-reference trailer is suppressed. Streamed JSON-mode requests
+buffer the answer (fences can span chunk deltas) and deliver the cleaned JSON
+as a single content chunk before the terminator; reasoning/progress frames are
+suppressed so the concatenated content is pure JSON.
+
+This is what clients built on the Vercel AI SDK's `generateObject` expect —
+e.g. Vane, whose `JSON.parse` chokes on ` ```json `-fenced replies
+([Vane#959](https://github.com/ItzCrazyKns/Vane/issues/959)). Requests without
+`response_format` (or with `{"type": "text"}`) are completely unaffected. If
+the model produces no parseable JSON at all, the reply passes through
+unchanged rather than masking what it said.
+
+#### Streaming feedback on long runs
+
+On a hard problem at high/max/ultracode effort, Claude may think or run
+tools for many minutes before the first answer token. To keep
+`/v1/chat/completions` streams alive and visibly *working* (rather than
+looking stalled — or being severed by a buffering proxy before any headers
+reach the client), the wrapper:
+
+- sends a one-time comment preamble to flush the response head past buffering
+  proxies immediately;
+- emits lightweight keep-alive comments, plus periodic **visible** "⏳ Still
+  working… (elapsed)" ticks on the `reasoning_content` channel during silence;
+- surfaces **tool/subagent activity** (`🔧 Bash: …`, `🔧 Read: …`) on the same
+  channel, so a tool-heavy phase shows real progress.
+
+Progress rides `reasoning_content` (Open WebUI's collapsible "Thinking"
+section), never the answer content. Tune via `CLAUDE_WRAPPER_SSE_*` (see
+`.env.example`); set `CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS=0` /
+`CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY=false` to quiet it.
+
+#### Clarifying questions (interactive)
+
+Headless Claude Code has no interactive question UI: its `AskUserQuestion`
+card gets auto-dismissed, so Claude proceeds on assumptions and you never get
+to answer. With the **clarification protocol** on (default), the wrapper:
+
+- injects a system prompt (`--append-system-prompt`) teaching Claude that, when
+  a decision genuinely changes the result, it should ask its questions as plain
+  numbered text **and stop** — making the questions the whole turn — so you
+  answer in your next message and the session resumes automatically;
+- disables the dead interactive tool (`--disallowedTools AskUserQuestion`) so
+  questions always arrive as answerable text.
+
+Only chat/responses opt in; delegated task endpoints (audio, images, …) never
+pause. Disable globally with `CLAUDE_WRAPPER_CLARIFY=off`, override the injected
+instruction with `CLAUDE_WRAPPER_CLARIFY_PROMPT`, or opt a single request out
+with `"clarify": false` in the request body. (No clickable option buttons —
+Open WebUI has no way to feed those back; this is well-formatted text Q&A.)
 
 ### Audio
 
@@ -234,6 +305,7 @@ time and reuses them afterwards. See "Delegation design" below.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET`  | `/v1/models`, `/v1/models/{id}` | Advertise supported Claude models |
+| `GET`  | `/v1/usage/{session_id}` | Per-conversation token spend + remaining allowance (see usage cap) |
 | `GET`  | `/healthz` | Liveness probe |
 
 ## Delegation design
@@ -344,6 +416,91 @@ To pin a session explicitly pass `session_id` in the request body:
 
 The response body echoes `session_id` so clients can round-trip it.
 
+## Per-conversation usage cap (usage checkpoint)
+
+Every request spends your Anthropic session/subscription quota, and a single
+long conversation — especially at `max`/`ultracode` effort — can eat a large
+slice of it with no warning. The wrapper can cap that **per conversation** and
+ask before spending more.
+
+**The cap is ON by default at the Max 5× ($100) plan** (allowance 7,500,000,
+checkpoint every 375,000 tokens). Override it **by plan**, **by an explicit
+number**, or turn it **off**:
+
+```bash
+# (a) By subscription plan — pro | max 5x ($100) | max 20x ($200)  [default: max 5x]
+CLAUDE_WRAPPER_SESSION_PLAN="max 5x"
+CLAUDE_WRAPPER_PRO_SESSION_TOKENS=1500000        # Pro anchor; Max scales 5x/20x from it
+
+# (b) Or set the allowance directly (this wins over the plan)
+CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE=0         # one "session's worth" of tokens (0 = use plan)
+
+# Disable entirely:
+CLAUDE_WRAPPER_SESSION_PLAN=off
+
+CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT=5            # block = 5% of the allowance
+CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD=continue,proceed,keep going,go on,yes
+```
+
+> ⚠️ **The per-plan token figures are estimates.** Anthropic does not publish a
+> token number for the Pro/Max *session* windows, and the wrapper can't query it
+> (the subscription quota is exposed nowhere in the API — see below). What's
+> defined is the *relationship*: Max is "5×" ($100) and "20×" ($200) of Pro. So
+> the plan setting anchors on `CLAUDE_WRAPPER_PRO_SESSION_TOKENS` and scales from
+> there. The default anchor (1,500,000) is **calibrated from real usage** — a
+> heavy ~2h Claude Code session measured ~1.54M billable tokens (input +
+> cache-creation + output, excluding near-free cache reads), which the operator
+> reported as 21% of a Max-5× window → ~7.5M per window → ~1.5M Pro anchor. Tune
+> it to your own usage; the cap is a safety checkpoint, not an exact mirror of
+> Anthropic's accounting. On startup the wrapper logs the resolved `plan` /
+> `allowance` / `block` so you can confirm.
+
+| Plan setting | Multiplier | Allowance (default anchor 1.5M) | Block @ 5% |
+|---|---|---|---|
+| `pro` / `pro $20` | 1× | 1,500,000 | 75,000 |
+| `max 5x` / `max $100` **(default)** | 5× | 7,500,000 | 375,000 |
+| `max 20x` / `max $200` | 20× | 30,000,000 | 1,500,000 |
+| `off` / `none` | — | disabled | — |
+
+How it works:
+
+- The wrapper tracks tokens (input + output) spent by each conversation.
+- A **block** is `allowance × percent` (e.g. 1,000,000 × 5% = 50,000 tokens).
+  Each conversation starts with one block of headroom.
+- Once a conversation has spent its current block, the **next** request doesn't
+  call Claude — it returns a checkpoint message:
+  > ⏸️ **Usage checkpoint.** This conversation has used **52,000 tokens**,
+  > reaching its **50,000-token** budget block (5% of the configured session
+  > allowance). Reply **continue** to allow another block, or start a new chat
+  > to reset.
+- Replying with a continue keyword grants one more block and proceeds. Starting
+  a **new chat** (new session) begins with a fresh budget.
+
+### Checking usage: `stats` / `context`
+
+Send **`stats`** or **`context`** (or `/stats`, `/context`) as the whole chat
+message and the wrapper answers **instantly, without spawning Claude** — even
+while the conversation is paused at a checkpoint, and at zero token cost:
+
+> 📊 **Usage stats**
+> - **Spent (this conversation):** 412,300 tokens across 7 requests (5.5% of the session allowance)
+> - **Remaining before the next checkpoint:** 337,700 of 750,000 tokens (2 × 375,000-token blocks)
+> - **Session allowance:** 7,500,000 tokens (max_5x plan), 5% per block
+> - **Session key:** `conv-1a2b3c…`
+
+Only a message that *is* the command triggers it — a prompt that merely
+mentions "stats" goes to Claude as usual. The same numbers are exposed
+programmatically at `GET /v1/usage/{session_id}` (the session key that chat
+responses return in their `session_id` field):
+
+```bash
+curl -fsS -H "Authorization: Bearer $KEY" http://localhost:8000/v1/usage/conv-1a2b3c | jq
+```
+
+Because the check happens before Claude is spawned, a paused conversation costs
+nothing until you confirm. The cap ships **enabled** at the Max 5× plan; set
+`CLAUDE_WRAPPER_SESSION_PLAN=off` to disable it.
+
 ## Concurrency
 
 - FastAPI + uvicorn serve requests async. Different sessions execute
@@ -404,9 +561,29 @@ The compose file mounts two named volumes:
 
 ## Supported models
 
-The `/v1/models` endpoint lists the Claude models the wrapper accepts:
-current Opus / Sonnet / Haiku family. Pass `"model": "auto"` to use
-`CLAUDE_WRAPPER_DEFAULT_MODEL`.
+The `/v1/models` endpoint lists the Claude models the wrapper accepts. The
+list is **built once at startup by scanning the installed Claude Code binary**
+for the model ids it ships with (the current Opus / Sonnet / Haiku families and
+the `fable` / `mythos` codename families, including the `[1m]` long-context
+variants), so it tracks whatever Claude Code version is installed instead of a
+hardcoded set. Set
+`CLAUDE_WRAPPER_MODEL_DISCOVERY=off` to serve a static built-in list instead;
+discovery also falls back to that list automatically if the binary can't be
+read. Pass `"model": "auto"` to use `CLAUDE_WRAPPER_DEFAULT_MODEL`.
+
+Each effort-capable model is advertised with one variant per effort level it
+accepts (the *family rule*): Opus 4.5+ and the `fable` / `mythos` codename
+families expose `(low)`/`(medium)`/`(high)`/`(xhigh)`/`(max)` plus `(ultracode)`;
+Sonnet 4.6+ exposes through `(xhigh)`; Haiku and older models expose none.
+Selecting a variant like `claude-opus-4-8 (xhigh)` sets the per-request effort.
+
+The `(ultracode)` variant is special: it requests xhigh effort **plus** Claude
+Code's dynamic-workflow (multi-agent) orchestration. Because ultracode is gated
+on dynamic workflows being enabled — and that setting defaults off in a headless
+container — the wrapper turns it on in the same overlay
+(`--settings '{"enableWorkflows": true, "ultracode": true}'`). An org-policy
+`disableWorkflows` or an account-level launch gate can still override this; those
+are account-side and cannot be set by the wrapper.
 
 ## Limitations
 

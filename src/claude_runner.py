@@ -12,6 +12,8 @@ from typing import AsyncIterator, Optional
 
 import aiofiles
 
+from .config import ULTRACODE_EFFORT, effort_choices_for
+
 log = logging.getLogger("claude_wrapper.runner")
 
 # Claude Code stream-json events are newline-delimited, but a single event
@@ -112,11 +114,26 @@ class ClaudeRunner:
         workspace_root: Path,
         claude_bin: str = "claude",
         request_timeout_seconds: int = 1800,
+        effort: str = "",
+        clarify_system_prompt: str = "",
+        clarify_disallowed_tools: tuple[str, ...] = (),
+        stream_partial_messages: bool = True,
     ):
         self.registry = registry
         self.workspace_root = workspace_root
         self.claude_bin = claude_bin
         self.request_timeout_seconds = request_timeout_seconds
+        self.effort = effort
+        # Emit incremental text/thinking deltas (live streaming) via
+        # `--include-partial-messages`. When on, the consolidated assistant
+        # text/thinking blocks are suppressed in _normalize_stream_event to avoid
+        # double-emitting what the deltas already streamed.
+        self.stream_partial_messages = stream_partial_messages
+        # Interactive clarification protocol, applied only when a caller passes
+        # clarify=True (chat/responses) AND a prompt is configured. Empty prompt
+        # ⇒ globally disabled (CLAUDE_WRAPPER_CLARIFY=off), so it's a no-op.
+        self.clarify_system_prompt = clarify_system_prompt
+        self.clarify_disallowed_tools = clarify_disallowed_tools
 
     def _session_cwd(self, session_key: str) -> Path:
         d = self.workspace_root / session_key
@@ -151,12 +168,37 @@ class ClaudeRunner:
                 new.append(p)
         return sorted(new)
 
+    def _resolve_effort(self, model: Optional[str], effort: Optional[str]) -> tuple[str, str]:
+        """Resolve the effort actually applied to a run, plus where it came from.
+
+        An explicit per-request value wins (including "", meaning "no flag");
+        otherwise we fall back to the server default (CLAUDE_WRAPPER_EFFORT).
+        Effort — and the ultracode settings overlay — only apply to the effort
+        choices a given model accepts (see config.effort_choices_for), so it's
+        dropped for models that take no effort and for an effort the model
+        doesn't support (e.g. max/ultracode on Sonnet).
+        Returns (effective_effort, source) where source is one of:
+        "request" | "server-default" | "model-incapable" | "effort-unsupported".
+        """
+        if effort is not None:
+            eff, source = effort, "request"
+        else:
+            eff, source = self.effort, "server-default"
+        allowed = effort_choices_for(model or "")
+        if not allowed:
+            return "", "model-incapable"
+        if eff and eff not in allowed:
+            return "", "effort-unsupported"
+        return eff, source
+
     def _build_argv(
         self,
         session_uuid: str,
         model: Optional[str],
         resume: bool,
         extra_args: Optional[list[str]] = None,
+        effort: Optional[str] = None,
+        clarify: bool = False,
     ) -> list[str]:
         # Prompt is fed via stdin (not argv) to avoid E2BIG on large prompts.
         argv = [
@@ -166,12 +208,43 @@ class ClaudeRunner:
             "stream-json",
             "--verbose",
         ]
+        if self.stream_partial_messages:
+            # Incremental message deltas (content_block_delta) so text and
+            # thinking stream token-by-token rather than one block at a time.
+            argv += ["--include-partial-messages"]
         if resume:
             argv += ["--resume", session_uuid]
         else:
             argv += ["--session-id", session_uuid]
         if model:
             argv += ["--model", model]
+        eff, _src = self._resolve_effort(model, effort)
+        if eff == ULTRACODE_EFFORT:
+            # "ultracode" is not a --effort value (the CLI ignores it and falls
+            # back to default effort). It is requested via settings instead,
+            # where the CLI resolves it to xhigh effort plus ultracode's
+            # dynamic-workflow orchestration opt-in.
+            #
+            # Ultracode is GATED on dynamic workflows being enabled: with them
+            # off the CLI rejects it ("Ultracode needs dynamic workflows
+            # enabled") and silently runs at default effort. In a fresh headless
+            # container the `enableWorkflows` setting defaults to false, so we
+            # must turn it on in the same overlay — otherwise the advertised
+            # "(ultracode)" model is selectable but a functional no-op. (An
+            # org-policy `disableWorkflows` or account launch gate can still
+            # override this; those are account-side, not settable here.)
+            argv += ["--settings", '{"enableWorkflows": true, "ultracode": true}']
+        elif eff:
+            argv += ["--effort", eff]
+        # Interactive clarification: teach Claude to pause-and-ask in plain text
+        # and disable the headless-dead question-card tool. Placed so the variadic
+        # --disallowedTools is terminated by the following --dangerously-skip-…
+        # flag rather than greedily eating a later positional.
+        if clarify:
+            if self.clarify_system_prompt:
+                argv += ["--append-system-prompt", self.clarify_system_prompt]
+            if self.clarify_disallowed_tools:
+                argv += ["--disallowedTools", *self.clarify_disallowed_tools]
         argv += ["--dangerously-skip-permissions"]
         if extra_args:
             argv += list(extra_args)
@@ -184,6 +257,8 @@ class ClaudeRunner:
         model: Optional[str] = None,
         env_extra: Optional[dict[str, str]] = None,
         extra_args: Optional[list[str]] = None,
+        effort: Optional[str] = None,
+        clarify: bool = False,
     ) -> AsyncIterator[StreamEvent]:
         """Yield StreamEvents as the subprocess produces them.
 
@@ -201,6 +276,8 @@ class ClaudeRunner:
                 model=model,
                 resume=not created,
                 extra_args=extra_args,
+                effort=effort,
+                clarify=clarify,
             )
 
             env = os.environ.copy()
@@ -209,7 +286,16 @@ class ClaudeRunner:
             if env_extra:
                 env.update(env_extra)
 
-            log.info("launching claude session_key=%s uuid=%s resume=%s", session_key, session_uuid, not created)
+            eff_applied, eff_source = self._resolve_effort(model, effort)
+            log.info(
+                "launching claude session_key=%s uuid=%s resume=%s model=%s effort=%s (%s)",
+                session_key,
+                session_uuid,
+                not created,
+                model,
+                eff_applied or "cli-default",
+                eff_source,
+            )
 
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -252,7 +338,7 @@ class ClaudeRunner:
                     except json.JSONDecodeError:
                         continue
 
-                    for normalized in _normalize_stream_event(evt):
+                    for normalized in _normalize_stream_event(evt, partial=self.stream_partial_messages):
                         if normalized.kind == "text" and normalized.text:
                             final_text_parts.append(normalized.text)
                         yield normalized
@@ -281,16 +367,36 @@ class ClaudeRunner:
                     await stdin_task
                 if returncode != 0 and errored is None:
                     errored = f"claude exited {returncode}: {stderr_output[-500:] if stderr_output else ''}"
-                # Drop the registry entry on resume-failure so the next request
-                # mints a fresh uuid, uses --session-id, and replays full history.
-                if (
-                    returncode != 0
-                    and not created
-                    and stderr_output
-                    and "session" in stderr_output.lower()
-                    and ("not found" in stderr_output.lower() or "no such" in stderr_output.lower())
-                ):
-                    log.warning("session %s uuid %s missing; dropping for next call", session_key, session_uuid)
+                # Self-heal a broken resume. If a --resume turn fails — a non-zero
+                # exit, or a stream-json result with an error subtype like
+                # "error_during_execution" (which exits 0) — without producing any
+                # assistant text, the underlying Claude session is unusable. The
+                # most common cause is its transcript being gone (e.g. the session
+                # store was wiped, or never persisted) while our key->uuid mapping
+                # survived, so every retry re-resumes the same dead uuid and fails
+                # identically. Drop the mapping so the NEXT request mints a fresh
+                # uuid, switches to --session-id, and replays the full transcript
+                # (prepare_messages leaves replay-only mode once registry.has() is
+                # False). Costs one extra full-history turn but keeps the
+                # conversation alive instead of permanently bricking it.
+                #
+                # The "no assistant text this turn" guard means a session that
+                # streamed a real answer and only then hit a late error is left
+                # intact — we only reset sessions that produced nothing usable.
+                stderr_lc = (stderr_output or "").lower()
+                session_missing = "session" in stderr_lc and (
+                    "not found" in stderr_lc or "no such" in stderr_lc
+                )
+                resume_unusable = bool(errored) and not final_text_parts
+                if not created and (session_missing or resume_unusable):
+                    log.warning(
+                        "resume failed for session %s uuid %s (returncode=%s error=%r); "
+                        "dropping mapping so the next turn replays full history",
+                        session_key,
+                        session_uuid,
+                        returncode,
+                        errored,
+                    )
                     await self.registry.forget(session_key)
 
             final_text = "".join(final_text_parts).strip()
@@ -321,6 +427,8 @@ class ClaudeRunner:
         model: Optional[str] = None,
         env_extra: Optional[dict[str, str]] = None,
         extra_args: Optional[list[str]] = None,
+        effort: Optional[str] = None,
+        clarify: bool = False,
     ) -> ClaudeResult:
         result = ClaudeResult(session_uuid="", final_text="")
         text_parts: list[str] = []
@@ -331,6 +439,8 @@ class ClaudeRunner:
             model=model,
             env_extra=env_extra,
             extra_args=extra_args,
+            effort=effort,
+            clarify=clarify,
         ):
             result.events.append(evt)
             if evt.kind == "text" and evt.text:
@@ -405,9 +515,35 @@ async def _drain_stderr(stream: Optional[asyncio.StreamReader]) -> str:
     return text
 
 
-def _normalize_stream_event(evt: dict) -> list[StreamEvent]:
-    """Convert a raw Claude Code stream-json event into StreamEvents."""
+def _normalize_stream_event(evt: dict, partial: bool = False) -> list[StreamEvent]:
+    """Convert a raw Claude Code stream-json event into StreamEvents.
+
+    When ``partial`` is True the run was launched with
+    ``--include-partial-messages``, so live text/thinking arrive as incremental
+    ``stream_event`` deltas (handled below). In that mode the *consolidated*
+    assistant ``text``/``thinking`` blocks are suppressed — they would otherwise
+    re-emit, in one chunk, exactly what the deltas already streamed. tool_use is
+    still taken from the consolidated block (its input doesn't stream usefully).
+    """
     etype = evt.get("type")
+
+    if etype == "stream_event":
+        # Incremental Anthropic streaming event (only present with
+        # --include-partial-messages). We care about content_block_delta for
+        # text and thinking; block start/stop, tool input fragments, signatures,
+        # and message-level deltas are not needed for the client stream.
+        inner = evt.get("event") or {}
+        if inner.get("type") != "content_block_delta":
+            return []
+        delta = inner.get("delta") or {}
+        dtype = delta.get("type")
+        if dtype == "text_delta":
+            text = delta.get("text") or ""
+            return [StreamEvent(kind="text", text=text, raw=inner)] if text else []
+        if dtype == "thinking_delta":
+            thinking = delta.get("thinking") or ""
+            return [StreamEvent(kind="thinking", text=thinking, raw=inner)] if thinking else []
+        return []
 
     if etype == "system":
         return [StreamEvent(kind="system", raw=evt)]
@@ -419,10 +555,14 @@ def _normalize_stream_event(evt: dict) -> list[StreamEvent]:
         for block in content:
             btype = block.get("type")
             if btype == "text":
+                if partial:
+                    continue  # already streamed via text_delta
                 text = block.get("text") or ""
                 if text:
                     out.append(StreamEvent(kind="text", text=text, raw=block))
             elif btype == "thinking":
+                if partial:
+                    continue  # already streamed via thinking_delta
                 out.append(StreamEvent(kind="thinking", text=block.get("thinking") or "", raw=block))
             elif btype == "tool_use":
                 out.append(

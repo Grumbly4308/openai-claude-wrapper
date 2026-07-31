@@ -7,7 +7,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from .deps import auth_dependency
 from .models import (
@@ -125,58 +125,13 @@ def _responses_to_chat_messages(req: ResponsesRequest) -> list[ChatMessage]:
 
 @router.post("/v1/responses", dependencies=[Depends(auth_dependency)])
 async def responses_api(req: ResponsesRequest):
-    from .main import run_chat_completion
+    # Flatten the Responses `input` to chat messages here, then hand off to the
+    # shared engine in main, which owns session derivation (including
+    # previous_response_id chaining), the token budget, and both the sync and
+    # streamed Responses wire formats.
+    from .main import run_responses  # lazy to avoid circular import
 
     messages = _responses_to_chat_messages(req)
     if not messages:
         raise HTTPException(status_code=400, detail="no input provided")
-
-    chat_req = ChatCompletionRequest(
-        model=req.model,
-        messages=messages,
-        stream=req.stream,
-        temperature=req.temperature,
-        top_p=req.top_p,
-        max_tokens=req.max_output_tokens,
-        user=req.user,
-        session_id=req.previous_response_id,
-    )
-    inner = await run_chat_completion(chat_req)
-    if req.stream:
-        return inner
-
-    import json as _json
-
-    body = inner.body if hasattr(inner, "body") else b""
-    try:
-        data = _json.loads(body.decode() if isinstance(body, (bytes, bytearray)) else body)
-    except Exception:
-        data = {}
-    msg = ((data.get("choices") or [{}])[0].get("message") or {})
-    text = msg.get("content") or ""
-    usage = data.get("usage") or {}
-
-    resp = {
-        "id": f"resp-{uuid.uuid4().hex[:24]}",
-        "object": "response",
-        "created_at": int(time.time()),
-        "model": req.model,
-        "status": "completed",
-        "output": [
-            {
-                "type": "message",
-                "id": f"msg-{uuid.uuid4().hex[:16]}",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": text, "annotations": []}],
-            }
-        ],
-        "output_text": text,
-        "usage": {
-            "input_tokens": int(usage.get("prompt_tokens") or 0),
-            "output_tokens": int(usage.get("completion_tokens") or 0),
-            "total_tokens": int(usage.get("total_tokens") or 0),
-        },
-        "metadata": req.metadata or {},
-        "previous_response_id": req.previous_response_id,
-    }
-    return JSONResponse(content=resp)
+    return await run_responses(req, messages)

@@ -11,7 +11,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional
 
 from fastapi import (
     Depends,
@@ -27,9 +27,18 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from . import tool_bridge
 from .config import SETTINGS, advertised_models, split_model_effort, supported_models
 from .converters import derive_session_id
 from .deps import FILE_STORE, PREPARER, RUNNER, USAGE_LEDGER, auth_dependency
+# Re-exported under the historical private names (and `extract_raw_json`, which
+# tests import from here) — see json_mode.py for why it is a separate module.
+from .json_mode import (
+    extract_raw_json,
+    json_instruction as _json_instruction,
+    json_mode_error as _json_mode_error,
+    wants_json as _wants_json,
+)
 from .models import (
     ChatCompletionChoice,
     ChatCompletionChunk,
@@ -116,6 +125,16 @@ _STREAM_SHOW_ACTIVITY = os.environ.get("CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY", "true
 _REASONING_CHANNEL = os.environ.get(
     "CLAUDE_WRAPPER_REASONING_CHANNEL", "details"
 ).strip().lower()
+
+# Whether to sniff prompt-declared JSON requests (a client that puts its schema
+# in the prompt and sends no response_format — see json_mode.py). Both effects
+# are no-ops on a false positive; set to off to disable the sniffing entirely.
+_JSON_SNIFF = os.environ.get("CLAUDE_WRAPPER_JSON_SNIFF", "on").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
 
 # (open, close) token pairs for the channels that wrap reasoning inside the
 # content stream. Other channels (reasoning_content, none) are not in this map.
@@ -248,6 +267,7 @@ async def _startup() -> None:
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     await PREPARER.aclose()
+    await tool_bridge.aclose()
 
 
 app.include_router(text_router)
@@ -442,12 +462,40 @@ async def _prepare_run(req: ChatCompletionRequest):
     return prompt, session_key, model
 
 
+def _log_request(kind: str, req: Any) -> None:
+    """One compact line per generation request.
+
+    A JSON-mode failure is reported from the *client* side ("Unexpected token
+    'B'…"), which says nothing about which wrapper surface served the turn or
+    whether the structured-output declaration was even seen — the two questions
+    that actually locate the bug. `json_mode=off` on a turn the client thought
+    was structured is the whole diagnosis in one field.
+    """
+    rf = getattr(req, "response_format", None)
+    log.info(
+        "%s: model=%s stream=%s json_mode=%s tools=%d",
+        kind,
+        req.model,
+        bool(getattr(req, "stream", False)),
+        getattr(rf, "type", None) or "off",
+        len(getattr(req, "tools", None) or []),
+    )
+
+
 async def run_chat_completion(req: ChatCompletionRequest):
     """Shared implementation reused by /v1/chat/completions, /v1/completions,
     and the batches worker."""
+    _log_request("chat/completions" + (" [tool-bridge]" if req.tools else ""), req)
+    # Function calling: a request that declares tools is owned by the CLIENT's
+    # agent loop, which is the opposite of the wrapper's agentic default. It is
+    # served by the tool bridge (a direct Messages API call — no Claude Code
+    # CLI, no built-in tools, no internal loop) and returns tool_calls for the
+    # client to execute. Requests without tools are untouched by this branch.
+    if req.tools:
+        return await _tool_bridge_completion(req)
     prep = await _prepare_run(req)
     if isinstance(prep, _InstantReply):
-        return _instant_reply(req, prep.session_key, prep.text)
+        return _json_safe_instant_reply(req, prep)
     prompt, session_key, model = prep
 
     if req.stream:
@@ -463,6 +511,78 @@ async def run_chat_completion(req: ChatCompletionRequest):
 @app.post("/v1/chat/completions", dependencies=[Depends(auth_dependency)])
 async def chat_completions(req: ChatCompletionRequest):
     return await run_chat_completion(req)
+
+
+async def _tool_bridge_completion(req: ChatCompletionRequest):
+    """Serve a function-calling request via the tool bridge.
+
+    Keeps the wrapper-level conveniences (session_id echo, per-conversation
+    budget gate, usage ledger) but none of the agentic machinery — no prompt
+    flattening, no CLI session, no KB addendum, no built-in tools.
+    """
+    session_key = derive_session_id(req.messages, req.session_id, req.user)
+
+    if USAGE_LEDGER.enabled:
+        state = await USAGE_LEDGER.snapshot(session_key)
+        if state.over_budget:
+            if _is_continue(req.messages):
+                await USAGE_LEDGER.grant(session_key)
+            else:
+                return _json_safe_instant_reply(
+                    req, _InstantReply(session_key, _budget_message(state))
+                )
+
+    model = req.model if req.model and req.model != "auto" else SETTINGS.default_model
+    run_model, effort = split_model_effort(model)
+    # Effort is a Claude Code CLI concept; the direct Messages API call has no
+    # equivalent, so it is reported as unapplied rather than silently claimed.
+    effort_info = {"applied": "api-default", "source": "tool-bridge", "requested": effort}
+
+    if req.stream:
+        async def _record(in_tok: int, out_tok: int) -> None:
+            if USAGE_LEDGER.enabled:
+                await USAGE_LEDGER.record(session_key, in_tok + out_tok)
+
+        return StreamingResponse(
+            tool_bridge.stream(
+                req, run_model, model, session_key, effort_info, on_usage=_record
+            ),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+
+    result = await tool_bridge.complete(req, run_model)
+    if USAGE_LEDGER.enabled:
+        await USAGE_LEDGER.record(session_key, result.input_tokens + result.output_tokens)
+
+    response = ChatCompletionResponse(
+        id=f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        created=int(time.time()),
+        model=model,
+        choices=[
+            ChatCompletionChoice(
+                index=0,
+                message=ChoiceMessage(
+                    role="assistant",
+                    content=result.content,
+                    tool_calls=result.tool_calls,
+                ),
+                finish_reason=result.finish_reason,
+            )
+        ],
+        usage=Usage(
+            prompt_tokens=result.input_tokens,
+            completion_tokens=result.output_tokens,
+            total_tokens=result.input_tokens + result.output_tokens,
+        ),
+        session_id=session_key,
+        effort=effort_info,
+    )
+    data = response.model_dump(exclude_none=True)
+    # Per the OpenAI spec a tool-call message carries an explicit null content,
+    # not an absent key (and never "") — exclude_none above would drop it.
+    data["choices"][0]["message"].setdefault("content", None)
+    return JSONResponse(content=data)
 
 
 async def _sync_response(
@@ -912,7 +1032,18 @@ def _resolve_clarify(req) -> bool:
     Absent/None => on (the interactive default); explicit false opts a request
     out. The server-level switch is enforced in the runner (an empty configured
     prompt makes clarify=True a no-op), so this only governs per-request intent.
+
+    JSON mode forces it OFF regardless of what the client asked for. The
+    clarification protocol tells Claude to make its ENTIRE reply a list of
+    questions when it hits an ambiguity, which is pure prose with no JSON in it
+    — so the reply reaches a structured-output client (Vercel AI SDK
+    generateObject → Vane) as an unparseable body and dies in JSON.parse. There
+    is also nobody on the far end who *can* answer: a generateObject call is a
+    one-shot machine request, not a chat turn. Asking is never the right move
+    there, so the wire contract wins over the interactive default.
     """
+    if _wants_json(req):
+        return False
     val = getattr(req, "clarify", None)
     return True if val is None else bool(val)
 
@@ -1015,6 +1146,7 @@ async def run_responses(rreq: ResponsesRequest, messages: list[ChatMessage]):
     `messages` is the chat-shaped conversation already flattened from the
     Responses `input` by the route layer.
     """
+    _log_request("responses", rreq)
     # `previous_response_id` wins over the message anchor so an explicit chain
     # always reattaches to the right session.
     session_key = derive_session_id(
@@ -1029,10 +1161,17 @@ async def run_responses(rreq: ResponsesRequest, messages: list[ChatMessage]):
         max_tokens=rreq.max_output_tokens,
         user=rreq.user,
         session_id=session_key,
+        # Carried across so _prepare_run appends the raw-JSON output instruction
+        # and turns the clarification protocol off, exactly as on the chat path.
+        response_format=rreq.response_format,
     )
 
     prep = await _prepare_run(chat_req)
     if isinstance(prep, _InstantReply):
+        if _wants_json(rreq):
+            raise HTTPException(
+                status_code=502, detail=_instant_reply_error(rreq, prep.text)
+            )
         return _responses_instant_reply(rreq, prep.session_key, prep.text)
     prompt, session_key, model = prep
 
@@ -1068,8 +1207,30 @@ async def _responses_sync(
         paths=[Path(p) for p in new_outputs], session_key=session_key, inline=False
     )
     final_text = result.final_text
-    if attachments:
-        final_text = _append_file_references(final_text, attachments)
+    if _wants_json(rreq):
+        # Same contract as the chat path: reduce the reply to the raw JSON value
+        # (never the file trailer), and fail loudly with the model's own words
+        # when nothing parses rather than hand the client prose to JSON.parse.
+        cleaned = extract_raw_json(final_text)
+        if cleaned is None:
+            raise HTTPException(status_code=502, detail=_json_mode_error(rreq, final_text))
+        final_text = cleaned
+    else:
+        unfenced = final_text
+        if _JSON_SNIFF and _prompt_requests_json(prompt):
+            unfenced = _unfence_json(final_text)
+            if unfenced == final_text:
+                # Strict unfencing matches only a reply that is a fence and
+                # nothing else. Claude habitually adds a closing sentence,
+                # and that alone used to send the backticks through to a
+                # client about to JSON.parse them. Escalate to the lone-block
+                # rule before giving up.
+                unfenced = _unfence_sole_json_block(final_text)
+        if unfenced != final_text:
+            log.info("unfenced a prompt-declared JSON reply (session=%s)", session_key)
+            final_text = unfenced
+        elif attachments:
+            final_text = _append_file_references(final_text, attachments)
 
     envelope = _responses_envelope(
         rreq,
@@ -1095,6 +1256,11 @@ async def _responses_stream(
     created = int(time.time())
     item_id = f"msg_{uuid.uuid4().hex[:24]}"
     seq = 0
+    # JSON mode: the client concatenates the text deltas and parses the result,
+    # so answer text is buffered and emitted as one cleaned delta at the end (a
+    # ```json fence can straddle chunk boundaries), and the file trailer is
+    # suppressed. Mirrors the chat stream.
+    json_mode = _wants_json(rreq)
 
     def ev(event_type: str, payload: dict) -> bytes:
         nonlocal seq
@@ -1167,6 +1333,8 @@ async def _responses_stream(
                 evt = item
                 if evt.kind == "text" and evt.text:
                     text_parts.append(evt.text)
+                    if json_mode:
+                        continue
                     yield ev(
                         "response.output_text.delta",
                         {"item_id": item_id, "output_index": 0,
@@ -1193,7 +1361,7 @@ async def _responses_stream(
         attachments = await _register_generated_files(
             paths=[Path(p) for p in new_outputs], session_key=session_key, inline=False
         )
-        if attachments:
+        if attachments and not json_mode:
             trailer = "\n\n" + _append_file_references("", attachments).strip()
             text_parts.append(trailer)
             yield ev(
@@ -1202,6 +1370,22 @@ async def _responses_stream(
             )
 
         full_text = "".join(text_parts)
+        if json_mode:
+            # Flush the buffered answer as a single delta, reduced to the raw
+            # JSON value. If nothing parses, the response head is long gone, so
+            # the turn fails on the stream's own channel (response.failed) with
+            # no text emitted at all — never prose the client will choke on.
+            cleaned = extract_raw_json(full_text)
+            if cleaned is None:
+                errored = errored or _json_mode_error(rreq, full_text)
+                full_text = ""
+            else:
+                full_text = cleaned
+                yield ev(
+                    "response.output_text.delta",
+                    {"item_id": item_id, "output_index": 0,
+                     "content_index": 0, "delta": full_text},
+                )
         yield ev(
             "response.output_text.done",
             {"item_id": item_id, "output_index": 0, "content_index": 0, "text": full_text},
@@ -1397,6 +1581,18 @@ def _budget_message(state: UsageState) -> str:
         f"budget block ({pct}% of the configured session allowance). "
         f"Reply **continue** to allow another block, or start a new chat to reset."
     )
+
+
+def _json_safe_instant_reply(req: ChatCompletionRequest, prep: "_InstantReply"):
+    """Render an instant reply, or refuse to in JSON mode.
+
+    A wrapper-authored message is prose; a structured-output client parses the
+    body and dies on it. Fail with the reason instead of shipping a 200 the
+    client cannot read. See json_mode.instant_reply_error.
+    """
+    if _wants_json(req):
+        raise HTTPException(status_code=502, detail=_instant_reply_error(req, prep.text))
+    return _instant_reply(req, prep.session_key, prep.text)
 
 
 def _instant_reply(req: ChatCompletionRequest, session_key: str, text: str):

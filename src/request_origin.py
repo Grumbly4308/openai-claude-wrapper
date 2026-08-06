@@ -4,8 +4,15 @@ Generated-file links must be clickable in a chat UI, which means absolute.
 CLAUDE_WRAPPER_PUBLIC_BASE_URL stays authoritative when set; when it is not,
 the inbound request's own origin is a better answer than no link at all.
 Carried in a ContextVar because _file_download_url runs deep inside the
-response builders, which have no Request in scope -- and one caller (the
-batches worker) has no request at all, hence the empty default.
+response builders, which have no Request in scope.
+
+The default is empty for callers that genuinely run outside a request, which is
+what makes the trailer degrade to plain text rather than emit a broken link.
+Note that the batches worker is NOT one of them: routes_batches launches it with
+asyncio.create_task inside the POST handler, and create_task copies the current
+context, so the worker keeps the submitting request's origin for the batch's
+whole life -- long after the middleware's own reset has run. Batch outputs
+therefore do get links, addressed to whatever origin submitted the batch.
 """
 
 from __future__ import annotations

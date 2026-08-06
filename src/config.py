@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -142,6 +143,8 @@ class Settings:
     max_upload_bytes: int
     request_timeout_seconds: int
     public_base_url: str
+    download_signing_key: str
+    download_url_ttl_seconds: int
     openwebui_base_url: str
     openwebui_api_key: str
     openwebui_default_collection: str
@@ -188,6 +191,18 @@ class Settings:
             log.warning("unknown CLAUDE_WRAPPER_TOOLS_MODE=%r; using 'bridge'", tools_mode)
             tools_mode = "bridge"
 
+        # Signing key for download links. An explicit key wins; otherwise derive
+        # one deterministically from the configured API keys, so it is stable
+        # across workers (compose exposes CLAUDE_WRAPPER_WORKERS) and restarts
+        # with zero operator configuration, needs no state on disk, and rotating
+        # an API key invalidates outstanding links. Empty when no API keys are
+        # set: auth is off in that deployment, so links need no signature.
+        dl_key = os.environ.get("CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY", "").strip()
+        if not dl_key and keys:
+            dl_key = hashlib.sha256(
+                b"claude-wrapper/download-key/v1\n" + "\n".join(sorted(keys)).encode()
+            ).hexdigest()
+
         for d in (data_dir, workspace, files, sessions):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -204,6 +219,12 @@ class Settings:
             max_upload_bytes=int(os.environ.get("CLAUDE_WRAPPER_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024))),
             request_timeout_seconds=int(os.environ.get("CLAUDE_WRAPPER_REQUEST_TIMEOUT", "1800")),
             public_base_url=os.environ.get("CLAUDE_WRAPPER_PUBLIC_BASE_URL", "").rstrip("/"),
+            download_signing_key=dl_key,
+            # Lifetime of a download link's capability, in seconds (30 days).
+            # Expiry is the only revocation short of deleting the blob, and
+            # these links live forever in the chat client's message history.
+            # 0 = never expires (still signed).
+            download_url_ttl_seconds=_int_env("CLAUDE_WRAPPER_DOWNLOAD_URL_TTL", 2592000),
             openwebui_base_url=os.environ.get("OPENWEBUI_BASE_URL", "").rstrip("/"),
             openwebui_api_key=os.environ.get("OPENWEBUI_API_KEY", ""),
             openwebui_default_collection=os.environ.get("OPENWEBUI_DEFAULT_COLLECTION", ""),

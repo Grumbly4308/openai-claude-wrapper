@@ -27,10 +27,17 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import tool_bridge, tool_routing
+from . import download_tokens, tool_bridge, tool_routing
 from .config import SETTINGS, advertised_models, split_model_effort, supported_models
 from .converters import derive_session_id
-from .deps import FILE_STORE, PREPARER, RUNNER, USAGE_LEDGER, auth_dependency
+from .deps import (
+    FILE_STORE,
+    PREPARER,
+    RUNNER,
+    USAGE_LEDGER,
+    auth_dependency,
+    download_auth_dependency,
+)
 # Re-exported under the historical private names (and `extract_raw_json`, which
 # tests import from here) — see json_mode.py for why it is a separate module.
 from .json_mode import (
@@ -381,7 +388,7 @@ async def delete_file(file_id: str) -> dict:
     return {"id": file_id, "object": "file", "deleted": deleted}
 
 
-@app.get("/v1/files/{file_id}/content", dependencies=[Depends(auth_dependency)])
+@app.get("/v1/files/{file_id}/content", dependencies=[Depends(download_auth_dependency)])
 async def download_file(file_id: str) -> StreamingResponse:
     record = await FILE_STORE.get(file_id)
     if record is None:
@@ -1717,10 +1724,22 @@ async def _register_generated_files(
 
 
 def _file_download_url(file_id: str) -> Optional[str]:
+    """Download URL for a generated file, or None when the wrapper has no way to
+    name itself (the caller then degrades to plain text).
+
+    The query carries a per-file capability, because a browser clicking a link
+    in chat sends no Authorization header. Signature deliberately unchanged:
+    _append_file_references picks between its two line formats purely on whether
+    this returns a URL.
+    """
     base = SETTINGS.public_base_url
     if not base:
         return None
-    return f"{base}/v1/files/{file_id}/content"
+    query = download_tokens.mint(
+        file_id, SETTINGS.download_signing_key, SETTINGS.download_url_ttl_seconds
+    )
+    url = f"{base}/v1/files/{file_id}/content"
+    return f"{url}?{query}" if query else url
 
 
 def _append_file_references(text: str, attachments: list[dict]) -> str:

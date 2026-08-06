@@ -422,22 +422,45 @@ client.chat.completions.create(
 
 ## Generated files (Claude writes binaries back)
 
-When Claude writes into `outputs/` in the session workspace, the wrapper
-detects the new files and:
+When Claude writes a file into the session workspace, the wrapper detects it
+and:
 
 1. Registers each one with `/v1/files` (`purpose=assistant_output`).
 2. Appends a "Generated files" block to the assistant message listing
-   each file's `file_id`, mime, and size.
+   each file as a markdown download link (mime, size, and `file_id`).
 3. If the request body sets `"inline_generated_files": true`, the raw
    bytes are included inline as base64 under `message.attachments[*].content_base64`.
+   (Non-streaming chat only — there is no field to carry them while streaming.)
 
 A typical prompt:
 
 > "Transcode the attached `.wav` to MP3 and write it to
 > `outputs/result.mp3`."
 
-…produces a response with a `file_id` the client can download with
-`GET /v1/files/{id}/content`.
+…produces a response with a link the user can click, plus a `file_id` the client
+can download with `GET /v1/files/{id}/content`.
+
+Files are excluded from delivery if they live under `uploads/` (the user's own
+attachments) or under any dot-prefixed path — so `.scratch/` is a free channel
+for intermediate work that shouldn't be handed back.
+
+### Making the link clickable
+
+Two things have to be true, and both have safe defaults:
+
+- **An absolute URL.** Set `CLAUDE_WRAPPER_PUBLIC_BASE_URL` to whatever address
+  clients reach the wrapper on. Without it the trailer degrades to
+  non-clickable `→ file_id=…` text.
+- **Auth the browser can satisfy.** A link click sends no `Authorization`
+  header, so with `CLAUDE_WRAPPER_API_KEYS` set every download used to 401.
+  Each link now carries `?exp=…&sig=…`: an HMAC over exactly that one file id
+  and expiry. It grants reading that one blob — listing, metadata and delete
+  still require a real API key, and no API key ever appears in chat text.
+  The signing key defaults to one derived from `CLAUDE_WRAPPER_API_KEYS`
+  (stable across workers and restarts); set `CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY`
+  explicitly if you don't want an API-key rotation to invalidate outstanding
+  links. Links expire after `CLAUDE_WRAPPER_DOWNLOAD_URL_TTL` seconds
+  (default 30 days; `0` = never).
 
 ### If your client sends `tools` (Open WebUI native function calling)
 

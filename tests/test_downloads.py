@@ -33,6 +33,7 @@ from src import deps as src_deps
 from src import download_tokens, request_origin
 from src import main as src_main
 from src.deps import FILE_STORE
+from src.file_store import FileStore
 from src.main import app
 
 client = TestClient(app)
@@ -162,6 +163,37 @@ def test_trailer_degrades_to_plain_text_without_a_url(monkeypatch):
     assert out == "done\n\nGenerated files:\n- report.csv (text/csv, 12 bytes) → file_id=file-9"
 
 
+# ---------- _resolve_workspace_hint ----------
+#
+# The hint is what makes Claude write a deliverable to a file instead of pasting
+# it inline, so it is the switch the whole download feature hangs off. It had no
+# coverage at all: replacing the body with a constant True or a constant False
+# left the suite green.
+
+
+class _Req:
+    def __init__(self, response_format=None):
+        self.response_format = response_format
+
+
+class _Fmt:
+    def __init__(self, type_):
+        self.type = type_
+        self.json_schema = None
+
+
+def test_workspace_hint_on_for_an_ordinary_turn():
+    assert src_main._resolve_workspace_hint(_Req()) is True
+    assert src_main._resolve_workspace_hint(_Req(_Fmt("text"))) is True
+
+
+def test_workspace_hint_off_in_json_mode():
+    """A structured-output client wants the value in the reply body. Nudging
+    Claude to put the deliverable in a file instead would starve it."""
+    assert src_main._resolve_workspace_hint(_Req(_Fmt("json_object"))) is False
+    assert src_main._resolve_workspace_hint(_Req(_Fmt("json_schema"))) is False
+
+
 # ---------- origin derivation through a real request ----------
 
 
@@ -221,9 +253,37 @@ def test_origin_is_live_inside_the_request(monkeypatch):
         assert captured == ["https://chat.example"]
     finally:
         app.router.routes = [r for r in app.router.routes if getattr(r, "path", "") != "/_test_origin_on"]
-    # The ContextVar is scoped to the request: outside one it reads empty, which
-    # is what keeps the batches worker (no request at all) on the plain-text
-    # trailer rather than minting a link to whatever host asked last.
+    # The ContextVar is scoped to the request: at module scope it reads empty,
+    # which is what keeps a caller outside any request on the plain-text trailer
+    # rather than minting a link to whatever host asked last.
+    assert request_origin.current_origin() == ""
+
+
+def test_a_task_spawned_in_a_request_inherits_that_origin():
+    """Documents real behavior that the module comment used to deny.
+
+    routes_batches.py launches its worker with asyncio.create_task inside the
+    POST handler. create_task snapshots the current context, so the worker keeps
+    the submitting request's origin for the batch's whole life -- including after
+    the middleware's finally-block reset. Batch outputs therefore DO get links,
+    addressed to the origin that submitted the batch. That is defensible (it is
+    the only origin that caller ever had), but it is the opposite of what the
+    code claimed, so pin it rather than leave it to be rediscovered.
+    """
+
+    async def scenario():
+        seen: list[str] = []
+
+        async def worker():
+            seen.append(request_origin.current_origin())
+
+        token = request_origin._ORIGIN.set("https://chat.example")
+        task = asyncio.create_task(worker())      # as routes_batches.py does
+        request_origin._ORIGIN.reset(token)       # as the middleware's finally does
+        await task
+        return seen
+
+    assert asyncio.run(scenario()) == ["https://chat.example"]
     assert request_origin.current_origin() == ""
 
 
@@ -322,6 +382,28 @@ def test_malformed_file_ids_are_rejected_by_the_store(monkeypatch, stored_file):
     assert asyncio.run(FILE_STORE.delete("../../etc")) is False
     assert _get("file-XYZ").status_code == 404
     assert _get("..%2F..%2Fetc%2Fpasswd").status_code in (404, 400)
+
+
+def test_the_id_guard_stops_delete_from_escaping_the_store(tmp_path):
+    """The guard is load-bearing, not decorative.
+
+    delete() does shutil.rmtree(root / file_id) on an unchecked join, so a
+    traversing id recursively deletes an arbitrary directory. The assertions
+    above cannot show this: their inputs resolve to paths that do not exist, so
+    they return None/False via the .exists() check whether or not the guard is
+    present, and pass identically with it removed. This one puts a real
+    directory at the other end of the traversal, so it fails if the guard goes.
+    """
+    root = tmp_path / "store"
+    root.mkdir(parents=True)
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("do not delete me")
+
+    store = FileStore(root)
+    assert asyncio.run(store.delete("../victim")) is False
+    assert victim.exists(), "traversing id escaped the store root and deleted a sibling"
+    assert (victim / "keep.txt").read_text() == "do not delete me"
 
 
 def test_minted_url_authenticates_against_the_live_route(monkeypatch, stored_file):

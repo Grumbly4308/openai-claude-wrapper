@@ -448,9 +448,12 @@ for intermediate work that shouldn't be handed back.
 
 Two things have to be true, and both have safe defaults:
 
-- **An absolute URL.** Set `CLAUDE_WRAPPER_PUBLIC_BASE_URL` to whatever address
-  clients reach the wrapper on. Without it the trailer degrades to
-  non-clickable `→ file_id=…` text.
+- **An absolute URL.** `CLAUDE_WRAPPER_PUBLIC_BASE_URL` wins whenever it is set.
+  Otherwise the wrapper derives the base from the request's own `Host` /
+  `X-Forwarded-Host` / `X-Forwarded-Proto` headers, which is correct behind a
+  typical reverse proxy and needs no configuration. Set
+  `CLAUDE_WRAPPER_DERIVE_BASE_URL=off` to go back to the old non-clickable
+  `→ file_id=…` text.
 - **Auth the browser can satisfy.** A link click sends no `Authorization`
   header, so with `CLAUDE_WRAPPER_API_KEYS` set every download used to 401.
   Each link now carries `?exp=…&sig=…`: an HMAC over exactly that one file id

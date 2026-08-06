@@ -38,6 +38,7 @@ from .deps import (
     auth_dependency,
     download_auth_dependency,
 )
+from .request_origin import RequestOriginMiddleware, current_origin
 # Re-exported under the historical private names (and `extract_raw_json`, which
 # tests import from here) — see json_mode.py for why it is a separate module.
 from .json_mode import (
@@ -292,6 +293,11 @@ app.include_router(assistants_router)
 app.include_router(vector_stores_router)
 app.include_router(fine_tuning_router)
 app.include_router(realtime_router)
+
+# Records the origin each request arrived on, so generated-file links can be
+# absolute (and therefore clickable) without the operator configuring
+# CLAUDE_WRAPPER_PUBLIC_BASE_URL. Pure-ASGI on purpose — see request_origin.py.
+app.add_middleware(RequestOriginMiddleware)
 
 
 # ---------- health & models ----------
@@ -1714,6 +1720,11 @@ async def _register_generated_files(
                 source="generated",
             )
             entry = record.to_openai()
+            # Non-OpenAI key on an already non-OpenAI dict, so SDK clients get
+            # the link without having to parse it back out of the markdown.
+            url = _file_download_url(record.id)
+            if url:
+                entry["url"] = url
             if inline:
                 data = p.read_bytes()
                 entry["content_base64"] = base64.b64encode(data).decode("ascii")
@@ -1732,7 +1743,7 @@ def _file_download_url(file_id: str) -> Optional[str]:
     _append_file_references picks between its two line formats purely on whether
     this returns a URL.
     """
-    base = SETTINGS.public_base_url
+    base = SETTINGS.public_base_url or current_origin()
     if not base:
         return None
     query = download_tokens.mint(

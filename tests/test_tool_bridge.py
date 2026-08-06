@@ -13,6 +13,7 @@ import contextlib
 import dataclasses
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -575,6 +576,36 @@ def test_agentic_mode_still_bridges_a_mid_loop_transcript(bridge, monkeypatch):
         )
     assert r.status_code == 200
     assert len(capture.requests) == 1
+
+
+def test_agentic_mode_tools_request_gets_a_clickable_download_link(bridge, monkeypatch, tmp_path):
+    """The end-to-end goal: tools on the wire, a file produced, a link in the reply."""
+    capture = bridge()
+    _set_mode(
+        monkeypatch,
+        "agentic",
+        public_base_url="https://wrapper.example",
+        download_signing_key="k" * 32,
+        download_url_ttl_seconds=3600,
+    )
+    out = tmp_path / "report.csv"
+    out.write_text("a,b\n1,2\n")
+    with _stub_runner(final_text="done", new_outputs=[out]):
+        r = _post(
+            {
+                "model": "claude-haiku-4-5",
+                "messages": [{"role": "user", "content": "make me a csv"}],
+                "tools": [WEB_SEARCH_TOOL],
+            }
+        )
+    assert r.status_code == 200
+    assert capture.requests == []
+    content = r.json()["choices"][0]["message"]["content"]
+    assert re.search(
+        r"\[report\.csv\]\(https://wrapper\.example/v1/files/file-[0-9a-f]{32}/content"
+        r"\?exp=\d+&sig=[A-Za-z0-9_-]+\)",
+        content,
+    ), content
 
 
 def test_oauth_auth_headers(bridge, monkeypatch, tmp_path):

@@ -30,7 +30,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src import deps as src_deps
-from src import download_tokens
+from src import download_tokens, request_origin
 from src import main as src_main
 from src.deps import FILE_STORE
 from src.main import app
@@ -107,14 +107,22 @@ def _main_settings(monkeypatch, **overrides):
     )
 
 
-def test_public_base_url_builds_the_link(monkeypatch):
+def test_public_base_url_wins_over_derived_origin(monkeypatch):
     _main_settings(monkeypatch, public_base_url="https://configured", download_signing_key="")
+    monkeypatch.setattr(src_main, "current_origin", lambda: "https://derived")
     assert src_main._file_download_url("file-1") == "https://configured/v1/files/file-1/content"
 
 
-def test_no_base_url_returns_none(monkeypatch):
+def test_derived_origin_used_when_public_base_url_is_empty(monkeypatch):
+    _main_settings(monkeypatch, public_base_url="", download_signing_key="")
+    monkeypatch.setattr(src_main, "current_origin", lambda: "https://derived")
+    assert src_main._file_download_url("file-1") == "https://derived/v1/files/file-1/content"
+
+
+def test_no_base_and_no_origin_returns_none(monkeypatch):
     """Back-compat: the caller then degrades to the plain-text trailer."""
     _main_settings(monkeypatch, public_base_url="")
+    monkeypatch.setattr(src_main, "current_origin", lambda: "")
     assert src_main._file_download_url("file-1") is None
 
 
@@ -149,8 +157,74 @@ def test_trailer_renders_a_markdown_link_when_a_url_is_available(monkeypatch):
 
 def test_trailer_degrades_to_plain_text_without_a_url(monkeypatch):
     _main_settings(monkeypatch, public_base_url="")
+    monkeypatch.setattr(src_main, "current_origin", lambda: "")
     out = src_main._append_file_references("done", [ATTACHMENT])
     assert out == "done\n\nGenerated files:\n- report.csv (text/csv, 12 bytes) → file_id=file-9"
+
+
+# ---------- origin derivation through a real request ----------
+
+
+def _origin_seen_by(headers=None, root_path="") -> str:
+    scope_headers = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    return request_origin._origin_from_scope(
+        {"type": "http", "scheme": "http", "headers": scope_headers, "root_path": root_path}
+    )
+
+
+def test_origin_from_scope():
+    assert _origin_seen_by({"host": "wrapper:8000"}) == "http://wrapper:8000"
+    # X-Forwarded-* wins: uvicorn only trusts proxy headers from
+    # forwarded_allow_ips, so scope["scheme"] is http behind a TLS terminator.
+    assert (
+        _origin_seen_by({"host": "internal", "x-forwarded-host": "chat.example", "x-forwarded-proto": "https"})
+        == "https://chat.example"
+    )
+    assert _origin_seen_by({"host": "wrapper", "x-forwarded-proto": "https, http"}) == "https://wrapper"
+    assert _origin_seen_by({"host": "wrapper"}, root_path="/api") == "http://wrapper/api"
+    assert _origin_seen_by({}) == ""
+
+
+def test_derive_base_url_off_leaves_the_origin_empty(monkeypatch):
+    monkeypatch.setattr(
+        request_origin,
+        "SETTINGS",
+        dataclasses.replace(request_origin.SETTINGS, derive_base_url=False),
+    )
+    captured: list[str] = []
+
+    @app.get("/_test_origin_off")
+    async def _probe():
+        captured.append(request_origin.current_origin())
+        return {}
+
+    try:
+        client.get("/_test_origin_off", headers={"Host": "wrapper"})
+        assert captured == [""]
+    finally:
+        app.router.routes = [r for r in app.router.routes if getattr(r, "path", "") != "/_test_origin_off"]
+
+
+def test_origin_is_live_inside_the_request(monkeypatch):
+    captured: list[str] = []
+
+    @app.get("/_test_origin_on")
+    async def _probe():
+        captured.append(request_origin.current_origin())
+        return {}
+
+    try:
+        client.get(
+            "/_test_origin_on",
+            headers={"X-Forwarded-Proto": "https", "X-Forwarded-Host": "chat.example"},
+        )
+        assert captured == ["https://chat.example"]
+    finally:
+        app.router.routes = [r for r in app.router.routes if getattr(r, "path", "") != "/_test_origin_on"]
+    # The ContextVar is scoped to the request: outside one it reads empty, which
+    # is what keeps the batches worker (no request at all) on the plain-text
+    # trailer rather than minting a link to whatever host asked last.
+    assert request_origin.current_origin() == ""
 
 
 # ---------- the download route ----------

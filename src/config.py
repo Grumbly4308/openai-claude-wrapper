@@ -143,6 +143,7 @@ class Settings:
     max_upload_bytes: int
     request_timeout_seconds: int
     public_base_url: str
+    derive_base_url: bool
     download_signing_key: str
     download_url_ttl_seconds: int
     openwebui_base_url: str
@@ -219,6 +220,12 @@ class Settings:
             max_upload_bytes=int(os.environ.get("CLAUDE_WRAPPER_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024))),
             request_timeout_seconds=int(os.environ.get("CLAUDE_WRAPPER_REQUEST_TIMEOUT", "1800")),
             public_base_url=os.environ.get("CLAUDE_WRAPPER_PUBLIC_BASE_URL", "").rstrip("/"),
+            # Generated-file links must be absolute to be clickable in a chat
+            # UI. public_base_url stays authoritative when set; otherwise the
+            # inbound request's own origin is used. Set
+            # CLAUDE_WRAPPER_DERIVE_BASE_URL=off to restore the old plain-text
+            # "→ file_id=…" trailer on deployments that name themselves badly.
+            derive_base_url=_bool_env("CLAUDE_WRAPPER_DERIVE_BASE_URL", True),
             download_signing_key=dl_key,
             # Lifetime of a download link's capability, in seconds (30 days).
             # Expiry is the only revocation short of deleting the blob, and

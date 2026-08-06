@@ -35,8 +35,12 @@ from .deps import FILE_STORE, PREPARER, RUNNER, USAGE_LEDGER, auth_dependency
 # tests import from here) — see json_mode.py for why it is a separate module.
 from .json_mode import (
     extract_raw_json,
+    instant_reply_error as _instant_reply_error,
     json_instruction as _json_instruction,
     json_mode_error as _json_mode_error,
+    prompt_requests_json as _prompt_requests_json,
+    unfence_json as _unfence_json,
+    unfence_sole_json_block as _unfence_sole_json_block,
     wants_json as _wants_json,
 )
 from .models import (

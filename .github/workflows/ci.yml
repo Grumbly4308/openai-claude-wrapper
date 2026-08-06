@@ -1,0 +1,41 @@
+name: CI
+
+# Three separate import-level breakages reached main before this existed
+# (#20 deleted helpers #21 then imported; #23 deleted Settings.from_env
+# arguments), each of which stopped the server from starting at all. The
+# import check below is the cheap guard for exactly that class of bug: it
+# fails on a dangling import in under a second, without needing Claude
+# credentials or a container.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Import check
+        # Catches dangling imports and undefined module-level names that
+        # would otherwise only surface as a crash-looping container.
+        env:
+          CLAUDE_WRAPPER_DATA: ${{ runner.temp }}/data
+        run: python -c "import src.main; print('src.main imports OK')"
+
+      - name: Tests
+        env:
+          CLAUDE_WRAPPER_DATA: ${{ runner.temp }}/data
+        run: python -m pytest tests -q

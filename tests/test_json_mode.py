@@ -204,46 +204,53 @@ def test_response_format_text_is_not_json_mode() -> None:
     check("text_mode.content_verbatim", content == fenced, note=content)
 
 
-# ---------- prompt-declared JSON (no response_format on the wire) ----------
+# ---------- prompt-declared JSON: RETIRED ----------
 #
-# Clients that put the schema in the prompt and JSON.parse the reply anyway
-# send nothing the wrapper can detect via response_format. The sniff heuristic
-# covers them: it requires BOTH a schema marker and an imperative, then asks
-# for an unfenced reply and strips any fence that slips through regardless.
+# There used to be a heuristic here ("the sniff") that guessed from prompt text
+# — a schema marker plus an imperative — that a client wanted JSON, then
+# appended a no-fences hint and unfenced the reply. It was built for Vane on
+# the belief that Vane declared nothing the wrapper could see. That turned out
+# to be false: Vane sends response_format json_schema, so the sniff sat in the
+# `else` branch and could never fire on the traffic it was written for. It was
+# removed rather than left flag-gated, because its only remaining effect was to
+# rewrite ORDINARY chat replies on a regex false positive.
 #
-# This path was silently lost once already (deleted by #20, un-restored by
-# #21's chat-path rewrite) without turning a single test red, so it is worth
-# pinning down on both the prompt and the response side.
+# These tests are the inverse of the ones they replace: a prompt that used to
+# trip the sniff must now be treated as completely ordinary. They exist so the
+# path cannot creep back in unnoticed.
 
 _SNIFFED = "Use this json schema: {\"a\": 1}. Respond with JSON only."
 
 
-def test_sniffed_prompt_gets_fence_hint() -> None:
+def test_sniff_prompt_gets_no_hint() -> None:
+    # The prompt reaches Claude verbatim — no appended formatting instruction.
     _STATE["final_text"] = '{"a": 1}'
     _chat([{"role": "user", "content": _SNIFFED}])
-    check("sniff.hint_in_prompt", "no markdown code fences" in _STATE["last_prompt"])
-    check("sniff.not_json_mode_instruction", "JSON Schema" not in _STATE["last_prompt"])
+    check("retired.no_hint_in_prompt", "no markdown code fences" not in _STATE["last_prompt"])
+    check("retired.no_json_mode_instruction", "JSON Schema" not in _STATE["last_prompt"])
 
 
-def test_sniffed_reply_is_unfenced() -> None:
-    _STATE["final_text"] = '```json\n{"a": 1}\n```'
+def test_sniff_prompt_reply_is_not_unfenced() -> None:
+    # Without response_format the reply is prose as far as the wrapper knows,
+    # fences and all. Only a real declaration earns rewriting.
+    fenced = '```json\n{"a": 1}\n```'
+    _STATE["final_text"] = fenced
     r = _chat([{"role": "user", "content": _SNIFFED}])
     content = r.json()["choices"][0]["message"]["content"]
-    check("sniff.unfenced", json.loads(content) == {"a": 1}, note=content)
+    check("retired.content_verbatim", content == fenced, note=content)
 
 
-def test_sniffed_reply_with_trailing_prose_is_unfenced() -> None:
-    # Claude habitually adds a closing sentence; strict fence-only matching
-    # misses that, so the lone-block rule has to catch it.
-    _STATE["final_text"] = 'Here you go:\n```json\n{"a": 1}\n```\nHope that helps!'
+def test_sniff_prompt_with_trailing_prose_is_untouched() -> None:
+    reply = 'Here you go:\n```json\n{"a": 1}\n```\nHope that helps!'
+    _STATE["final_text"] = reply
     r = _chat([{"role": "user", "content": _SNIFFED}])
     content = r.json()["choices"][0]["message"]["content"]
-    check("sniff.unfenced_sole_block", json.loads(content) == {"a": 1}, note=content)
+    check("retired.sole_block_untouched", content == reply, note=content)
 
 
-def test_unsniffed_prompt_keeps_fences_and_hint_out() -> None:
-    # A directive with no schema marker must NOT trip the sniff — ordinary
-    # chat that merely mentions JSON has to pass through byte for byte.
+def test_ordinary_json_chat_still_passes_through() -> None:
+    # Unchanged from before the retirement: chat that merely mentions JSON has
+    # to pass through byte for byte.
     fenced = 'Sure:\n```json\n{"a": 1}\n```'
     _STATE["final_text"] = fenced
     r = _chat([{"role": "user", "content": "Return a JSON object with a key"}])
@@ -292,9 +299,12 @@ def test_stream_without_response_format_untouched() -> None:
 # c95c2f1 and 8854a17). These pin the contract with a real file in play:
 #
 #   real JSON mode  => never a trailer, at any of the four emission sites
-#   sniff-unfenced  => never a trailer (non-streaming only; there is no
-#                      unfencing on the streaming paths, by design)
-#   neither         => trailer present
+#   anything else   => trailer present
+#
+# There used to be a third row here for the prompt-declared JSON sniff, which
+# suppressed the trailer on the two non-streaming sites as a side effect of
+# unfencing the reply. The sniff is retired, so real JSON mode is now the only
+# thing that suppresses.
 #
 # Registration into the file store stays unconditional either way; only the
 # markdown trailer is gated.
@@ -378,31 +388,31 @@ def test_trailer_suppressed_in_json_mode_all_sites() -> None:
     _STATE["new_outputs"] = []
 
 
-def test_trailer_suppressed_when_a_sniffed_reply_is_unfenced() -> None:
-    # Prompt-declared JSON, non-streaming only: the unfencing that makes the
-    # reply parseable would be undone by appending markdown after it.
+def test_trailer_kept_on_a_would_be_sniffed_prompt() -> None:
+    # The retirement's trailer consequence, on both non-streaming sites. These
+    # two turns used to have their trailer suppressed as a side effect of the
+    # sniff unfencing the reply; with no response_format on the wire they are
+    # ordinary turns now, so a generated file must be surfaced as usual.
     _STATE["new_outputs"] = _generated("sniff-sync.txt")
     _STATE["final_text"] = '```json\n{"a": 1}\n```'
     r = _chat([{"role": "user", "content": _SNIFFED}])
     content = r.json()["choices"][0]["message"]["content"]
-    check("trailer.sniff_sync_suppressed", _TRAILER not in content, note=content)
-    check("trailer.sniff_sync_parses", json.loads(content) == {"a": 1}, note=content)
+    check("trailer.retired_sync_kept", _TRAILER in content, note=content)
 
     _STATE["new_outputs"] = _generated("sniff-resp.txt")
     r = _responses(input=_SNIFFED)
     text = json.dumps(r.json())
-    check("trailer.sniff_resp_sync_suppressed", _TRAILER not in text, note=text[:400])
+    check("trailer.retired_resp_sync_kept", _TRAILER in text, note=text[:400])
     _STATE["new_outputs"] = []
 
 
-def test_trailer_kept_when_the_sniff_did_not_unfence() -> None:
-    # The sniff matching is not enough: suppression requires the unfencing to
-    # have actually changed the text. A prose reply keeps its trailer.
+def test_trailer_kept_on_a_prose_reply() -> None:
+    # Unchanged: a plain prose reply with a generated file keeps its trailer.
     _STATE["new_outputs"] = _generated("sniff-noop.txt")
     _STATE["final_text"] = "I could not produce that."
     r = _chat([{"role": "user", "content": _SNIFFED}])
     content = r.json()["choices"][0]["message"]["content"]
-    check("trailer.sniff_noop_keeps_trailer", _TRAILER in content, note=content)
+    check("trailer.prose_keeps_trailer", _TRAILER in content, note=content)
     _STATE["new_outputs"] = []
 
 
@@ -421,8 +431,12 @@ def main() -> int:
         test_stream_without_response_format_untouched,
         test_trailer_present_without_json_mode,
         test_trailer_suppressed_in_json_mode_all_sites,
-        test_trailer_suppressed_when_a_sniffed_reply_is_unfenced,
-        test_trailer_kept_when_the_sniff_did_not_unfence,
+        test_sniff_prompt_gets_no_hint,
+        test_sniff_prompt_reply_is_not_unfenced,
+        test_sniff_prompt_with_trailing_prose_is_untouched,
+        test_ordinary_json_chat_still_passes_through,
+        test_trailer_kept_on_a_would_be_sniffed_prompt,
+        test_trailer_kept_on_a_prose_reply,
     ]
     for t in tests:
         try:

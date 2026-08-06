@@ -116,10 +116,10 @@ def test_workspace_hint_noop_when_globally_disabled() -> None:
 
 
 def test_workspace_prompt_carries_no_json_schema_marker() -> None:
-    """Hard constraint: the sniff (json_mode.prompt_requests_json) keys off a
-    "json schema" marker. The hint travels as a CLI argument today and is never
-    concatenated into the prompt, but keep it schema-free so a future refactor
-    that does concatenate cannot flip the sniff on turns that never matched."""
+    """The hint travels as a CLI argument and is never concatenated into the
+    prompt, so nothing reads it as a structured-output declaration today. Keep
+    it free of "json schema" markers anyway, so it stays inert if a future
+    refactor ever does concatenate it into the prompt."""
     import re
 
     assert not re.search(r"json[\s_-]?schema", DEFAULT_WORKSPACE_SYSTEM_PROMPT, re.I)

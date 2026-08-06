@@ -69,11 +69,10 @@ DEFAULT_CLARIFY_SYSTEM_PROMPT = (
 # Override with CLAUDE_WRAPPER_WORKSPACE_PROMPT; turn it off with
 # CLAUDE_WRAPPER_WORKSPACE_HINT=off.
 #
-# HARD CONSTRAINT on this text: it must contain no "json schema" marker. It
-# travels as a CLI argument and is never concatenated into the prompt, so today
-# it cannot flip the prompt-declared-JSON sniff (json_mode.prompt_requests_json)
-# — but keep it schema-free so a future refactor that does concatenate it stays
-# safe.
+# Keep this text free of "json schema" markers. It travels as a CLI argument
+# and is never concatenated into the prompt, so nothing reads it as a
+# structured-output declaration today — but staying schema-free keeps it inert
+# if a future refactor ever does concatenate it.
 DEFAULT_WORKSPACE_SYSTEM_PROMPT = (
     "Workspace protocol. Your current working directory is a private, "
     "per-conversation workspace, and it is wired to the user: any file you "

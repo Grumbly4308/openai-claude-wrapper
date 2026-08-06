@@ -22,6 +22,14 @@ except Exception:  # pragma: no cover
 
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
+# Exactly the shape every id we mint has ("file-" + uuid4().hex). _dir_for joins
+# the id onto the store root unchecked, and the content route is reachable
+# without an API key (a signed download link), where a percent-encoded "..%2F"
+# is unquoted into the path param after routing. Validating here covers every
+# reader at once, including routes_vector_stores/routes_batches, which go
+# through the store directly rather than over HTTP.
+_ID_RE = re.compile(r"^file-[0-9a-f]{32}$")
+
 
 def _safe_filename(name: str) -> str:
     name = (name or "upload").strip().replace("\\", "/").split("/")[-1]
@@ -178,6 +186,8 @@ class FileStore:
         return record
 
     async def get(self, file_id: str) -> Optional[FileRecord]:
+        if not _ID_RE.match(file_id or ""):
+            return None
         meta_path = self._dir_for(file_id) / "meta.json"
         if not meta_path.exists():
             return None
@@ -211,6 +221,8 @@ class FileStore:
         return out
 
     async def delete(self, file_id: str) -> bool:
+        if not _ID_RE.match(file_id or ""):
+            return False
         d = self._dir_for(file_id)
         if not d.exists():
             return False

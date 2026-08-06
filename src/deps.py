@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from fastapi import Header, HTTPException
+from fastapi import Header, HTTPException, Query
 
+from . import download_tokens
 from .claude_runner import ClaudeRunner, SessionRegistry
 from .config import SETTINGS
 from .converters import MessagePreparer
@@ -39,6 +40,9 @@ RUNNER = ClaudeRunner(
     # Empty when CLAUDE_WRAPPER_CLARIFY=off, which makes clarify=True a no-op.
     clarify_system_prompt=SETTINGS.clarify_system_prompt if SETTINGS.clarify_enabled else "",
     clarify_disallowed_tools=SETTINGS.clarify_disallowed_tools if SETTINGS.clarify_enabled else (),
+    # Empty when CLAUDE_WRAPPER_WORKSPACE_HINT=off, which makes
+    # workspace_hint=True a no-op.
+    workspace_system_prompt=SETTINGS.workspace_system_prompt if SETTINGS.workspace_hint_enabled else "",
     stream_partial_messages=SETTINGS.stream_partial_messages,
 )
 PREPARER = MessagePreparer(FILE_STORE, SETTINGS.workspace_dir, registry=SESSIONS)
@@ -55,3 +59,28 @@ async def auth_dependency(authorization: Optional[str] = Header(default=None)) -
         token = authorization[7:].strip()
     if token not in SETTINGS.api_keys:
         raise HTTPException(status_code=401, detail="invalid API key")
+
+
+async def download_auth_dependency(
+    file_id: str,
+    exp: Optional[str] = Query(default=None),
+    sig: Optional[str] = Query(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> None:
+    """Auth for the one route a browser opens directly.
+
+    Accepts either a normal API key (SDK clients, unchanged) or a valid,
+    unexpired per-file capability minted by _file_download_url. The signature is
+    an ADDITION to the header check, never a replacement, and it grants read of
+    exactly one blob — listing, metadata and delete still require the key.
+    """
+    if not SETTINGS.require_auth:
+        return
+    if download_tokens.verify(file_id, exp, sig, SETTINGS.download_signing_key):
+        return
+    # A browser following a link sends no header, so "bad signature" is the real
+    # diagnosis there; falling through would report a missing Authorization
+    # header the user cannot supply.
+    if authorization is None and sig is not None:
+        raise HTTPException(status_code=401, detail="invalid or expired download link")
+    await auth_dependency(authorization)

@@ -49,11 +49,28 @@ services:
       # `Authorization: Bearer <key>`. Leave unset to disable wrapper auth.
       CLAUDE_WRAPPER_API_KEYS: "${CLAUDE_WRAPPER_API_KEYS:-}"
 
-      # If set, the wrapper emits markdown download links for generated
-      # files in assistant output, e.g. [report.pdf](http://host:8000/v1/files/file-.../content).
+      # Base URL for the markdown download links the wrapper emits for
+      # generated files, e.g. [report.pdf](http://host:8000/v1/files/file-.../content).
       # Point this at whatever URL clients (Open WebUI, etc.) can reach the
-      # wrapper on. Leave unset to fall back to the plain "file_id=…" block.
+      # wrapper on. Leave unset and the wrapper derives it from each request's
+      # own Host / X-Forwarded-* headers instead (see DERIVE_BASE_URL).
       CLAUDE_WRAPPER_PUBLIC_BASE_URL: "${CLAUDE_WRAPPER_PUBLIC_BASE_URL:-}"
+      # Derive the link base from the inbound request when PUBLIC_BASE_URL is
+      # unset. Set to "off" to fall back to the plain "file_id=…" text block.
+      CLAUDE_WRAPPER_DERIVE_BASE_URL: "${CLAUDE_WRAPPER_DERIVE_BASE_URL:-on}"
+      # Download links carry a per-file HMAC capability so a browser click
+      # authenticates without an Authorization header. The key is derived from
+      # CLAUDE_WRAPPER_API_KEYS by default (stable across workers and restarts);
+      # set it explicitly to keep links alive across an API-key rotation.
+      CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY: "${CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY:-}"
+      # Link lifetime in seconds (default 30 days). 0 = never expires.
+      CLAUDE_WRAPPER_DOWNLOAD_URL_TTL: "${CLAUDE_WRAPPER_DOWNLOAD_URL_TTL:-2592000}"
+
+      # Tell Claude its working directory is a workspace whose new files are
+      # delivered to the user as download links, so it writes deliverables to
+      # files instead of pasting them inline. Set "off" to disable.
+      CLAUDE_WRAPPER_WORKSPACE_HINT: "${CLAUDE_WRAPPER_WORKSPACE_HINT:-on}"
+      CLAUDE_WRAPPER_WORKSPACE_PROMPT: "${CLAUDE_WRAPPER_WORKSPACE_PROMPT:-}"
 
       CLAUDE_WRAPPER_DEFAULT_MODEL: "${CLAUDE_WRAPPER_DEFAULT_MODEL:-claude-opus-4-8}"
 

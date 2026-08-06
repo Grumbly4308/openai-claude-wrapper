@@ -9,8 +9,11 @@ bridge.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -27,8 +30,9 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from src import main as src_main
 from src import tool_bridge
-from src.claude_runner import ClaudeResult
+from src.claude_runner import ClaudeResult, StreamEvent
 from src.deps import RUNNER
 from src.main import app
 
@@ -449,6 +453,108 @@ def test_no_tools_uses_agentic_path(bridge):
     assert capture.requests == []
 
 
+# ---------- tools present: always the bridge; no tools: always the CLI ----------
+#
+# There is no mode switch. A turn cannot be served both ways -- the CLI runs its
+# own tool loop and cannot surface a caller-declared tool -- so `tools` on the
+# wire means the bridge, and the bridge has no workspace and produces no files.
+# A chat UI that wants downloads sends no tools (Open WebUI: Function Calling
+# "Native" -> "Default"), which is the second test below.
+
+
+@contextlib.contextmanager
+def _stub_runner(final_text="cli ok", new_outputs=None):
+    """Replace RUNNER.run_collect for the duration, as instance attribute.
+
+    Same reasoning as test_no_tools_uses_agentic_path (the CLI path): other modules patch
+    ClaudeRunner at class level on import, so class-level patching here could be
+    shadowed or shadow them.
+    """
+
+    async def _stub_run_collect(prompt, session_key, **_kwargs):
+        events = []
+        if new_outputs is not None:
+            events.append(
+                StreamEvent(kind="system", raw={"new_outputs": [str(p) for p in new_outputs]})
+            )
+        return ClaudeResult(
+            session_uuid="u",
+            final_text=final_text,
+            input_tokens=1,
+            output_tokens=1,
+            events=events,
+        )
+
+    had_own = "run_collect" in RUNNER.__dict__
+    prev = RUNNER.__dict__.get("run_collect")
+    RUNNER.run_collect = _stub_run_collect
+    try:
+        yield
+    finally:
+        if had_own:
+            RUNNER.run_collect = prev
+        else:
+            del RUNNER.run_collect
+
+
+def _set_settings(monkeypatch, **extra):
+    monkeypatch.setattr(
+        src_main, "SETTINGS", dataclasses.replace(src_main.SETTINGS, **extra)
+    )
+
+
+def test_every_tools_request_stays_on_the_bridge(bridge, monkeypatch):
+    """Explicit assertion of the promise the other 14 tests rely on.
+
+    Unconditional: no setting relaxes it. Clients that own their agent loop
+    (the Vercel AI SDK, LangChain) depend on getting a tool_call back rather
+    than prose, and dropping their tools to run the CLI would break the loop on
+    its opening turn.
+    """
+    capture = bridge(_anthropic_tool_use_response())
+    with _stub_runner():
+        r = _post(
+            {
+                "model": "claude-haiku-4-5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [WEB_SEARCH_TOOL],
+            }
+        )
+    assert r.status_code == 200
+    assert len(capture.requests) == 1
+    assert r.json()["choices"][0]["message"]["tool_calls"]
+
+
+def test_a_toolless_request_gets_a_clickable_download_link(bridge, monkeypatch, tmp_path):
+    """The end-to-end goal, in the shape Open WebUI sends once Function Calling
+    is set to "Default": no tools on the wire, a file produced, a link in the
+    reply. This is the supported route to downloads from a chat UI."""
+    capture = bridge()
+    _set_settings(
+        monkeypatch,
+        public_base_url="https://wrapper.example",
+        download_signing_key="k" * 32,
+        download_url_ttl_seconds=3600,
+    )
+    out = tmp_path / "report.csv"
+    out.write_text("a,b\n1,2\n")
+    with _stub_runner(final_text="done", new_outputs=[out]):
+        r = _post(
+            {
+                "model": "claude-haiku-4-5",
+                "messages": [{"role": "user", "content": "make me a csv"}],
+            }
+        )
+    assert r.status_code == 200
+    assert capture.requests == []
+    content = r.json()["choices"][0]["message"]["content"]
+    assert re.search(
+        r"\[report\.csv\]\(https://wrapper\.example/v1/files/file-[0-9a-f]{32}/content"
+        r"\?exp=\d+&sig=[A-Za-z0-9_-]+\)",
+        content,
+    ), content
+
+
 def test_oauth_auth_headers(bridge, monkeypatch, tmp_path):
     capture = bridge(_anthropic_tool_use_response())
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -471,7 +577,7 @@ def test_oauth_auth_headers(bridge, monkeypatch, tmp_path):
 #
 # A request may declare tools AND response_format: AI SDK clients do this when a
 # structured-output call is allowed to call tools first. The bridge path is
-# chosen before the agentic path's JSON-mode handling ever runs, so it has to
+# chosen before the CLI path's JSON-mode handling ever runs, so it has to
 # apply the output-format instruction and the raw-JSON reduction itself —
 # otherwise the client JSON.parses a fenced or prose-wrapped body and dies.
 

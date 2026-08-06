@@ -195,6 +195,45 @@ class Settings:
             openwebui_api_key=os.environ.get("OPENWEBUI_API_KEY", ""),
             openwebui_default_collection=os.environ.get("OPENWEBUI_DEFAULT_COLLECTION", ""),
             pdf_inline_max_chars=int(os.environ.get("CLAUDE_WRAPPER_PDF_INLINE_MAX_CHARS", "0")),
+            # Reasoning effort forwarded to `claude --effort`. Empty means
+            # "don't pass the flag" (use the CLI's own default).
+            effort=os.environ.get("CLAUDE_WRAPPER_EFFORT", "").strip(),
+            # Per-conversation token cap. The session allowance can be set
+            # directly (CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE) or derived from a
+            # named subscription plan (CLAUDE_WRAPPER_SESSION_PLAN=pro|max_5x|
+            # max_20x); an explicit allowance wins. A conversation may spend
+            # `allowance × percent` tokens before the wrapper pauses to ask
+            # whether to continue. Allowance 0 disables the cap.
+            session_token_allowance=_resolve_session_allowance()[0],
+            session_block_percent=_float_env("CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT", 5.0),
+            session_plan=_resolve_session_allowance()[1],
+            budget_continue_keywords=_keyword_set(
+                os.environ.get(
+                    "CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD",
+                    "continue,proceed,keep going,go on,yes",
+                )
+            ),
+            # Interactive clarification protocol. On by default for chat/responses
+            # so Claude asks answerable questions and pauses, rather than firing a
+            # dead AskUserQuestion card or asking-then-proceeding. Delegated task
+            # endpoints (audio/images/etc.) never opt in.
+            clarify_enabled=_bool_env("CLAUDE_WRAPPER_CLARIFY", True),
+            clarify_system_prompt=(
+                os.environ.get("CLAUDE_WRAPPER_CLARIFY_PROMPT", "").strip()
+                or DEFAULT_CLARIFY_SYSTEM_PROMPT
+            ),
+            clarify_disallowed_tools=tuple(
+                t.strip()
+                for t in os.environ.get(
+                    "CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS", "AskUserQuestion"
+                ).split(",")
+                if t.strip()
+            ),
+            # Add `--include-partial-messages` so Claude Code emits incremental
+            # text/thinking deltas (live token-by-token streaming) instead of one
+            # whole block per step. On by default; set CLAUDE_WRAPPER_STREAM_PARTIAL
+            # =off to fall back to whole-block events.
+            stream_partial_messages=_bool_env("CLAUDE_WRAPPER_STREAM_PARTIAL", True),
         )
 
 

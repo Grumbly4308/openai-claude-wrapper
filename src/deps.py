@@ -40,6 +40,9 @@ RUNNER = ClaudeRunner(
     # Empty when CLAUDE_WRAPPER_CLARIFY=off, which makes clarify=True a no-op.
     clarify_system_prompt=SETTINGS.clarify_system_prompt if SETTINGS.clarify_enabled else "",
     clarify_disallowed_tools=SETTINGS.clarify_disallowed_tools if SETTINGS.clarify_enabled else (),
+    # Empty when CLAUDE_WRAPPER_WORKSPACE_HINT=off, which makes
+    # workspace_hint=True a no-op.
+    workspace_system_prompt=SETTINGS.workspace_system_prompt if SETTINGS.workspace_hint_enabled else "",
     stream_partial_messages=SETTINGS.stream_partial_messages,
 )
 PREPARER = MessagePreparer(FILE_STORE, SETTINGS.workspace_dir, registry=SESSIONS)

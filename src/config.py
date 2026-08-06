@@ -62,6 +62,36 @@ DEFAULT_CLARIFY_SYSTEM_PROMPT = (
 )
 
 
+# Injected (via `claude --append-system-prompt`) on interactive chat/responses
+# requests so Claude knows the files it writes are actually delivered to the
+# user. Without it Claude has no reason to prefer writing a file over pasting
+# the contents inline, and the download-link feature mostly never fires.
+# Override with CLAUDE_WRAPPER_WORKSPACE_PROMPT; turn it off with
+# CLAUDE_WRAPPER_WORKSPACE_HINT=off.
+#
+# HARD CONSTRAINT on this text: it must contain no "json schema" marker. It
+# travels as a CLI argument and is never concatenated into the prompt, so today
+# it cannot flip the prompt-declared-JSON sniff (json_mode.prompt_requests_json)
+# — but keep it schema-free so a future refactor that does concatenate it stays
+# safe.
+DEFAULT_WORKSPACE_SYSTEM_PROMPT = (
+    "Workspace protocol. Your current working directory is a private, "
+    "per-conversation workspace, and it is wired to the user: any file you "
+    "create or modify there is captured after your turn and handed back to them "
+    "as a download link appended to your reply. So when the user asks for a "
+    "document, spreadsheet, dataset, script, diagram or image, WRITE IT TO A "
+    "FILE in the working directory with a short descriptive filename and a "
+    "correct extension, and do not also paste the full contents into your reply "
+    "— summarize what you produced in a sentence or two and let the link carry "
+    "the artifact. Short snippets the user clearly wants to read inline (a few "
+    "lines of code, a command, a brief answer) stay in the reply as usual. Keep "
+    "scratch and intermediate files out of the delivery: put them under a "
+    "dot-prefixed directory such as `.scratch/` (dot-prefixed paths are never "
+    "delivered), and never write into `uploads/`, which holds the user's own "
+    "attachments."
+)
+
+
 # Subscription-plan → per-session token allowance.
 #
 # Anthropic does NOT publish a token figure for the Pro/Max session windows, so
@@ -158,6 +188,8 @@ class Settings:
     clarify_enabled: bool
     clarify_system_prompt: str
     clarify_disallowed_tools: tuple[str, ...]
+    workspace_hint_enabled: bool
+    workspace_system_prompt: str
     stream_partial_messages: bool
 
     @property
@@ -269,6 +301,14 @@ class Settings:
                     "CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS", "AskUserQuestion"
                 ).split(",")
                 if t.strip()
+            ),
+            # Tell Claude its cwd is a workspace whose new files are delivered
+            # to the user as download links. On by default for chat/responses;
+            # delegated task endpoints (audio/images/etc.) never opt in.
+            workspace_hint_enabled=_bool_env("CLAUDE_WRAPPER_WORKSPACE_HINT", True),
+            workspace_system_prompt=(
+                os.environ.get("CLAUDE_WRAPPER_WORKSPACE_PROMPT", "").strip()
+                or DEFAULT_WORKSPACE_SYSTEM_PROMPT
             ),
             # Add `--include-partial-messages` so Claude Code emits incremental
             # text/thinking deltas (live token-by-token streaming) instead of one

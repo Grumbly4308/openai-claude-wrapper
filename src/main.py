@@ -622,7 +622,7 @@ async def _sync_response(
     run_model, effort = split_model_effort(model)
     result = await RUNNER.run_collect(
         prompt=prompt, session_key=session_key, model=run_model, effort=effort,
-        clarify=_resolve_clarify(req),
+        clarify=_resolve_clarify(req), workspace_hint=_resolve_workspace_hint(req),
     )
 
     if result.error and not result.final_text:
@@ -708,6 +708,7 @@ async def _stream_response(
     created = int(time.time())
     run_model, effort = split_model_effort(model)
     clarify = _resolve_clarify(req)
+    workspace_hint = _resolve_workspace_hint(req)
 
     # JSON mode: the client parses the concatenated content as JSON, so nothing
     # non-JSON may enter the content stream — no reasoning/progress frames, no
@@ -788,7 +789,8 @@ async def _stream_response(
     async def _pump() -> None:
         try:
             async for evt in RUNNER.run_stream(
-                prompt=prompt, session_key=session_key, model=run_model, effort=effort, clarify=clarify
+                prompt=prompt, session_key=session_key, model=run_model, effort=effort,
+                clarify=clarify, workspace_hint=workspace_hint,
             ):
                 await queue.put(evt)
         except Exception as e:  # pragma: no cover - defensive
@@ -1071,6 +1073,18 @@ def _effort_info(run_model: str, requested_effort: Optional[str]) -> dict:
     return {"applied": applied or "cli-default", "source": source, "requested": requested_effort}
 
 
+def _resolve_workspace_hint(req) -> bool:
+    """Whether to tell Claude its cwd is a workspace that delivers new files.
+
+    JSON mode forces it OFF: a structured-output client wants the value in the
+    reply body, and a hint nudging Claude to put the deliverable in a file
+    instead would starve it. Same reasoning as _resolve_clarify. The server-level
+    switch is enforced in the runner (an empty configured prompt makes
+    workspace_hint=True a no-op).
+    """
+    return not _wants_json(req)
+
+
 def _resolve_clarify(req) -> bool:
     """Per-request intent for the interactive clarification protocol.
 
@@ -1235,7 +1249,7 @@ async def _responses_sync(
     run_model, effort = split_model_effort(model)
     result = await RUNNER.run_collect(
         prompt=prompt, session_key=session_key, model=run_model, effort=effort,
-        clarify=_resolve_clarify(rreq),
+        clarify=_resolve_clarify(rreq), workspace_hint=_resolve_workspace_hint(rreq),
     )
     if result.error and not result.final_text:
         raise HTTPException(status_code=502, detail=f"claude failed: {result.error}")
@@ -1298,6 +1312,7 @@ async def _responses_stream(
 ) -> AsyncIterator[bytes]:
     run_model, effort = split_model_effort(model)
     clarify = _resolve_clarify(rreq)
+    workspace_hint = _resolve_workspace_hint(rreq)
     created = int(time.time())
     item_id = f"msg_{uuid.uuid4().hex[:24]}"
     seq = 0
@@ -1350,7 +1365,8 @@ async def _responses_stream(
     async def _pump() -> None:
         try:
             async for evt in RUNNER.run_stream(
-                prompt=prompt, session_key=session_key, model=run_model, effort=effort, clarify=clarify
+                prompt=prompt, session_key=session_key, model=run_model, effort=effort,
+                clarify=clarify, workspace_hint=workspace_hint,
             ):
                 await queue.put(evt)
         except Exception as e:  # pragma: no cover - defensive

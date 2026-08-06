@@ -74,6 +74,12 @@ services:
       # cost of the client's tools being ignored on those turns.
       CLAUDE_WRAPPER_TOOLS_MODE: "${CLAUDE_WRAPPER_TOOLS_MODE:-bridge}"
 
+      # Tell Claude its working directory is a workspace whose new files are
+      # delivered to the user as download links, so it writes deliverables to
+      # files instead of pasting them inline. Set "off" to disable.
+      CLAUDE_WRAPPER_WORKSPACE_HINT: "${CLAUDE_WRAPPER_WORKSPACE_HINT:-on}"
+      CLAUDE_WRAPPER_WORKSPACE_PROMPT: "${CLAUDE_WRAPPER_WORKSPACE_PROMPT:-}"
+
       CLAUDE_WRAPPER_DEFAULT_MODEL: "${CLAUDE_WRAPPER_DEFAULT_MODEL:-claude-opus-4-8}"
 
       # Reasoning effort forwarded to every `claude` invocation: low | medium |

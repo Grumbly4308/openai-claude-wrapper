@@ -465,6 +465,15 @@ Two things have to be true, and both have safe defaults:
   links. Links expire after `CLAUDE_WRAPPER_DOWNLOAD_URL_TTL` seconds
   (default 30 days; `0` = never).
 
+### Getting Claude to write a file at all
+
+`CLAUDE_WRAPPER_WORKSPACE_HINT` (on by default) tells Claude that its working
+directory is delivered to the user, so it writes a requested document or dataset
+to a file instead of pasting the whole thing into the reply. Without it Claude
+has no way to know the file goes anywhere, and mostly won't create one. It is
+forced off for JSON-mode requests, where the client wants the value in the reply
+body. Override the text with `CLAUDE_WRAPPER_WORKSPACE_PROMPT`.
+
 ### If your client sends `tools` (Open WebUI native function calling)
 
 A request that declares `tools` is served by the **tool bridge**, which calls the

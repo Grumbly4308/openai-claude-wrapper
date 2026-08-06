@@ -3,10 +3,13 @@
 .env
 .env.*
 data/
+inbox/
 **/__pycache__
 **/*.pyc
 .venv/
 node_modules/
 README.md
 docker-compose.yml
+docker-compose.*.yml
+deploy/
 *.log

@@ -31,23 +31,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # ---- stub ClaudeRunner before importing the FastAPI app ----
 from src.claude_runner import ClaudeResult, ClaudeRunner, StreamEvent  # noqa: E402
 
-# Per-test knobs: what the stub model replies, and what prompt it received.
+# Per-test knobs: what the stub model replies, what prompt it received, and
+# which files the run "generated" (paths that must exist on disk — the wrapper
+# skips anything it cannot stat).
 _STATE = {
     "final_text": "",
     "stream_texts": [],
     "last_prompt": "",
+    "new_outputs": [],
 }
 
 
 async def _stub_run_collect(self, prompt, session_key, model=None, effort=None, **_kwargs):
     _STATE["last_prompt"] = prompt
+    events = []
+    if _STATE["new_outputs"]:
+        events.append(StreamEvent(kind="system", raw={"new_outputs": list(_STATE["new_outputs"])}))
     return ClaudeResult(
         session_uuid="stub-uuid",
         final_text=_STATE["final_text"],
         stop_reason="stop",
         input_tokens=1,
         output_tokens=1,
-        events=[],
+        events=events,
     )
 
 
@@ -58,7 +64,12 @@ async def _stub_run_stream(self, prompt, session_key, model=None, effort=None, *
         yield StreamEvent(kind="text", text=piece)
     yield StreamEvent(
         kind="final",
-        raw={"stop_reason": "stop", "new_outputs": [], "input_tokens": 1, "output_tokens": 1},
+        raw={
+            "stop_reason": "stop",
+            "new_outputs": list(_STATE["new_outputs"]),
+            "input_tokens": 1,
+            "output_tokens": 1,
+        },
     )
 
 
@@ -273,6 +284,128 @@ def test_stream_without_response_format_untouched() -> None:
     check("stream.plain_finish", finish == "stop")
 
 
+# ---------- the generated-file trailer vs. JSON mode ----------
+#
+# Every other stub in the suite reports new_outputs=[], so until now the
+# suppression branches had never been exercised with attachments actually
+# present — which is exactly how they got clobbered twice (#20/#21, restored by
+# c95c2f1 and 8854a17). These pin the contract with a real file in play:
+#
+#   real JSON mode  => never a trailer, at any of the four emission sites
+#   sniff-unfenced  => never a trailer (non-streaming only; there is no
+#                      unfencing on the streaming paths, by design)
+#   neither         => trailer present
+#
+# Registration into the file store stays unconditional either way; only the
+# markdown trailer is gated.
+
+_TRAILER = "Generated files:"
+
+
+def _generated(tmp_name="artifact.txt"):
+    p = Path(_TMP) / tmp_name
+    p.write_text("payload")
+    return [str(p)]
+
+
+def _responses(**extra):
+    body = {"model": "claude-opus-4-8", "input": "make me a file", **extra}
+    r = client.post("/v1/responses", json=body)
+    assert r.status_code == 200, r.text
+    return r
+
+
+def test_trailer_present_without_json_mode() -> None:
+    """Control case: the trailer only means something if it appears here."""
+    _STATE["new_outputs"] = _generated("plain-sync.txt")
+    _STATE["final_text"] = "here you go"
+    r = _chat([{"role": "user", "content": "make me a file"}])
+    content = r.json()["choices"][0]["message"]["content"]
+    check("trailer.sync_present", _TRAILER in content, note=content)
+
+    _STATE["stream_texts"] = ["here ", "you go"]
+    _STATE["new_outputs"] = _generated("plain-stream.txt")
+    r = _chat([{"role": "user", "content": "make me a file (stream)"}], stream=True)
+    content, _reasoning, _finish = _parse_sse(r.text)
+    check("trailer.stream_present", _TRAILER in content, note=content)
+    _STATE["stream_texts"] = []
+    _STATE["new_outputs"] = []
+
+
+def test_trailer_suppressed_in_json_mode_all_sites() -> None:
+    raw = '{"a": 1}'
+
+    # chat, non-streaming
+    _STATE["new_outputs"] = _generated("json-sync.txt")
+    _STATE["final_text"] = raw
+    r = _chat(
+        [{"role": "user", "content": "make me a file"}],
+        response_format={"type": "json_object"},
+    )
+    content = r.json()["choices"][0]["message"]["content"]
+    check("trailer.json_sync_suppressed", _TRAILER not in content, note=content)
+    check("trailer.json_sync_parses", json.loads(content) == {"a": 1}, note=content)
+    # ...but the file is still registered and retrievable.
+    attachments = r.json()["choices"][0]["message"].get("attachments") or []
+    check("trailer.json_sync_still_registered", len(attachments) == 1, note=str(attachments))
+
+    # chat, streaming
+    _STATE["stream_texts"] = [raw]
+    _STATE["new_outputs"] = _generated("json-stream.txt")
+    r = _chat(
+        [{"role": "user", "content": "make me a file (stream)"}],
+        response_format={"type": "json_object"},
+        stream=True,
+    )
+    content, _reasoning, _finish = _parse_sse(r.text)
+    check("trailer.json_stream_suppressed", _TRAILER not in content, note=content)
+    check("trailer.json_stream_parses", json.loads(content) == {"a": 1}, note=content)
+    _STATE["stream_texts"] = []
+
+    # /v1/responses, non-streaming
+    _STATE["new_outputs"] = _generated("json-resp-sync.txt")
+    _STATE["final_text"] = raw
+    r = _responses(text={"format": {"type": "json_object"}})
+    text = json.dumps(r.json())
+    check("trailer.json_resp_sync_suppressed", _TRAILER not in text, note=text[:400])
+
+    # /v1/responses, streaming
+    _STATE["stream_texts"] = [raw]
+    _STATE["new_outputs"] = _generated("json-resp-stream.txt")
+    r = _responses(text={"format": {"type": "json_object"}}, stream=True)
+    check("trailer.json_resp_stream_suppressed", _TRAILER not in r.text, note=r.text[:400])
+    _STATE["stream_texts"] = []
+    _STATE["new_outputs"] = []
+
+
+def test_trailer_suppressed_when_a_sniffed_reply_is_unfenced() -> None:
+    # Prompt-declared JSON, non-streaming only: the unfencing that makes the
+    # reply parseable would be undone by appending markdown after it.
+    _STATE["new_outputs"] = _generated("sniff-sync.txt")
+    _STATE["final_text"] = '```json\n{"a": 1}\n```'
+    r = _chat([{"role": "user", "content": _SNIFFED}])
+    content = r.json()["choices"][0]["message"]["content"]
+    check("trailer.sniff_sync_suppressed", _TRAILER not in content, note=content)
+    check("trailer.sniff_sync_parses", json.loads(content) == {"a": 1}, note=content)
+
+    _STATE["new_outputs"] = _generated("sniff-resp.txt")
+    r = _responses(input=_SNIFFED)
+    text = json.dumps(r.json())
+    check("trailer.sniff_resp_sync_suppressed", _TRAILER not in text, note=text[:400])
+    _STATE["new_outputs"] = []
+
+
+def test_trailer_kept_when_the_sniff_did_not_unfence() -> None:
+    # The sniff matching is not enough: suppression requires the unfencing to
+    # have actually changed the text. A prose reply keeps its trailer.
+    _STATE["new_outputs"] = _generated("sniff-noop.txt")
+    _STATE["final_text"] = "I could not produce that."
+    r = _chat([{"role": "user", "content": _SNIFFED}])
+    content = r.json()["choices"][0]["message"]["content"]
+    check("trailer.sniff_noop_keeps_trailer", _TRAILER in content, note=content)
+    _STATE["new_outputs"] = []
+
+
 # ---------- runner ----------
 
 
@@ -286,6 +419,10 @@ def main() -> int:
         test_response_format_text_is_not_json_mode,
         test_stream_json_buffers_and_strips,
         test_stream_without_response_format_untouched,
+        test_trailer_present_without_json_mode,
+        test_trailer_suppressed_in_json_mode_all_sites,
+        test_trailer_suppressed_when_a_sniffed_reply_is_unfenced,
+        test_trailer_kept_when_the_sniff_did_not_unfence,
     ]
     for t in tests:
         try:

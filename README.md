@@ -28,11 +28,27 @@ Open `.env` and set anything you need:
 
 | Variable | Purpose |
 | --- | --- |
+| `CLAUDE_UID` / `CLAUDE_GID` | Uid/gid the container runs as. Must match the host account that owns any bind-mounted path. Defaults to `1000`. |
+| `CLAUDE_INBOX_DIR` | Host drop folder, bind-mounted read-only at `/data/inbox`. Defaults to `./inbox`. |
 | `CLAUDE_WRAPPER_API_KEYS` | Comma-separated bearer tokens clients must send. Leave blank on a trusted network. |
 | `CLAUDE_WRAPPER_PORT` | Host + container port. Defaults to `8000`. |
 | `CLAUDE_WRAPPER_DEFAULT_MODEL` | Used when a request sets `"model": "auto"`. |
 | `ANTHROPIC_API_KEY` | Skip the interactive login — use API key auth instead. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | Skip the interactive login — use a pre-minted OAuth token. |
+
+Set `CLAUDE_UID` / `CLAUDE_GID` first, before you build. The container
+runs unprivileged as an in-image `claude` user, and that uid has to
+match the host account owning the inbox (and the credentials file, if
+you use the overlay in [Auth](#auth)) — otherwise the container reads
+those paths as a stranger and mode-600 files are simply unreadable:
+
+```bash
+id -u   # -> CLAUDE_UID
+id -g   # -> CLAUDE_GID
+```
+
+These are baked into the image at build time, so changing them later
+needs `docker compose up -d --build`, not just a restart.
 
 If both `ANTHROPIC_API_KEY` and a persisted OAuth login are set, the
 env var wins. Most users should leave the auth vars blank and run the
@@ -355,6 +371,32 @@ before Claude Code is invoked, so Claude can open them with its `Read`
 tool (including images, PDFs, audio, and video — use ffmpeg inside the
 container for the latter).
 
+### Host drop folder (`/data/inbox`)
+
+Some clients (Open WebUI in particular) extract a document to text
+before it ever reaches the wrapper, so Claude sees the client's
+transcription rather than the file. The inbox sidesteps that: whatever
+you put in `CLAUDE_INBOX_DIR` on the host appears read-only inside the
+container at `/data/inbox`, and Claude reads the real bytes.
+
+```bash
+cp report.pdf ./inbox/          # CLAUDE_INBOX_DIR on the host
+```
+
+Then just name the path in chat:
+
+> "Read /data/inbox/report.pdf and summarise section 3."
+
+Two requirements, both easy to get wrong:
+
+- **The host path must already exist.** Docker creates a missing bind
+  source as a *root-owned* directory, which the container then can't
+  read.
+- **It must be readable by `CLAUDE_UID`** (see [1. Configure](#1-configure)).
+
+The mount is read-only, so Claude can't modify or delete anything you
+drop there; it writes results to the session workspace as usual.
+
 ### Upload a file
 
 ```bash
@@ -533,6 +575,26 @@ itself to Anthropic. In order of preference:
 - **Env vars.** Set `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` in
   `.env`. Takes precedence over nothing; skip if you've done the
   interactive login.
+- **Share the host account's login.** If the host already has a Claude
+  Code login you'd rather reuse, point `CLAUDE_HOST_CREDENTIALS` at its
+  `~/.claude/.credentials.json` and add the optional overlay:
+
+  ```bash
+  docker compose -f docker-compose.yml -f docker-compose.host-credentials.yml up -d
+  ```
+
+  This bind-mounts that single file read-only. Because it's one file
+  rather than a directory, an in-container token refresh can't replace
+  the inode — refreshes have to happen host-side, and an expired token
+  means logging in again *on the host*. The file is mode 600, so
+  `CLAUDE_UID` must match its owner. Prefer the container's own login
+  for anything long-running or headless.
+
+  Note this is a deliberately narrow mount. Bind-mounting the host's
+  whole `~/.claude` instead co-mingles its live daemon, session locks,
+  and 700-mode sessions dir, which breaks `claude --resume`: the first
+  turn of a chat succeeds and every follow-up fails with
+  `error_during_execution`.
 
 Entrypoint subcommands available via `docker compose run --rm -it
 claude-wrapper <cmd>`:
@@ -558,6 +620,15 @@ The compose file mounts two named volumes:
   per-session workspaces).
 - `claude-home` → `/home/claude/.claude` (Claude Code's own state,
   including the OAuth credentials from `login` / `setup-token`).
+
+…plus one host bind mount:
+
+- `${CLAUDE_INBOX_DIR:-./inbox}` → `/data/inbox`, read-only. See
+  [Host drop folder](#host-drop-folder-datainbox).
+
+The container runs unprivileged as `CLAUDE_UID:CLAUDE_GID` with
+`cap_drop: ALL` and `no-new-privileges`, so everything it touches on the
+host must be readable by that uid.
 
 ## Supported models
 

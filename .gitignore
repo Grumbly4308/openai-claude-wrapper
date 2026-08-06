@@ -2,6 +2,10 @@
 .env.*
 !.env.example
 
+# Default host drop folder (CLAUDE_INBOX_DIR). Track the dir, not the files.
+inbox/*
+!inbox/.gitkeep
+
 __pycache__/
 *.py[cod]
 *$py.class

@@ -2,6 +2,10 @@
 #
 # fix-claude-home-mount.sh — repair durable `claude --resume` on the prod host.
 #
+# HISTORICAL — this fix is already applied; the preflight below will refuse to
+# run. It also predates the unprivileged deployment (it assumes a /root-owned
+# compose dir and hardcodes uid 1000). See deploy/README.md. Safe to delete.
+#
 # ROOT CAUSE
 #   The persistence volume `claude-home` is mounted at /root/.claude, but the
 #   container runs as user `claude` (HOME=/home/claude). Claude Code therefore

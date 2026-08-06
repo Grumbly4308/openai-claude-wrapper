@@ -270,6 +270,17 @@ def test_missing_and_bad_signatures_are_rejected(monkeypatch, stored_file):
     assert bad.json()["detail"] == "invalid or expired download link"
 
 
+def test_non_ascii_signature_is_a_401_not_a_500(monkeypatch, stored_file):
+    # hmac.compare_digest raises TypeError on a non-ASCII str. This is the one
+    # route reachable without a credential, so a mangled link has to fail closed
+    # with a 401 rather than a traceback per request. Needs an unexpired exp to
+    # get past the earlier short-circuits and actually reach the compare.
+    _require_auth(monkeypatch)
+    bad = _get(stored_file.id, "?exp=99999999999&sig=%C3%A9")
+    assert bad.status_code == 401
+    assert bad.json()["detail"] == "invalid or expired download link"
+
+
 def test_expired_signature_is_rejected_by_the_route(monkeypatch, stored_file):
     _require_auth(monkeypatch)
     past = int(time.time()) - 60

@@ -45,7 +45,11 @@ def mint(file_id: str, key: str, ttl: int) -> str:
 
 def verify(file_id: str, exp_raw: Optional[str], sig: Optional[str], key: str) -> bool:
     """Whether (exp, sig) is a valid, unexpired capability for `file_id`."""
-    if not (key and sig and exp_raw):
+    # `sig` arrives percent-decoded off the query string and can hold anything.
+    # hmac.compare_digest raises TypeError on a non-ASCII str, and this is the
+    # one route reachable without a credential — so a mangled link would turn
+    # into a 500 and a traceback per request instead of a clean 401.
+    if not (key and sig and exp_raw) or not sig.isascii():
         return False
     try:
         exp = int(exp_raw)

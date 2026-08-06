@@ -227,14 +227,36 @@ class Settings:
         # Signing key for download links. An explicit key wins; otherwise derive
         # one deterministically from the configured API keys, so it is stable
         # across workers (compose exposes CLAUDE_WRAPPER_WORKERS) and restarts
-        # with zero operator configuration, needs no state on disk, and rotating
-        # an API key invalidates outstanding links. Empty when no API keys are
-        # set: auth is off in that deployment, so links need no signature.
+        # with zero operator configuration and no state on disk. Empty when no
+        # API keys are set: auth is off in that deployment, so links need no
+        # signature.
+        #
+        # The derivation is deliberately EXPENSIVE. A signed link is a
+        # (file_id, exp, sig) triple published into chat text, shared-chat
+        # exports, browser history and proxy logs — i.e. a known MAC pair over
+        # this key. A single cheap hash would make any leaked link an offline
+        # oracle for CLAUDE_WRAPPER_API_KEYS itself, at millions of guesses per
+        # second, which is exactly the full-privilege escalation the per-file
+        # capability exists to avoid. scrypt runs once at boot (~50ms, unnoticed
+        # by the operator) and is memory-hard, so it does not parallelise onto a
+        # GPU the way SHA-256 does.
+        #
+        # This raises the cost of a weak API key; it does not make one safe. The
+        # salt is a fixed domain string (there is no disk state to hold a random
+        # one), so set CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY to 32 random bytes if
+        # you want the link secret fully independent of your API keys — that
+        # also stops an API-key rotation invalidating every outstanding link.
         dl_key = os.environ.get("CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY", "").strip()
         if not dl_key and keys:
-            dl_key = hashlib.sha256(
-                b"claude-wrapper/download-key/v1\n" + "\n".join(sorted(keys)).encode()
-            ).hexdigest()
+            dl_key = hashlib.scrypt(
+                "\n".join(sorted(keys)).encode(),
+                salt=b"claude-wrapper/download-key/v2",
+                n=2**15,
+                r=8,
+                p=1,
+                maxmem=64 * 1024 * 1024,
+                dklen=32,
+            ).hex()
 
         for d in (data_dir, workspace, files, sessions):
             d.mkdir(parents=True, exist_ok=True)
@@ -303,9 +325,17 @@ class Settings:
                 if t.strip()
             ),
             # Tell Claude its cwd is a workspace whose new files are delivered
-            # to the user as download links. On by default for chat/responses;
-            # delegated task endpoints (audio/images/etc.) never opt in.
-            workspace_hint_enabled=_bool_env("CLAUDE_WRAPPER_WORKSPACE_HINT", True),
+            # to the user as download links.
+            #
+            # OFF by default, because it changes the SHAPE of the reply: it asks
+            # Claude to write the deliverable to a file and summarise instead of
+            # pasting it inline. That is right for a chat UI and wrong for every
+            # existing programmatic caller — run_chat_completion is shared by
+            # /v1/completions, /v1/assistants runs and the batches worker, so a
+            # script doing completions.create("write me a python script…") and
+            # reading choices[0].text would silently start getting "I wrote it
+            # to script.py" plus a link. Turn it on for chat-UI deployments.
+            workspace_hint_enabled=_bool_env("CLAUDE_WRAPPER_WORKSPACE_HINT", False),
             workspace_system_prompt=(
                 os.environ.get("CLAUDE_WRAPPER_WORKSPACE_PROMPT", "").strip()
                 or DEFAULT_WORKSPACE_SYSTEM_PROMPT

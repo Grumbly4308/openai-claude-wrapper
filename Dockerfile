@@ -40,10 +40,22 @@ COPY src /app/src
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
+# The in-container `claude` user's uid/gid MUST match the host user that owns
+# any bind-mounted paths (the inbox, a shared credentials file), otherwise the
+# container reads them as a stranger and 600-mode files are simply unreadable.
+# Override at build time to match the host account, e.g. for a host `claude`
+# at uid 1001:  docker compose build --build-arg CLAUDE_UID=1001 --build-arg CLAUDE_GID=1001
+# (docker-compose.yml wires these to CLAUDE_UID/CLAUDE_GID in .env for you.)
+ARG CLAUDE_UID=1000
+ARG CLAUDE_GID=1000
+
+# `node` occupies uid 1000 in the base image; remove it so that uid is free.
 RUN userdel -r node 2>/dev/null || true \
-    && useradd --create-home --shell /bin/bash --uid 1000 claude \
+    && (getent group "${CLAUDE_GID}" >/dev/null || groupadd --gid "${CLAUDE_GID}" claude) \
+    && useradd --create-home --shell /bin/bash \
+        --uid "${CLAUDE_UID}" --gid "${CLAUDE_GID}" claude \
     && mkdir -p /data/files /data/workspace /data/sessions /home/claude/.claude \
-    && chown -R claude:claude /app /data /home/claude
+    && chown -R "${CLAUDE_UID}:${CLAUDE_GID}" /app /data /home/claude
 
 USER claude
 

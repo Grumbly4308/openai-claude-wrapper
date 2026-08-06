@@ -3,9 +3,24 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Must match the HOST user that owns bind-mounted paths. Find it with
+        # `id -u` / `id -g` and set CLAUDE_UID / CLAUDE_GID in .env.
+        CLAUDE_UID: "${CLAUDE_UID:-1000}"
+        CLAUDE_GID: "${CLAUDE_GID:-1000}"
     image: claude-wrapper:latest
     container_name: claude-wrapper
     restart: unless-stopped
+    # Belt-and-braces: the image already ends on `USER claude`, but pinning the
+    # uid here means an image built with different args (or pulled from a
+    # registry) still runs unprivileged, and `docker compose run` inherits it.
+    user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
+    security_opt:
+      # Block setuid/setcap binaries inside the container from escalating —
+      # nothing here needs to gain privileges after startup.
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     # Default command: run the OpenAI-compatible API server.
     # Run a one-time login with:
     #   docker compose run --rm -it claude-wrapper login
@@ -77,21 +92,24 @@ services:
       # Host-side drop folder. Put files here on the host; reference them
       # in chat as /data/inbox/<file> so Claude reads the real bytes
       # instead of OWU's text extraction. Read-only by default.
-      - /home/vbox/inbox:/data/inbox:ro
+      #
+      # This MUST be a path that already exists and is readable by
+      # CLAUDE_UID above — Docker creates a missing bind source as a
+      # ROOT-OWNED directory, which the container then can't read.
+      - ${CLAUDE_INBOX_DIR:-./inbox}:/data/inbox:ro
       # Claude Code's own state. Sessions/projects/locks MUST stay isolated to
       # this container: bind-mounting the host's whole ~/.claude co-mingles its
       # live daemon, session locks and 700-mode sessions dir, which breaks
       # `claude --resume` — the first turn of a chat succeeds (it creates a
       # session) but every follow-up turn then fails with
       # `error_during_execution`. So Claude state lives in a container-local
-      # volume, and we share ONLY the login credential file so a host login /
-      # token refresh still propagates (the original point of the bind mount).
+      # volume, authenticated by its own one-time login:
       #
-      # If you authenticate via CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY env
-      # instead of a host login, drop the second line below (no host
-      # credentials file to share).
+      #   docker compose run --rm -it claude-wrapper login
+      #
+      # To instead share the HOST account's login, add the optional overlay:
+      #   docker compose -f docker-compose.yml -f docker-compose.host-credentials.yml up -d
       - claude-home:/home/claude/.claude
-      - ${CLAUDE_HOST_CREDENTIALS:-/home/vbox/.claude/.credentials.json}:/home/claude/.claude/.credentials.json
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CLAUDE_WRAPPER_PORT:-8000}/healthz"]
       interval: 30s

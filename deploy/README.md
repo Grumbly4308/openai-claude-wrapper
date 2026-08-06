@@ -1,5 +1,15 @@
 # Prod fix: durable `claude --resume`
 
+> **HISTORICAL — already applied. Do not run `fix-claude-home-mount.sh`.**
+>
+> Both parts below shipped: `docker-compose.yml` mounts `claude-home` at
+> `/home/claude/.claude`, and the `run_stream` self-heal is in
+> `src/claude_runner.py`. The script's preflight now fails by design (it can't
+> find the old `claude-home:/root/.claude` mount to rewrite). It also assumes a
+> `/root`-owned deployment, which no longer matches how this is deployed —
+> the compose stack runs unprivileged as `CLAUDE_UID`. Kept only as a record of
+> the root cause; safe to delete.
+
 Symptom: Open WebUI shows `TransferEncodingError: Not enough data to satisfy
 transfer length header` on **older** conversations — fast (a few seconds) and
 consistent for that chat, while new chats work.
@@ -38,7 +48,7 @@ first migrates the live (ephemeral) state into the volume so currently-working
 chats survive the cutover.
 
 ```bash
-# on the prod host (10.160.2.11):
+# on the prod host (historical — see the banner above):
 sudo REBUILD=1 deploy/fix-claude-home-mount.sh
 ```
 

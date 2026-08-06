@@ -262,6 +262,44 @@ async def _startup() -> None:
     else:
         log.info("interactive clarification DISABLED (CLAUDE_WRAPPER_CLARIFY=off)")
 
+    # Generated-file downloads. Same reasoning as the knowledge-base block above:
+    # every way this is misconfigured fails *quietly* — a link that renders as
+    # plain text, or never appears at all — and none of them say why. Three
+    # independent settings have to line up, so state all three at boot.
+    if SETTINGS.public_base_url:
+        link_base, base_src = SETTINGS.public_base_url, "CLAUDE_WRAPPER_PUBLIC_BASE_URL"
+    elif SETTINGS.derive_base_url:
+        link_base, base_src = "(derived per-request from the inbound Host)", "CLAUDE_WRAPPER_DERIVE_BASE_URL=on"
+    else:
+        link_base, base_src = "", ""
+    if link_base:
+        log.info(
+            "generated-file downloads ENABLED — link base=%s (%s), signing=%s, ttl=%s, workspace hint=%s",
+            link_base,
+            base_src,
+            "on" if SETTINGS.download_signing_key else "off (no API keys; route is unauthenticated)",
+            f"{SETTINGS.download_url_ttl_seconds}s" if SETTINGS.download_url_ttl_seconds else "never expires",
+            "on" if SETTINGS.workspace_hint_enabled else "OFF",
+        )
+        if not SETTINGS.workspace_hint_enabled:
+            log.warning(
+                "download links are configured but CLAUDE_WRAPPER_WORKSPACE_HINT is off, so "
+                "Claude is never told its files are delivered and will usually paste content "
+                "inline instead of writing a file. Set it on for a chat-UI deployment."
+            )
+        if not SETTINGS.public_base_url:
+            log.warning(
+                "CLAUDE_WRAPPER_PUBLIC_BASE_URL is unset, so link hosts are derived from each "
+                "request. Behind a chat UI that reaches this wrapper on an internal hostname "
+                "(e.g. http://claude-wrapper:8000) the links will not resolve in a browser. "
+                "Set it to the URL the BROWSER uses."
+            )
+    else:
+        log.info(
+            "generated-file downloads DISABLED — no CLAUDE_WRAPPER_PUBLIC_BASE_URL and "
+            "CLAUDE_WRAPPER_DERIVE_BASE_URL=off, so the file trailer stays plain text."
+        )
+
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:

@@ -453,14 +453,20 @@ def test_no_tools_uses_agentic_path(bridge):
     assert capture.requests == []
 
 
-# ---------- tools present: CLAUDE_WRAPPER_TOOLS_MODE decides who serves it ----------
+# ---------- tools present: always the bridge; no tools: always the CLI ----------
+#
+# There is no mode switch. A turn cannot be served both ways -- the CLI runs its
+# own tool loop and cannot surface a caller-declared tool -- so `tools` on the
+# wire means the bridge, and the bridge has no workspace and produces no files.
+# A chat UI that wants downloads sends no tools (Open WebUI: Function Calling
+# "Native" -> "Default"), which is the second test below.
 
 
 @contextlib.contextmanager
-def _stub_runner(final_text="agentic ok", new_outputs=None):
+def _stub_runner(final_text="cli ok", new_outputs=None):
     """Replace RUNNER.run_collect for the duration, as instance attribute.
 
-    Same reasoning as test_no_tools_uses_agentic_path: other modules patch
+    Same reasoning as test_no_tools_uses_agentic_path (the CLI path): other modules patch
     ClaudeRunner at class level on import, so class-level patching here could be
     shadowed or shadow them.
     """
@@ -491,16 +497,21 @@ def _stub_runner(final_text="agentic ok", new_outputs=None):
             del RUNNER.run_collect
 
 
-def _set_mode(monkeypatch, mode, **extra):
+def _set_settings(monkeypatch, **extra):
     monkeypatch.setattr(
-        src_main, "SETTINGS", dataclasses.replace(src_main.SETTINGS, tools_mode=mode, **extra)
+        src_main, "SETTINGS", dataclasses.replace(src_main.SETTINGS, **extra)
     )
 
 
-def test_default_mode_keeps_every_tools_request_on_the_bridge(bridge, monkeypatch):
-    """Explicit assertion of the back-compat promise the other 14 tests rely on."""
+def test_every_tools_request_stays_on_the_bridge(bridge, monkeypatch):
+    """Explicit assertion of the promise the other 14 tests rely on.
+
+    Unconditional: no setting relaxes it. Clients that own their agent loop
+    (the Vercel AI SDK, LangChain) depend on getting a tool_call back rather
+    than prose, and dropping their tools to run the CLI would break the loop on
+    its opening turn.
+    """
     capture = bridge(_anthropic_tool_use_response())
-    _set_mode(monkeypatch, "bridge")
     with _stub_runner():
         r = _post(
             {
@@ -514,76 +525,13 @@ def test_default_mode_keeps_every_tools_request_on_the_bridge(bridge, monkeypatc
     assert r.json()["choices"][0]["message"]["tool_calls"]
 
 
-def test_agentic_mode_runs_the_cli_for_an_offered_tool(bridge, monkeypatch):
-    capture = bridge()  # would raise IndexError if the bridge were hit
-    _set_mode(monkeypatch, "agentic")
-    with _stub_runner():
-        r = _post(
-            {
-                "model": "claude-haiku-4-5",
-                "messages": [{"role": "user", "content": "make me a csv"}],
-                "tools": [WEB_SEARCH_TOOL],
-            }
-        )
-    assert r.status_code == 200
-    msg = r.json()["choices"][0]["message"]
-    assert msg["content"] == "agentic ok"
-    assert "tool_calls" not in msg
-    assert capture.requests == []
-
-
-def test_agentic_mode_still_bridges_a_forced_call(bridge, monkeypatch):
-    capture = bridge(_anthropic_tool_use_response())
-    _set_mode(monkeypatch, "agentic")
-    with _stub_runner():
-        r = _post(
-            {
-                "model": "claude-haiku-4-5",
-                "messages": [{"role": "user", "content": "hi"}],
-                "tools": [WEB_SEARCH_TOOL],
-                "tool_choice": "required",
-            }
-        )
-    assert r.status_code == 200
-    assert len(capture.requests) == 1
-    assert r.json()["choices"][0]["message"]["tool_calls"]
-
-
-def test_agentic_mode_still_bridges_a_mid_loop_transcript(bridge, monkeypatch):
-    capture = bridge(_anthropic_tool_use_response())
-    _set_mode(monkeypatch, "agentic")
-    with _stub_runner():
-        r = _post(
-            {
-                "model": "claude-haiku-4-5",
-                "messages": [
-                    {"role": "user", "content": "search"},
-                    {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": "call_1",
-                                "type": "function",
-                                "function": {"name": "web_search", "arguments": '{"query":"x"}'},
-                            }
-                        ],
-                    },
-                    {"role": "tool", "tool_call_id": "call_1", "content": "results"},
-                ],
-                "tools": [WEB_SEARCH_TOOL],
-            }
-        )
-    assert r.status_code == 200
-    assert len(capture.requests) == 1
-
-
-def test_agentic_mode_tools_request_gets_a_clickable_download_link(bridge, monkeypatch, tmp_path):
-    """The end-to-end goal: tools on the wire, a file produced, a link in the reply."""
+def test_a_toolless_request_gets_a_clickable_download_link(bridge, monkeypatch, tmp_path):
+    """The end-to-end goal, in the shape Open WebUI sends once Function Calling
+    is set to "Default": no tools on the wire, a file produced, a link in the
+    reply. This is the supported route to downloads from a chat UI."""
     capture = bridge()
-    _set_mode(
+    _set_settings(
         monkeypatch,
-        "agentic",
         public_base_url="https://wrapper.example",
         download_signing_key="k" * 32,
         download_url_ttl_seconds=3600,
@@ -595,7 +543,6 @@ def test_agentic_mode_tools_request_gets_a_clickable_download_link(bridge, monke
             {
                 "model": "claude-haiku-4-5",
                 "messages": [{"role": "user", "content": "make me a csv"}],
-                "tools": [WEB_SEARCH_TOOL],
             }
         )
     assert r.status_code == 200
@@ -630,7 +577,7 @@ def test_oauth_auth_headers(bridge, monkeypatch, tmp_path):
 #
 # A request may declare tools AND response_format: AI SDK clients do this when a
 # structured-output call is allowed to call tools first. The bridge path is
-# chosen before the agentic path's JSON-mode handling ever runs, so it has to
+# chosen before the CLI path's JSON-mode handling ever runs, so it has to
 # apply the output-format instruction and the raw-JSON reduction itself —
 # otherwise the client JSON.parses a fenced or prose-wrapped body and dies.
 

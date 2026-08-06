@@ -27,7 +27,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import download_tokens, tool_bridge, tool_routing
+from . import download_tokens, tool_bridge
 from .config import SETTINGS, advertised_models, split_model_effort, supported_models
 from .converters import derive_session_id
 from .deps import (
@@ -489,18 +489,19 @@ def _log_request(kind: str, req: Any) -> None:
 async def run_chat_completion(req: ChatCompletionRequest):
     """Shared implementation reused by /v1/chat/completions, /v1/completions,
     and the batches worker."""
-    bridged = tool_routing.use_tool_bridge(req, SETTINGS.tools_mode)
-    _log_request("chat/completions" + (" [tool-bridge]" if bridged else ""), req)
-    # Function calling: a request that is contractually owed a tool_call — a
-    # forced tool_choice, or a transcript that ends mid-loop — is owned by the
-    # CLIENT's agent loop and served by the tool bridge (a direct Messages API
-    # call: no Claude Code CLI, no built-in tools, no session workspace, so no
-    # generated files). A request that merely *offers* tools on an opening turn
-    # is ambiguous, and who serves it is the operator's call
-    # (CLAUDE_WRAPPER_TOOLS_MODE, default "bridge" = always the bridge).
-    # On the CLI path the client's tools are dropped: the CLI cannot surface
-    # them. That is the price of "agentic", and why it is not the default.
-    if bridged:
+    _log_request("chat/completions" + (" [tool-bridge]" if req.tools else ""), req)
+    # Function calling: the CLIENT owns the agent loop, so the request is served
+    # by the tool bridge (a direct Messages API call) and stops at the tool_call.
+    # The bridge has no Claude Code CLI, hence no session workspace and no
+    # generated files — a tools-carrying turn cannot produce a download link.
+    #
+    # There is no way to serve one turn both ways: the CLI runs its own tool
+    # loop and cannot surface a caller-declared tool. So this is not a knob. A
+    # chat UI that wants file downloads should stop sending `tools` instead —
+    # in Open WebUI, set the model's Function Calling from "Native" to
+    # "Default", which makes it run its own tool-selection call and send a
+    # plain completion here. See README, "Generated files".
+    if req.tools:
         return await _tool_bridge_completion(req)
     prep = await _prepare_run(req)
     if isinstance(prep, _InstantReply):

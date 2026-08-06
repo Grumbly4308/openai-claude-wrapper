@@ -153,10 +153,9 @@ class ChatCompletionRequest(BaseModel):
     # the agent loop: the request is served by the tool bridge, which calls the
     # Anthropic Messages API directly (bypassing the Claude Code CLI — no
     # built-in tools, no internal loop, no session workspace) and returns
-    # tool_calls for the client to execute. Under
-    # CLAUDE_WRAPPER_TOOLS_MODE=agentic this applies only to turns that are owed
-    # a tool call (see tool_routing.py); other turns run the CLI and the tools
-    # are ignored.
+    # tool_calls for the client to execute. A tools-carrying turn therefore
+    # cannot generate files; a chat UI that wants downloads should send no
+    # tools (Open WebUI: Function Calling "Native" -> "Default").
     tools: Optional[list[ToolDef]] = None
     tool_choice: Optional[Union[str, dict[str, Any]]] = None
     parallel_tool_calls: Optional[bool] = None

@@ -66,14 +66,6 @@ services:
       # Link lifetime in seconds (default 30 days). 0 = never expires.
       CLAUDE_WRAPPER_DOWNLOAD_URL_TTL: "${CLAUDE_WRAPPER_DOWNLOAD_URL_TTL:-2592000}"
 
-      # Who serves a chat request that carries `tools`: "bridge" (default) sends
-      # every such request to the Anthropic Messages API, which has no CLI and
-      # therefore cannot generate files. "agentic" keeps only the turns that are
-      # owed a tool call on the bridge and runs the CLI for the rest, so a chat
-      # UI in native function-calling mode can still produce downloads — at the
-      # cost of the client's tools being ignored on those turns.
-      CLAUDE_WRAPPER_TOOLS_MODE: "${CLAUDE_WRAPPER_TOOLS_MODE:-bridge}"
-
       # Tell Claude its working directory is a workspace whose new files are
       # delivered to the user as download links, so it writes deliverables to
       # files instead of pasting them inline. Set "off" to disable.

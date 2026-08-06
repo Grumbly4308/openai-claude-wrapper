@@ -167,7 +167,6 @@ class Settings:
     api_keys: frozenset[str]
     require_auth: bool
     default_model: str
-    tools_mode: str
     claude_bin: str
     max_upload_bytes: int
     request_timeout_seconds: int
@@ -211,17 +210,6 @@ class Settings:
         raw_keys = os.environ.get("CLAUDE_WRAPPER_API_KEYS", "").strip()
         keys = frozenset(k.strip() for k in raw_keys.split(",") if k.strip())
         require = bool(keys)
-
-        # Who owns the agent loop for a tools-carrying chat request. "bridge"
-        # (the default) is the historical behavior: any request declaring tools
-        # goes to the tool bridge. "agentic" keeps only the turns that are owed
-        # a tool call on the bridge and runs the CLI for the rest, so a chat UI
-        # in native function-calling mode can still produce files. Resolved here
-        # rather than at the call site so an unknown value warns once at boot.
-        tools_mode = os.environ.get("CLAUDE_WRAPPER_TOOLS_MODE", "bridge").strip().lower() or "bridge"
-        if tools_mode not in ("bridge", "agentic"):
-            log.warning("unknown CLAUDE_WRAPPER_TOOLS_MODE=%r; using 'bridge'", tools_mode)
-            tools_mode = "bridge"
 
         # Signing key for download links. An explicit key wins; otherwise derive
         # one deterministically from the configured API keys, so it is stable
@@ -268,7 +256,6 @@ class Settings:
             api_keys=keys,
             require_auth=require,
             default_model=os.environ.get("CLAUDE_WRAPPER_DEFAULT_MODEL", "claude-opus-4-8"),
-            tools_mode=tools_mode,
             claude_bin=os.environ.get("CLAUDE_WRAPPER_CLAUDE_BIN", "claude"),
             max_upload_bytes=int(os.environ.get("CLAUDE_WRAPPER_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024))),
             request_timeout_seconds=int(os.environ.get("CLAUDE_WRAPPER_REQUEST_TIMEOUT", "1800")),

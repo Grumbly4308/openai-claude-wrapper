@@ -193,6 +193,54 @@ def test_response_format_text_is_not_json_mode() -> None:
     check("text_mode.content_verbatim", content == fenced, note=content)
 
 
+# ---------- prompt-declared JSON (no response_format on the wire) ----------
+#
+# Clients that put the schema in the prompt and JSON.parse the reply anyway
+# send nothing the wrapper can detect via response_format. The sniff heuristic
+# covers them: it requires BOTH a schema marker and an imperative, then asks
+# for an unfenced reply and strips any fence that slips through regardless.
+#
+# This path was silently lost once already (deleted by #20, un-restored by
+# #21's chat-path rewrite) without turning a single test red, so it is worth
+# pinning down on both the prompt and the response side.
+
+_SNIFFED = "Use this json schema: {\"a\": 1}. Respond with JSON only."
+
+
+def test_sniffed_prompt_gets_fence_hint() -> None:
+    _STATE["final_text"] = '{"a": 1}'
+    _chat([{"role": "user", "content": _SNIFFED}])
+    check("sniff.hint_in_prompt", "no markdown code fences" in _STATE["last_prompt"])
+    check("sniff.not_json_mode_instruction", "JSON Schema" not in _STATE["last_prompt"])
+
+
+def test_sniffed_reply_is_unfenced() -> None:
+    _STATE["final_text"] = '```json\n{"a": 1}\n```'
+    r = _chat([{"role": "user", "content": _SNIFFED}])
+    content = r.json()["choices"][0]["message"]["content"]
+    check("sniff.unfenced", json.loads(content) == {"a": 1}, note=content)
+
+
+def test_sniffed_reply_with_trailing_prose_is_unfenced() -> None:
+    # Claude habitually adds a closing sentence; strict fence-only matching
+    # misses that, so the lone-block rule has to catch it.
+    _STATE["final_text"] = 'Here you go:\n```json\n{"a": 1}\n```\nHope that helps!'
+    r = _chat([{"role": "user", "content": _SNIFFED}])
+    content = r.json()["choices"][0]["message"]["content"]
+    check("sniff.unfenced_sole_block", json.loads(content) == {"a": 1}, note=content)
+
+
+def test_unsniffed_prompt_keeps_fences_and_hint_out() -> None:
+    # A directive with no schema marker must NOT trip the sniff — ordinary
+    # chat that merely mentions JSON has to pass through byte for byte.
+    fenced = 'Sure:\n```json\n{"a": 1}\n```'
+    _STATE["final_text"] = fenced
+    r = _chat([{"role": "user", "content": "Return a JSON object with a key"}])
+    content = r.json()["choices"][0]["message"]["content"]
+    check("nosniff.content_verbatim", content == fenced, note=content)
+    check("nosniff.no_hint", "no markdown code fences" not in _STATE["last_prompt"])
+
+
 # ---------- streaming path ----------
 
 

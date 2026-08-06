@@ -55,6 +55,14 @@ services:
       # wrapper on. Leave unset to fall back to the plain "file_id=…" block.
       CLAUDE_WRAPPER_PUBLIC_BASE_URL: "${CLAUDE_WRAPPER_PUBLIC_BASE_URL:-}"
 
+      # Who serves a chat request that carries `tools`: "bridge" (default) sends
+      # every such request to the Anthropic Messages API, which has no CLI and
+      # therefore cannot generate files. "agentic" keeps only the turns that are
+      # owed a tool call on the bridge and runs the CLI for the rest, so a chat
+      # UI in native function-calling mode can still produce downloads — at the
+      # cost of the client's tools being ignored on those turns.
+      CLAUDE_WRAPPER_TOOLS_MODE: "${CLAUDE_WRAPPER_TOOLS_MODE:-bridge}"
+
       CLAUDE_WRAPPER_DEFAULT_MODEL: "${CLAUDE_WRAPPER_DEFAULT_MODEL:-claude-opus-4-8}"
 
       # Reasoning effort forwarded to every `claude` invocation: low | medium |

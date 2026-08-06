@@ -27,7 +27,7 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import tool_bridge
+from . import tool_bridge, tool_routing
 from .config import SETTINGS, advertised_models, split_model_effort, supported_models
 from .converters import derive_session_id
 from .deps import FILE_STORE, PREPARER, RUNNER, USAGE_LEDGER, auth_dependency
@@ -495,13 +495,18 @@ def _log_request(kind: str, req: Any) -> None:
 async def run_chat_completion(req: ChatCompletionRequest):
     """Shared implementation reused by /v1/chat/completions, /v1/completions,
     and the batches worker."""
-    _log_request("chat/completions" + (" [tool-bridge]" if req.tools else ""), req)
-    # Function calling: a request that declares tools is owned by the CLIENT's
-    # agent loop, which is the opposite of the wrapper's agentic default. It is
-    # served by the tool bridge (a direct Messages API call — no Claude Code
-    # CLI, no built-in tools, no internal loop) and returns tool_calls for the
-    # client to execute. Requests without tools are untouched by this branch.
-    if req.tools:
+    bridged = tool_routing.use_tool_bridge(req, SETTINGS.tools_mode)
+    _log_request("chat/completions" + (" [tool-bridge]" if bridged else ""), req)
+    # Function calling: a request that is contractually owed a tool_call — a
+    # forced tool_choice, or a transcript that ends mid-loop — is owned by the
+    # CLIENT's agent loop and served by the tool bridge (a direct Messages API
+    # call: no Claude Code CLI, no built-in tools, no session workspace, so no
+    # generated files). A request that merely *offers* tools on an opening turn
+    # is ambiguous, and who serves it is the operator's call
+    # (CLAUDE_WRAPPER_TOOLS_MODE, default "bridge" = always the bridge).
+    # On the CLI path the client's tools are dropped: the CLI cannot surface
+    # them. That is the price of "agentic", and why it is not the default.
+    if bridged:
         return await _tool_bridge_completion(req)
     prep = await _prepare_run(req)
     if isinstance(prep, _InstantReply):

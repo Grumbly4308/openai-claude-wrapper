@@ -439,6 +439,28 @@ A typical prompt:
 …produces a response with a `file_id` the client can download with
 `GET /v1/files/{id}/content`.
 
+### If your client sends `tools` (Open WebUI native function calling)
+
+A request that declares `tools` is served by the **tool bridge**, which calls the
+Anthropic Messages API directly — no Claude Code CLI, so no workspace, no `Write`
+tool, and **no generated files on those turns**. Open WebUI in *Native* function
+calling mode sends its whole tool roster on every message, so this silently
+disables file downloads for the entire chat.
+
+Two ways out:
+
+- **Preferred, zero config:** in Open WebUI set the model's **Function Calling**
+  setting from **Native** to **Default**. Open WebUI then runs its own
+  tool-selection call and sends no `tools[]` on the completion. The CLI path
+  works as normal, downloads included, with function calling fully intact.
+- **`CLAUDE_WRAPPER_TOOLS_MODE=agentic`:** only turns actually *owed* a tool call
+  (a forced `tool_choice`, or a transcript ending mid-loop) go to the bridge;
+  everything else runs the CLI. The tradeoff is real: on those CLI turns the
+  client's tools are silently dropped, because the CLI cannot surface them. A
+  genuine agentic client offering a tool on an opening turn gets prose rather
+  than a `tool_call` — legal OpenAI, but a behavior change. That is why the
+  default stays `bridge`.
+
 ## Conversation continuity
 
 OpenAI's Chat Completions API is stateless — the client sends the full
@@ -658,9 +680,13 @@ are account-side and cannot be set by the wrapper.
 
 ## Limitations
 
-- No tool-calling over the OpenAI function/tool surface — Claude Code
-  manages its own tools internally (Read/Write/Bash/etc.) and surfaces
-  only the final assistant text.
+- A single turn can serve the client's tools or run Claude Code, never both.
+  Requests carrying `tools` go to the tool bridge (Messages API, `tool_calls`
+  returned, no CLI and therefore no generated files); requests without them run
+  the agentic CLI path, where Claude manages its own tools internally
+  (Read/Write/Bash/etc.) and only the final assistant text is surfaced. See
+  "Generated files" for `CLAUDE_WRAPPER_TOOLS_MODE` and the Open WebUI setting
+  that avoids the choice entirely.
 - Fine-tuning endpoints return 501: Claude models aren't user-tunable
   through this path. Use `/v1/assistants` to save per-customer
   instructions instead.

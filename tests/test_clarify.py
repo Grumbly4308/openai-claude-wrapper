@@ -63,6 +63,21 @@ def test_clarify_argv_noop_when_globally_disabled() -> None:
     assert "--disallowedTools" not in argv
 
 
+def test_tools_mode_config_parsing() -> None:
+    prev = os.environ.get("CLAUDE_WRAPPER_TOOLS_MODE")
+    try:
+        assert Settings.from_env().tools_mode == "bridge"  # default
+        os.environ["CLAUDE_WRAPPER_TOOLS_MODE"] = "AGENTIC"
+        assert Settings.from_env().tools_mode == "agentic"  # case-insensitive
+        os.environ["CLAUDE_WRAPPER_TOOLS_MODE"] = "nonsense"
+        assert Settings.from_env().tools_mode == "bridge"  # unknown warns, falls back
+    finally:
+        if prev is None:
+            os.environ.pop("CLAUDE_WRAPPER_TOOLS_MODE", None)
+        else:
+            os.environ["CLAUDE_WRAPPER_TOOLS_MODE"] = prev
+
+
 def test_clarify_config_parsing() -> None:
     prev = os.environ.get("CLAUDE_WRAPPER_CLARIFY")
     try:

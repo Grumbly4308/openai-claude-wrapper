@@ -150,10 +150,13 @@ class ChatCompletionRequest(BaseModel):
     # AI SDK's generateObject (Vane, and other OpenAI-compatible clients).
     response_format: Optional[ResponseFormat] = None
     # OpenAI function calling. When `tools` is a non-empty list the CLIENT owns
-    # the agent loop: the request bypasses the Claude Code CLI entirely (no
-    # built-in tools, no internal loop) and is served by the tool bridge, which
-    # calls the Anthropic Messages API directly and returns tool_calls for the
-    # client to execute.
+    # the agent loop: the request is served by the tool bridge, which calls the
+    # Anthropic Messages API directly (bypassing the Claude Code CLI — no
+    # built-in tools, no internal loop, no session workspace) and returns
+    # tool_calls for the client to execute. Under
+    # CLAUDE_WRAPPER_TOOLS_MODE=agentic this applies only to turns that are owed
+    # a tool call (see tool_routing.py); other turns run the CLI and the tools
+    # are ignored.
     tools: Optional[list[ToolDef]] = None
     tool_choice: Optional[Union[str, dict[str, Any]]] = None
     parallel_tool_calls: Optional[bool] = None

@@ -9,6 +9,8 @@ bridge.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import json
 import os
 import sys
@@ -27,8 +29,9 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from src import main as src_main
 from src import tool_bridge
-from src.claude_runner import ClaudeResult
+from src.claude_runner import ClaudeResult, StreamEvent
 from src.deps import RUNNER
 from src.main import app
 
@@ -447,6 +450,131 @@ def test_no_tools_uses_agentic_path(bridge):
         else:
             del RUNNER.run_collect
     assert capture.requests == []
+
+
+# ---------- tools present: CLAUDE_WRAPPER_TOOLS_MODE decides who serves it ----------
+
+
+@contextlib.contextmanager
+def _stub_runner(final_text="agentic ok", new_outputs=None):
+    """Replace RUNNER.run_collect for the duration, as instance attribute.
+
+    Same reasoning as test_no_tools_uses_agentic_path: other modules patch
+    ClaudeRunner at class level on import, so class-level patching here could be
+    shadowed or shadow them.
+    """
+
+    async def _stub_run_collect(prompt, session_key, **_kwargs):
+        events = []
+        if new_outputs is not None:
+            events.append(
+                StreamEvent(kind="system", raw={"new_outputs": [str(p) for p in new_outputs]})
+            )
+        return ClaudeResult(
+            session_uuid="u",
+            final_text=final_text,
+            input_tokens=1,
+            output_tokens=1,
+            events=events,
+        )
+
+    had_own = "run_collect" in RUNNER.__dict__
+    prev = RUNNER.__dict__.get("run_collect")
+    RUNNER.run_collect = _stub_run_collect
+    try:
+        yield
+    finally:
+        if had_own:
+            RUNNER.run_collect = prev
+        else:
+            del RUNNER.run_collect
+
+
+def _set_mode(monkeypatch, mode, **extra):
+    monkeypatch.setattr(
+        src_main, "SETTINGS", dataclasses.replace(src_main.SETTINGS, tools_mode=mode, **extra)
+    )
+
+
+def test_default_mode_keeps_every_tools_request_on_the_bridge(bridge, monkeypatch):
+    """Explicit assertion of the back-compat promise the other 14 tests rely on."""
+    capture = bridge(_anthropic_tool_use_response())
+    _set_mode(monkeypatch, "bridge")
+    with _stub_runner():
+        r = _post(
+            {
+                "model": "claude-haiku-4-5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [WEB_SEARCH_TOOL],
+            }
+        )
+    assert r.status_code == 200
+    assert len(capture.requests) == 1
+    assert r.json()["choices"][0]["message"]["tool_calls"]
+
+
+def test_agentic_mode_runs_the_cli_for_an_offered_tool(bridge, monkeypatch):
+    capture = bridge()  # would raise IndexError if the bridge were hit
+    _set_mode(monkeypatch, "agentic")
+    with _stub_runner():
+        r = _post(
+            {
+                "model": "claude-haiku-4-5",
+                "messages": [{"role": "user", "content": "make me a csv"}],
+                "tools": [WEB_SEARCH_TOOL],
+            }
+        )
+    assert r.status_code == 200
+    msg = r.json()["choices"][0]["message"]
+    assert msg["content"] == "agentic ok"
+    assert "tool_calls" not in msg
+    assert capture.requests == []
+
+
+def test_agentic_mode_still_bridges_a_forced_call(bridge, monkeypatch):
+    capture = bridge(_anthropic_tool_use_response())
+    _set_mode(monkeypatch, "agentic")
+    with _stub_runner():
+        r = _post(
+            {
+                "model": "claude-haiku-4-5",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [WEB_SEARCH_TOOL],
+                "tool_choice": "required",
+            }
+        )
+    assert r.status_code == 200
+    assert len(capture.requests) == 1
+    assert r.json()["choices"][0]["message"]["tool_calls"]
+
+
+def test_agentic_mode_still_bridges_a_mid_loop_transcript(bridge, monkeypatch):
+    capture = bridge(_anthropic_tool_use_response())
+    _set_mode(monkeypatch, "agentic")
+    with _stub_runner():
+        r = _post(
+            {
+                "model": "claude-haiku-4-5",
+                "messages": [
+                    {"role": "user", "content": "search"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "web_search", "arguments": '{"query":"x"}'},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "results"},
+                ],
+                "tools": [WEB_SEARCH_TOOL],
+            }
+        )
+    assert r.status_code == 200
+    assert len(capture.requests) == 1
 
 
 def test_oauth_auth_headers(bridge, monkeypatch, tmp_path):

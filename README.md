@@ -422,22 +422,78 @@ client.chat.completions.create(
 
 ## Generated files (Claude writes binaries back)
 
-When Claude writes into `outputs/` in the session workspace, the wrapper
-detects the new files and:
+When Claude writes a file into the session workspace, the wrapper detects it
+and:
 
 1. Registers each one with `/v1/files` (`purpose=assistant_output`).
 2. Appends a "Generated files" block to the assistant message listing
-   each file's `file_id`, mime, and size.
+   each file as a markdown download link (mime, size, and `file_id`).
 3. If the request body sets `"inline_generated_files": true`, the raw
    bytes are included inline as base64 under `message.attachments[*].content_base64`.
+   (Non-streaming chat only — there is no field to carry them while streaming.)
 
 A typical prompt:
 
 > "Transcode the attached `.wav` to MP3 and write it to
 > `outputs/result.mp3`."
 
-…produces a response with a `file_id` the client can download with
-`GET /v1/files/{id}/content`.
+…produces a response with a link the user can click, plus a `file_id` the client
+can download with `GET /v1/files/{id}/content`.
+
+Files are excluded from delivery if they live under `uploads/` (the user's own
+attachments) or under any dot-prefixed path — so `.scratch/` is a free channel
+for intermediate work that shouldn't be handed back.
+
+### Making the link clickable
+
+Two things have to be true, and both have safe defaults:
+
+- **An absolute URL.** `CLAUDE_WRAPPER_PUBLIC_BASE_URL` wins whenever it is set.
+  Otherwise the wrapper derives the base from the request's own `Host` /
+  `X-Forwarded-Host` / `X-Forwarded-Proto` headers, which is correct behind a
+  typical reverse proxy and needs no configuration. Set
+  `CLAUDE_WRAPPER_DERIVE_BASE_URL=off` to go back to the old non-clickable
+  `→ file_id=…` text.
+- **Auth the browser can satisfy.** A link click sends no `Authorization`
+  header, so with `CLAUDE_WRAPPER_API_KEYS` set every download used to 401.
+  Each link now carries `?exp=…&sig=…`: an HMAC over exactly that one file id
+  and expiry. It grants reading that one blob — listing, metadata and delete
+  still require a real API key, and no API key ever appears in chat text.
+  The signing key defaults to one derived from `CLAUDE_WRAPPER_API_KEYS`
+  (stable across workers and restarts); set `CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY`
+  explicitly if you don't want an API-key rotation to invalidate outstanding
+  links. Links expire after `CLAUDE_WRAPPER_DOWNLOAD_URL_TTL` seconds
+  (default 30 days; `0` = never).
+
+### Getting Claude to write a file at all
+
+`CLAUDE_WRAPPER_WORKSPACE_HINT` (on by default) tells Claude that its working
+directory is delivered to the user, so it writes a requested document or dataset
+to a file instead of pasting the whole thing into the reply. Without it Claude
+has no way to know the file goes anywhere, and mostly won't create one. It is
+forced off for JSON-mode requests, where the client wants the value in the reply
+body. Override the text with `CLAUDE_WRAPPER_WORKSPACE_PROMPT`.
+
+### If your client sends `tools` (Open WebUI native function calling)
+
+A request that declares `tools` is served by the **tool bridge**, which calls the
+Anthropic Messages API directly — no Claude Code CLI, so no workspace, no `Write`
+tool, and **no generated files on those turns**. Open WebUI in *Native* function
+calling mode sends its whole tool roster on every message, so this silently
+disables file downloads for the entire chat.
+
+The fix is client-side, and needs no wrapper configuration: in Open WebUI set
+the model's **Function Calling** setting from **Native** to **Default**. Open
+WebUI then runs its own tool-selection call and sends no `tools[]` on the
+completion, so the request takes the CLI path — downloads work, and function
+calling stays fully intact.
+
+There is deliberately no wrapper-side switch for this. A single turn cannot be
+served both ways: the CLI runs its own tool loop and cannot surface a
+caller-declared tool. Routing a tools-carrying turn to the CLI anyway would
+silently drop the client's tools, so a real agentic client (the Vercel AI SDK,
+LangChain) offering a tool on its opening turn would get prose instead of a
+`tool_call` and its loop would stall on the first hop.
 
 ## Conversation continuity
 
@@ -658,9 +714,12 @@ are account-side and cannot be set by the wrapper.
 
 ## Limitations
 
-- No tool-calling over the OpenAI function/tool surface — Claude Code
-  manages its own tools internally (Read/Write/Bash/etc.) and surfaces
-  only the final assistant text.
+- A single turn can serve the client's tools or run Claude Code, never both.
+  Requests carrying `tools` go to the tool bridge (Messages API, `tool_calls`
+  returned, no CLI and therefore no generated files); requests without them run
+  the agentic CLI path, where Claude manages its own tools internally
+  (Read/Write/Bash/etc.) and only the final assistant text is surfaced. See
+  "Generated files" for the Open WebUI setting that avoids the choice entirely.
 - Fine-tuning endpoints return 501: Claude models aren't user-tunable
   through this path. Use `/v1/assistants` to save per-customer
   instructions instead.

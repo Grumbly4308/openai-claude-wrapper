@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -58,6 +59,35 @@ DEFAULT_CLARIFY_SYSTEM_PROMPT = (
     "message as the answers and continue from there. If the ambiguity is minor or "
     "the request is already clear, just proceed, stating any assumptions in one "
     "short line. Never ask more questions than necessary."
+)
+
+
+# Injected (via `claude --append-system-prompt`) on interactive chat/responses
+# requests so Claude knows the files it writes are actually delivered to the
+# user. Without it Claude has no reason to prefer writing a file over pasting
+# the contents inline, and the download-link feature mostly never fires.
+# Override with CLAUDE_WRAPPER_WORKSPACE_PROMPT; turn it off with
+# CLAUDE_WRAPPER_WORKSPACE_HINT=off.
+#
+# Keep this text free of "json schema" markers. It travels as a CLI argument
+# and is never concatenated into the prompt, so nothing reads it as a
+# structured-output declaration today — but staying schema-free keeps it inert
+# if a future refactor ever does concatenate it.
+DEFAULT_WORKSPACE_SYSTEM_PROMPT = (
+    "Workspace protocol. Your current working directory is a private, "
+    "per-conversation workspace, and it is wired to the user: any file you "
+    "create or modify there is captured after your turn and handed back to them "
+    "as a download link appended to your reply. So when the user asks for a "
+    "document, spreadsheet, dataset, script, diagram or image, WRITE IT TO A "
+    "FILE in the working directory with a short descriptive filename and a "
+    "correct extension, and do not also paste the full contents into your reply "
+    "— summarize what you produced in a sentence or two and let the link carry "
+    "the artifact. Short snippets the user clearly wants to read inline (a few "
+    "lines of code, a command, a brief answer) stay in the reply as usual. Keep "
+    "scratch and intermediate files out of the delivery: put them under a "
+    "dot-prefixed directory such as `.scratch/` (dot-prefixed paths are never "
+    "delivered), and never write into `uploads/`, which holds the user's own "
+    "attachments."
 )
 
 
@@ -141,6 +171,9 @@ class Settings:
     max_upload_bytes: int
     request_timeout_seconds: int
     public_base_url: str
+    derive_base_url: bool
+    download_signing_key: str
+    download_url_ttl_seconds: int
     openwebui_base_url: str
     openwebui_api_key: str
     openwebui_default_collection: str
@@ -153,6 +186,8 @@ class Settings:
     clarify_enabled: bool
     clarify_system_prompt: str
     clarify_disallowed_tools: tuple[str, ...]
+    workspace_hint_enabled: bool
+    workspace_system_prompt: str
     stream_partial_messages: bool
 
     @property
@@ -176,6 +211,40 @@ class Settings:
         keys = frozenset(k.strip() for k in raw_keys.split(",") if k.strip())
         require = bool(keys)
 
+        # Signing key for download links. An explicit key wins; otherwise derive
+        # one deterministically from the configured API keys, so it is stable
+        # across workers (compose exposes CLAUDE_WRAPPER_WORKERS) and restarts
+        # with zero operator configuration and no state on disk. Empty when no
+        # API keys are set: auth is off in that deployment, so links need no
+        # signature.
+        #
+        # The derivation is deliberately EXPENSIVE. A signed link is a
+        # (file_id, exp, sig) triple published into chat text, shared-chat
+        # exports, browser history and proxy logs — i.e. a known MAC pair over
+        # this key. A single cheap hash would make any leaked link an offline
+        # oracle for CLAUDE_WRAPPER_API_KEYS itself, at millions of guesses per
+        # second, which is exactly the full-privilege escalation the per-file
+        # capability exists to avoid. scrypt runs once at boot (~50ms, unnoticed
+        # by the operator) and is memory-hard, so it does not parallelise onto a
+        # GPU the way SHA-256 does.
+        #
+        # This raises the cost of a weak API key; it does not make one safe. The
+        # salt is a fixed domain string (there is no disk state to hold a random
+        # one), so set CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY to 32 random bytes if
+        # you want the link secret fully independent of your API keys — that
+        # also stops an API-key rotation invalidating every outstanding link.
+        dl_key = os.environ.get("CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY", "").strip()
+        if not dl_key and keys:
+            dl_key = hashlib.scrypt(
+                "\n".join(sorted(keys)).encode(),
+                salt=b"claude-wrapper/download-key/v2",
+                n=2**15,
+                r=8,
+                p=1,
+                maxmem=64 * 1024 * 1024,
+                dklen=32,
+            ).hex()
+
         for d in (data_dir, workspace, files, sessions):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -191,6 +260,18 @@ class Settings:
             max_upload_bytes=int(os.environ.get("CLAUDE_WRAPPER_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024))),
             request_timeout_seconds=int(os.environ.get("CLAUDE_WRAPPER_REQUEST_TIMEOUT", "1800")),
             public_base_url=os.environ.get("CLAUDE_WRAPPER_PUBLIC_BASE_URL", "").rstrip("/"),
+            # Generated-file links must be absolute to be clickable in a chat
+            # UI. public_base_url stays authoritative when set; otherwise the
+            # inbound request's own origin is used. Set
+            # CLAUDE_WRAPPER_DERIVE_BASE_URL=off to restore the old plain-text
+            # "→ file_id=…" trailer on deployments that name themselves badly.
+            derive_base_url=_bool_env("CLAUDE_WRAPPER_DERIVE_BASE_URL", True),
+            download_signing_key=dl_key,
+            # Lifetime of a download link's capability, in seconds (30 days).
+            # Expiry is the only revocation short of deleting the blob, and
+            # these links live forever in the chat client's message history.
+            # 0 = never expires (still signed).
+            download_url_ttl_seconds=_int_env("CLAUDE_WRAPPER_DOWNLOAD_URL_TTL", 2592000),
             openwebui_base_url=os.environ.get("OPENWEBUI_BASE_URL", "").rstrip("/"),
             openwebui_api_key=os.environ.get("OPENWEBUI_API_KEY", ""),
             openwebui_default_collection=os.environ.get("OPENWEBUI_DEFAULT_COLLECTION", ""),
@@ -228,6 +309,22 @@ class Settings:
                     "CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS", "AskUserQuestion"
                 ).split(",")
                 if t.strip()
+            ),
+            # Tell Claude its cwd is a workspace whose new files are delivered
+            # to the user as download links.
+            #
+            # OFF by default, because it changes the SHAPE of the reply: it asks
+            # Claude to write the deliverable to a file and summarise instead of
+            # pasting it inline. That is right for a chat UI and wrong for every
+            # existing programmatic caller — run_chat_completion is shared by
+            # /v1/completions, /v1/assistants runs and the batches worker, so a
+            # script doing completions.create("write me a python script…") and
+            # reading choices[0].text would silently start getting "I wrote it
+            # to script.py" plus a link. Turn it on for chat-UI deployments.
+            workspace_hint_enabled=_bool_env("CLAUDE_WRAPPER_WORKSPACE_HINT", False),
+            workspace_system_prompt=(
+                os.environ.get("CLAUDE_WRAPPER_WORKSPACE_PROMPT", "").strip()
+                or DEFAULT_WORKSPACE_SYSTEM_PROMPT
             ),
             # Add `--include-partial-messages` so Claude Code emits incremental
             # text/thinking deltas (live token-by-token streaming) instead of one

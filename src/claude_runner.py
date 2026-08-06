@@ -117,6 +117,7 @@ class ClaudeRunner:
         effort: str = "",
         clarify_system_prompt: str = "",
         clarify_disallowed_tools: tuple[str, ...] = (),
+        workspace_system_prompt: str = "",
         stream_partial_messages: bool = True,
     ):
         self.registry = registry
@@ -134,6 +135,10 @@ class ClaudeRunner:
         # ⇒ globally disabled (CLAUDE_WRAPPER_CLARIFY=off), so it's a no-op.
         self.clarify_system_prompt = clarify_system_prompt
         self.clarify_disallowed_tools = clarify_disallowed_tools
+        # Workspace protocol, applied only when a caller passes
+        # workspace_hint=True (chat/responses) AND a prompt is configured. Empty
+        # prompt ⇒ globally disabled (CLAUDE_WRAPPER_WORKSPACE_HINT=off).
+        self.workspace_system_prompt = workspace_system_prompt
 
     def _session_cwd(self, session_key: str) -> Path:
         d = self.workspace_root / session_key
@@ -199,6 +204,7 @@ class ClaudeRunner:
         extra_args: Optional[list[str]] = None,
         effort: Optional[str] = None,
         clarify: bool = False,
+        workspace_hint: bool = False,
     ) -> list[str]:
         # Prompt is fed via stdin (not argv) to avoid E2BIG on large prompts.
         argv = [
@@ -240,11 +246,19 @@ class ClaudeRunner:
         # and disable the headless-dead question-card tool. Placed so the variadic
         # --disallowedTools is terminated by the following --dangerously-skip-…
         # flag rather than greedily eating a later positional.
-        if clarify:
-            if self.clarify_system_prompt:
-                argv += ["--append-system-prompt", self.clarify_system_prompt]
-            if self.clarify_disallowed_tools:
-                argv += ["--disallowedTools", *self.clarify_disallowed_tools]
+        #
+        # The workspace protocol rides along in the same flag: the CLI takes one
+        # --append-system-prompt, so both segments are joined rather than the
+        # flag repeated.
+        segments: list[str] = []
+        if workspace_hint and self.workspace_system_prompt:
+            segments.append(self.workspace_system_prompt)
+        if clarify and self.clarify_system_prompt:
+            segments.append(self.clarify_system_prompt)
+        if segments:
+            argv += ["--append-system-prompt", "\n\n".join(segments)]
+        if clarify and self.clarify_disallowed_tools:
+            argv += ["--disallowedTools", *self.clarify_disallowed_tools]
         argv += ["--dangerously-skip-permissions"]
         if extra_args:
             argv += list(extra_args)
@@ -259,6 +273,7 @@ class ClaudeRunner:
         extra_args: Optional[list[str]] = None,
         effort: Optional[str] = None,
         clarify: bool = False,
+        workspace_hint: bool = False,
     ) -> AsyncIterator[StreamEvent]:
         """Yield StreamEvents as the subprocess produces them.
 
@@ -278,6 +293,7 @@ class ClaudeRunner:
                 extra_args=extra_args,
                 effort=effort,
                 clarify=clarify,
+                workspace_hint=workspace_hint,
             )
 
             env = os.environ.copy()
@@ -429,6 +445,7 @@ class ClaudeRunner:
         extra_args: Optional[list[str]] = None,
         effort: Optional[str] = None,
         clarify: bool = False,
+        workspace_hint: bool = False,
     ) -> ClaudeResult:
         result = ClaudeResult(session_uuid="", final_text="")
         text_parts: list[str] = []
@@ -441,6 +458,7 @@ class ClaudeRunner:
             extra_args=extra_args,
             effort=effort,
             clarify=clarify,
+            workspace_hint=workspace_hint,
         ):
             result.events.append(evt)
             if evt.kind == "text" and evt.text:

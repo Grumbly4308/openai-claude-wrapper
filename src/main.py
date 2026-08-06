@@ -27,21 +27,25 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import tool_bridge
+from . import download_tokens, tool_bridge
 from .config import SETTINGS, advertised_models, split_model_effort, supported_models
 from .converters import derive_session_id
-from .deps import FILE_STORE, PREPARER, RUNNER, USAGE_LEDGER, auth_dependency
+from .deps import (
+    FILE_STORE,
+    PREPARER,
+    RUNNER,
+    USAGE_LEDGER,
+    auth_dependency,
+    download_auth_dependency,
+)
+from .request_origin import RequestOriginMiddleware, current_origin
 # Re-exported under the historical private names (and `extract_raw_json`, which
 # tests import from here) — see json_mode.py for why it is a separate module.
 from .json_mode import (
-    FENCE_HINT as _FENCE_HINT,
     extract_raw_json,
     instant_reply_error as _instant_reply_error,
     json_instruction as _json_instruction,
     json_mode_error as _json_mode_error,
-    prompt_requests_json as _prompt_requests_json,
-    unfence_json as _unfence_json,
-    unfence_sole_json_block as _unfence_sole_json_block,
     wants_json as _wants_json,
 )
 from .models import (
@@ -130,16 +134,6 @@ _STREAM_SHOW_ACTIVITY = os.environ.get("CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY", "true
 _REASONING_CHANNEL = os.environ.get(
     "CLAUDE_WRAPPER_REASONING_CHANNEL", "details"
 ).strip().lower()
-
-# Whether to sniff prompt-declared JSON requests (a client that puts its schema
-# in the prompt and sends no response_format — see json_mode.py). Both effects
-# are no-ops on a false positive; set to off to disable the sniffing entirely.
-_JSON_SNIFF = os.environ.get("CLAUDE_WRAPPER_JSON_SNIFF", "on").strip().lower() not in (
-    "0",
-    "false",
-    "no",
-    "off",
-)
 
 # (open, close) token pairs for the channels that wrap reasoning inside the
 # content stream. Other channels (reasoning_content, none) are not in this map.
@@ -286,6 +280,11 @@ app.include_router(vector_stores_router)
 app.include_router(fine_tuning_router)
 app.include_router(realtime_router)
 
+# Records the origin each request arrived on, so generated-file links can be
+# absolute (and therefore clickable) without the operator configuring
+# CLAUDE_WRAPPER_PUBLIC_BASE_URL. Pure-ASGI on purpose — see request_origin.py.
+app.add_middleware(RequestOriginMiddleware)
+
 
 # ---------- health & models ----------
 
@@ -381,7 +380,7 @@ async def delete_file(file_id: str) -> dict:
     return {"id": file_id, "object": "file", "deleted": deleted}
 
 
-@app.get("/v1/files/{file_id}/content", dependencies=[Depends(auth_dependency)])
+@app.get("/v1/files/{file_id}/content", dependencies=[Depends(download_auth_dependency)])
 async def download_file(file_id: str) -> StreamingResponse:
     record = await FILE_STORE.get(file_id)
     if record is None:
@@ -459,11 +458,6 @@ async def _prepare_run(req: ChatCompletionRequest):
     prompt, _attachments = await PREPARER.prepare_messages(req.messages, session_key)
     if _wants_json(req):
         prompt = f"{prompt}\n\n{_json_instruction(req)}"
-    elif _JSON_SNIFF and _prompt_requests_json(prompt):
-        # No response_format on the wire, but the prompt itself asks for JSON
-        # against a schema. Ask for it unfenced; the hint is conditional on the
-        # answer being JSON, so a mis-sniffed chat turn is unaffected.
-        prompt = f"{prompt}\n\n{_FENCE_HINT}"
     model = req.model if req.model and req.model != "auto" else SETTINGS.default_model
 
     if not prompt.strip():
@@ -496,11 +490,17 @@ async def run_chat_completion(req: ChatCompletionRequest):
     """Shared implementation reused by /v1/chat/completions, /v1/completions,
     and the batches worker."""
     _log_request("chat/completions" + (" [tool-bridge]" if req.tools else ""), req)
-    # Function calling: a request that declares tools is owned by the CLIENT's
-    # agent loop, which is the opposite of the wrapper's agentic default. It is
-    # served by the tool bridge (a direct Messages API call — no Claude Code
-    # CLI, no built-in tools, no internal loop) and returns tool_calls for the
-    # client to execute. Requests without tools are untouched by this branch.
+    # Function calling: the CLIENT owns the agent loop, so the request is served
+    # by the tool bridge (a direct Messages API call) and stops at the tool_call.
+    # The bridge has no Claude Code CLI, hence no session workspace and no
+    # generated files — a tools-carrying turn cannot produce a download link.
+    #
+    # There is no way to serve one turn both ways: the CLI runs its own tool
+    # loop and cannot surface a caller-declared tool. So this is not a knob. A
+    # chat UI that wants file downloads should stop sending `tools` instead —
+    # in Open WebUI, set the model's Function Calling from "Native" to
+    # "Default", which makes it run its own tool-selection call and send a
+    # plain completion here. See README, "Generated files".
     if req.tools:
         return await _tool_bridge_completion(req)
     prep = await _prepare_run(req)
@@ -604,7 +604,7 @@ async def _sync_response(
     run_model, effort = split_model_effort(model)
     result = await RUNNER.run_collect(
         prompt=prompt, session_key=session_key, model=run_model, effort=effort,
-        clarify=_resolve_clarify(req),
+        clarify=_resolve_clarify(req), workspace_hint=_resolve_workspace_hint(req),
     )
 
     if result.error and not result.final_text:
@@ -633,25 +633,8 @@ async def _sync_response(
         cleaned = extract_raw_json(final_text)
         if cleaned is not None:
             final_text = cleaned
-    else:
-        unfenced = final_text
-        if _JSON_SNIFF and _prompt_requests_json(prompt):
-            unfenced = _unfence_json(final_text)
-            if unfenced == final_text:
-                # Strict unfencing matches only a reply that is a fence and
-                # nothing else. Claude habitually adds a closing sentence,
-                # and that alone used to send the backticks through to a
-                # client about to JSON.parse them. Escalate to the lone-block
-                # rule before giving up.
-                unfenced = _unfence_sole_json_block(final_text)
-        if unfenced != final_text:
-            # A prompt-declared JSON reply, unwrapped. The trailer would put
-            # markdown right back on the end of it, so it is suppressed here
-            # exactly as in real JSON mode.
-            log.info("unfenced a prompt-declared JSON reply (session=%s)", session_key)
-            final_text = unfenced
-        elif attachments and not req.inline_generated_files:
-            final_text = _append_file_references(final_text, attachments)
+    elif attachments and not req.inline_generated_files:
+        final_text = _append_file_references(final_text, attachments)
 
     choice_msg = ChoiceMessage(
         role="assistant",
@@ -690,6 +673,7 @@ async def _stream_response(
     created = int(time.time())
     run_model, effort = split_model_effort(model)
     clarify = _resolve_clarify(req)
+    workspace_hint = _resolve_workspace_hint(req)
 
     # JSON mode: the client parses the concatenated content as JSON, so nothing
     # non-JSON may enter the content stream — no reasoning/progress frames, no
@@ -770,7 +754,8 @@ async def _stream_response(
     async def _pump() -> None:
         try:
             async for evt in RUNNER.run_stream(
-                prompt=prompt, session_key=session_key, model=run_model, effort=effort, clarify=clarify
+                prompt=prompt, session_key=session_key, model=run_model, effort=effort,
+                clarify=clarify, workspace_hint=workspace_hint,
             ):
                 await queue.put(evt)
         except Exception as e:  # pragma: no cover - defensive
@@ -1053,6 +1038,18 @@ def _effort_info(run_model: str, requested_effort: Optional[str]) -> dict:
     return {"applied": applied or "cli-default", "source": source, "requested": requested_effort}
 
 
+def _resolve_workspace_hint(req) -> bool:
+    """Whether to tell Claude its cwd is a workspace that delivers new files.
+
+    JSON mode forces it OFF: a structured-output client wants the value in the
+    reply body, and a hint nudging Claude to put the deliverable in a file
+    instead would starve it. Same reasoning as _resolve_clarify. The server-level
+    switch is enforced in the runner (an empty configured prompt makes
+    workspace_hint=True a no-op).
+    """
+    return not _wants_json(req)
+
+
 def _resolve_clarify(req) -> bool:
     """Per-request intent for the interactive clarification protocol.
 
@@ -1217,7 +1214,7 @@ async def _responses_sync(
     run_model, effort = split_model_effort(model)
     result = await RUNNER.run_collect(
         prompt=prompt, session_key=session_key, model=run_model, effort=effort,
-        clarify=_resolve_clarify(rreq),
+        clarify=_resolve_clarify(rreq), workspace_hint=_resolve_workspace_hint(rreq),
     )
     if result.error and not result.final_text:
         raise HTTPException(status_code=502, detail=f"claude failed: {result.error}")
@@ -1242,22 +1239,8 @@ async def _responses_sync(
         if cleaned is None:
             raise HTTPException(status_code=502, detail=_json_mode_error(rreq, final_text))
         final_text = cleaned
-    else:
-        unfenced = final_text
-        if _JSON_SNIFF and _prompt_requests_json(prompt):
-            unfenced = _unfence_json(final_text)
-            if unfenced == final_text:
-                # Strict unfencing matches only a reply that is a fence and
-                # nothing else. Claude habitually adds a closing sentence,
-                # and that alone used to send the backticks through to a
-                # client about to JSON.parse them. Escalate to the lone-block
-                # rule before giving up.
-                unfenced = _unfence_sole_json_block(final_text)
-        if unfenced != final_text:
-            log.info("unfenced a prompt-declared JSON reply (session=%s)", session_key)
-            final_text = unfenced
-        elif attachments:
-            final_text = _append_file_references(final_text, attachments)
+    elif attachments:
+        final_text = _append_file_references(final_text, attachments)
 
     envelope = _responses_envelope(
         rreq,
@@ -1280,6 +1263,7 @@ async def _responses_stream(
 ) -> AsyncIterator[bytes]:
     run_model, effort = split_model_effort(model)
     clarify = _resolve_clarify(rreq)
+    workspace_hint = _resolve_workspace_hint(rreq)
     created = int(time.time())
     item_id = f"msg_{uuid.uuid4().hex[:24]}"
     seq = 0
@@ -1332,7 +1316,8 @@ async def _responses_stream(
     async def _pump() -> None:
         try:
             async for evt in RUNNER.run_stream(
-                prompt=prompt, session_key=session_key, model=run_model, effort=effort, clarify=clarify
+                prompt=prompt, session_key=session_key, model=run_model, effort=effort,
+                clarify=clarify, workspace_hint=workspace_hint,
             ):
                 await queue.put(evt)
         except Exception as e:  # pragma: no cover - defensive
@@ -1702,6 +1687,11 @@ async def _register_generated_files(
                 source="generated",
             )
             entry = record.to_openai()
+            # Non-OpenAI key on an already non-OpenAI dict, so SDK clients get
+            # the link without having to parse it back out of the markdown.
+            url = _file_download_url(record.id)
+            if url:
+                entry["url"] = url
             if inline:
                 data = p.read_bytes()
                 entry["content_base64"] = base64.b64encode(data).decode("ascii")
@@ -1712,10 +1702,22 @@ async def _register_generated_files(
 
 
 def _file_download_url(file_id: str) -> Optional[str]:
-    base = SETTINGS.public_base_url
+    """Download URL for a generated file, or None when the wrapper has no way to
+    name itself (the caller then degrades to plain text).
+
+    The query carries a per-file capability, because a browser clicking a link
+    in chat sends no Authorization header. Signature deliberately unchanged:
+    _append_file_references picks between its two line formats purely on whether
+    this returns a URL.
+    """
+    base = SETTINGS.public_base_url or current_origin()
     if not base:
         return None
-    return f"{base}/v1/files/{file_id}/content"
+    query = download_tokens.mint(
+        file_id, SETTINGS.download_signing_key, SETTINGS.download_url_ttl_seconds
+    )
+    url = f"{base}/v1/files/{file_id}/content"
+    return f"{url}?{query}" if query else url
 
 
 def _append_file_references(text: str, attachments: list[dict]) -> str:

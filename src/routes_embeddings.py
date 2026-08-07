@@ -19,7 +19,6 @@ import hashlib
 import json
 import logging
 import struct
-import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException

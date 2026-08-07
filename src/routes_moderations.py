@@ -7,8 +7,6 @@ response shape. If Claude returns malformed JSON we fall back to a safe
 
 from __future__ import annotations
 
-import json
-import time
 import uuid
 from typing import Any
 

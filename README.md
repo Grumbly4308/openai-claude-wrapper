@@ -366,6 +366,13 @@ Accepted URL schemes inside `image_url.url`:
 - `https://…` / `http://…` — fetched by the server.
 - `file-<id>` — reference to something previously uploaded to `/v1/files`.
 
+Note that the `http(s)` form makes the *server* fetch whatever URL the
+client names — including hosts on your internal network that the client
+couldn't reach directly (an SSRF surface, reachable by anyone holding an
+API key). Fine when the container's egress is restricted or its callers
+are trusted; if neither holds, front the wrapper with an egress
+allowlist or strip `image_url` parts at your gateway.
+
 Uploaded and inlined binaries are written into the per-session workspace
 before Claude Code is invoked, so Claude can open them with its `Read`
 tool (including images, PDFs, audio, and video — use ffmpeg inside the

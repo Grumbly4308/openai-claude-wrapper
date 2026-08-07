@@ -18,6 +18,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import struct
 from typing import Optional
 
@@ -114,6 +115,11 @@ def _hash_embedding(text: str, dim: int = 384) -> list[float]:
         counter += 1
         buf.extend(hashlib.sha256(f"{counter}:{text}".encode()).digest())
     vec = list(struct.unpack(f"{dim}f", bytes(buf[: dim * 4])))
+    # Raw hash bytes reinterpreted as float32 frequently decode to NaN/Inf
+    # (any exponent-all-ones bit pattern — most inputs hit at least one).
+    # Those poison the norm below and are not JSON-serializable, so the
+    # endpoint would 500. Zero them out; still deterministic per input.
+    vec = [x if math.isfinite(x) else 0.0 for x in vec]
     norm = sum(x * x for x in vec) ** 0.5 or 1.0
     return [x / norm for x in vec]
 

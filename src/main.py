@@ -273,14 +273,46 @@ async def _startup() -> None:
     else:
         link_base, base_src = "", ""
     if link_base:
+        # Signing/TTL are reported from download_links_signed — whether verify()
+        # actually runs on the route — not from the raw signing key, which can
+        # be set while nothing checks it (explicit key, no API keys). And a TTL
+        # is only a revocation window when something enforces it.
+        if SETTINGS.download_links_signed:
+            signing = "on"
+            ttl = (
+                f"{SETTINGS.download_url_ttl_seconds}s"
+                if SETTINGS.download_url_ttl_seconds
+                else "never expires (still signed)"
+            )
+        else:
+            signing = "off (no API keys; route is unauthenticated)"
+            ttl = "n/a (nothing is verified, so links never expire)"
         log.info(
             "generated-file downloads ENABLED — link base=%s (%s), signing=%s, ttl=%s, workspace hint=%s",
             link_base,
             base_src,
-            "on" if SETTINGS.download_signing_key else "off (no API keys; route is unauthenticated)",
-            f"{SETTINGS.download_url_ttl_seconds}s" if SETTINGS.download_url_ttl_seconds else "never expires",
-            "on" if SETTINGS.workspace_hint_enabled else "OFF",
+            signing,
+            ttl,
+            # The hint is also gated off per-request in JSON mode (see
+            # _resolve_workspace_hint), so "on" is the server default, not a
+            # promise about every request.
+            "on (server default; JSON-mode requests excluded)"
+            if SETTINGS.workspace_hint_enabled
+            else "OFF",
         )
+        if SETTINGS.download_signing_key and not SETTINGS.download_links_signed:
+            log.warning(
+                "CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY is set but CLAUDE_WRAPPER_API_KEYS is "
+                "empty, so the download route never verifies signatures — links carry exp/sig "
+                "but ANY request can read any stored file. Set API keys to enforce signing."
+            )
+        if SETTINGS.public_base_url and not SETTINGS.public_base_url.startswith(("http://", "https://")):
+            log.warning(
+                "CLAUDE_WRAPPER_PUBLIC_BASE_URL=%r has no http(s):// scheme, so generated "
+                "markdown links will not be clickable in a browser. Set the full URL the "
+                "BROWSER uses, scheme included.",
+                SETTINGS.public_base_url,
+            )
         if not SETTINGS.workspace_hint_enabled:
             log.warning(
                 "download links are configured but CLAUDE_WRAPPER_WORKSPACE_HINT is off, so "
@@ -299,6 +331,13 @@ async def _startup() -> None:
             "generated-file downloads DISABLED — no CLAUDE_WRAPPER_PUBLIC_BASE_URL and "
             "CLAUDE_WRAPPER_DERIVE_BASE_URL=off, so the file trailer stays plain text."
         )
+        if SETTINGS.workspace_hint_enabled:
+            log.warning(
+                "downloads are disabled but CLAUDE_WRAPPER_WORKSPACE_HINT is on, so Claude is "
+                "told its files come back as download links that can never render — replies "
+                "will reference files the user cannot fetch. Turn the hint off, or set "
+                "CLAUDE_WRAPPER_PUBLIC_BASE_URL / CLAUDE_WRAPPER_DERIVE_BASE_URL=on."
+            )
 
 
 @app.on_event("shutdown")

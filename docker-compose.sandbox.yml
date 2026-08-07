@@ -56,8 +56,10 @@ services:
       CLAUDE_WRAPPER_PORT: "${CLAUDE_WRAPPER_PORT:-8000}"
       CLAUDE_WRAPPER_HOST: "0.0.0.0"
 
-      # Runs execute in the agent container, not here.
-      CLAUDE_WRAPPER_AGENT_URL: "http://claude-agent:8791"
+      # Runs execute in the agent container, not here. If you override the URL,
+      # override CLAUDE_WRAPPER_AGENT_PORT to match — the port is spelled out in
+      # both places.
+      CLAUDE_WRAPPER_AGENT_URL: "${CLAUDE_WRAPPER_AGENT_URL:-http://claude-agent:8791}"
       CLAUDE_WRAPPER_AGENT_TOKEN: "${CLAUDE_WRAPPER_AGENT_TOKEN:-}"
 
       # The tool bridge (function-calling requests) and client-supplied
@@ -128,7 +130,7 @@ services:
     command: ["agent"]
     environment:
       CLAUDE_WRAPPER_HOST: "0.0.0.0"
-      CLAUDE_WRAPPER_AGENT_PORT: "8791"
+      CLAUDE_WRAPPER_AGENT_PORT: "${CLAUDE_WRAPPER_AGENT_PORT:-8791}"
       CLAUDE_WRAPPER_AGENT_TOKEN: "${CLAUDE_WRAPPER_AGENT_TOKEN:-}"
       CLAUDE_WRAPPER_REQUEST_TIMEOUT: "${CLAUDE_WRAPPER_REQUEST_TIMEOUT:-1800}"
 
@@ -164,7 +166,7 @@ services:
     networks:
       - backend
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8791/healthz"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CLAUDE_WRAPPER_AGENT_PORT:-8791}/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3

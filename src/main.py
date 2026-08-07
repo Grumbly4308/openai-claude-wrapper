@@ -161,6 +161,16 @@ async def _startup() -> None:
     models = supported_models()
     log.info("model list ready: %d models — %s", len(models), ", ".join(models))
 
+    # Where turns execute: locally, or in the sandboxed agent container.
+    if SETTINGS.agent_url:
+        log.info(
+            "agent execution: REMOTE via %s (sandboxed agent container; workspace "
+            "must be a volume shared with it at the same path)",
+            SETTINGS.agent_url,
+        )
+    else:
+        log.info("agent execution: local subprocess (%s)", SETTINGS.claude_bin)
+
     # Surface KB passthrough state at boot. The OpenWebUI addendum is silently
     # skipped when OPENWEBUI_BASE_URL is unset, which makes "Claude can't see the
     # KB" hard to diagnose — so make it explicit in the logs either way.
@@ -274,6 +284,7 @@ async def _startup() -> None:
 async def _shutdown() -> None:
     await PREPARER.aclose()
     await tool_bridge.aclose()
+    await RUNNER.aclose()
 
 
 app.include_router(text_router)

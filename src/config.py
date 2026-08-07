@@ -189,6 +189,8 @@ class Settings:
     workspace_hint_enabled: bool
     workspace_system_prompt: str
     stream_partial_messages: bool
+    agent_url: str
+    agent_token: str
 
     @property
     def download_links_signed(self) -> bool:
@@ -345,6 +347,16 @@ class Settings:
             # whole block per step. On by default; set CLAUDE_WRAPPER_STREAM_PARTIAL
             # =off to fall back to whole-block events.
             stream_partial_messages=_bool_env("CLAUDE_WRAPPER_STREAM_PARTIAL", True),
+            # Sandboxed topology (docker-compose.sandbox.yml): when set, the CLI
+            # is not spawned in this container — every run is sent to the agent
+            # shim (src.agent_shim) at this base URL, which lives on an internal
+            # network whose only egress is the allowlisting proxy. Empty (the
+            # default) keeps the classic single-container local subprocess.
+            agent_url=os.environ.get("CLAUDE_WRAPPER_AGENT_URL", "").strip().rstrip("/"),
+            # Optional shared secret the shim requires as a bearer token. The
+            # shim sits on an internal network either way; this guards against
+            # anything else that can reach that network.
+            agent_token=os.environ.get("CLAUDE_WRAPPER_AGENT_TOKEN", "").strip(),
         )
 
 

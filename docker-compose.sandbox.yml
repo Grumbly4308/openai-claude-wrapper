@@ -21,6 +21,14 @@
 #   docker compose -f docker-compose.sandbox.yml up -d
 #   podman-compose -f docker-compose.sandbox.yml up -d
 #
+# Under ROOTLESS podman two things differ from docker, both host-side:
+#   - `user:` below is a uid INSIDE the user namespace, so it does not name the
+#     host account. If the inbox bind mount reads as owned by a stranger, run
+#     with `--userns=keep-id` (or run podman as root).
+#   - On an SELinux host (Fedora/RHEL) the bind-mounted squid.conf, allowlist
+#     and inbox need a `:z` suffix, or the container is denied access to them.
+#     Left off here because relabeling touches files in your checkout.
+#
 # One-time CLI login happens in the AGENT container (the CLI runs there):
 #   docker compose -f docker-compose.sandbox.yml run --rm -it claude-agent login
 #
@@ -119,6 +127,18 @@ services:
       start_period: 20s
 
   claude-agent:
+    # Same image as the API container. It declares the build explicitly rather
+    # than relying on claude-wrapper having been built first: this service is
+    # started BEFORE claude-wrapper (depends_on, above), and podman-compose only
+    # builds services that carry a build section — without one, a first `up` on
+    # a clean machine tries to resolve claude-wrapper:latest as a registry pull.
+    # Both services tag the same image, so the second build is a cache hit.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CLAUDE_UID: "${CLAUDE_UID:-1000}"
+        CLAUDE_GID: "${CLAUDE_GID:-1000}"
     image: claude-wrapper:latest
     container_name: claude-agent
     restart: unless-stopped

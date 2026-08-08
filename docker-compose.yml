@@ -97,6 +97,28 @@ services:
       CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT: "${CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT:-5}"
       CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD: "${CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD:-continue,proceed,keep going,go on,yes}"
 
+      # Streaming shape. REASONING_CHANNEL decides where thinking, tool
+      # activity and the "still working" tick go: details (default) |
+      # reasoning_content | think_tags | none. See .env.example for the
+      # per-client tradeoffs — "none" also silences the progress ticks, so a
+      # buffering reverse proxy sees only the invisible keep-alive comments.
+      CLAUDE_WRAPPER_REASONING_CHANNEL: "${CLAUDE_WRAPPER_REASONING_CHANNEL:-details}"
+      CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY: "${CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY:-true}"
+      CLAUDE_WRAPPER_SSE_HEARTBEAT: "${CLAUDE_WRAPPER_SSE_HEARTBEAT:-15}"
+      CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES: "${CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES:-2048}"
+      CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS: "${CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS:-25}"
+      CLAUDE_WRAPPER_STREAM_PARTIAL: "${CLAUDE_WRAPPER_STREAM_PARTIAL:-true}"
+
+      # Headless Claude Code can't show its AskUserQuestion card, so the
+      # wrapper teaches it to ask in plain text and stop instead.
+      CLAUDE_WRAPPER_CLARIFY: "${CLAUDE_WRAPPER_CLARIFY:-on}"
+      CLAUDE_WRAPPER_CLARIFY_PROMPT: "${CLAUDE_WRAPPER_CLARIFY_PROMPT:-}"
+      CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS: "${CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS:-}"
+
+      # `auto` scans the installed CLI for its model list; `off` uses the
+      # static fallback.
+      CLAUDE_WRAPPER_MODEL_DISCOVERY: "${CLAUDE_WRAPPER_MODEL_DISCOVERY:-auto}"
+
       # When set, the wrapper injects a system-prompt addendum telling
       # Claude how to query OpenWebUI's retrieval API. The api key passes
       # through to Claude's Bash tool via env, never into the prompt.

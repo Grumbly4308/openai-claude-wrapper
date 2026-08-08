@@ -101,6 +101,22 @@ services:
       CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE: "${CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE:-0}"
       CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT: "${CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT:-5}"
       CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD: "${CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD:-continue,proceed,keep going,go on,yes}"
+      # The SSE frames are emitted HERE — this is the container that owns the
+      # client connection — so the streaming knobs belong on this service.
+      # CLARIFY and STREAM_PARTIAL are repeated on claude-agent below: they
+      # feed the same SETTINGS object in both containers, and letting the two
+      # disagree gives an API that advertises one behaviour and a CLI that
+      # runs another.
+      CLAUDE_WRAPPER_REASONING_CHANNEL: "${CLAUDE_WRAPPER_REASONING_CHANNEL:-details}"
+      CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY: "${CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY:-true}"
+      CLAUDE_WRAPPER_SSE_HEARTBEAT: "${CLAUDE_WRAPPER_SSE_HEARTBEAT:-15}"
+      CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES: "${CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES:-2048}"
+      CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS: "${CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS:-25}"
+      CLAUDE_WRAPPER_STREAM_PARTIAL: "${CLAUDE_WRAPPER_STREAM_PARTIAL:-true}"
+      CLAUDE_WRAPPER_CLARIFY: "${CLAUDE_WRAPPER_CLARIFY:-on}"
+      CLAUDE_WRAPPER_CLARIFY_PROMPT: "${CLAUDE_WRAPPER_CLARIFY_PROMPT:-}"
+      CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS: "${CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS:-}"
+      CLAUDE_WRAPPER_MODEL_DISCOVERY: "${CLAUDE_WRAPPER_MODEL_DISCOVERY:-auto}"
       # The KB addendum is BUILT here (the prompt text); the curl calls it
       # teaches run in the agent container, which carries the same vars below.
       OPENWEBUI_BASE_URL: "${OPENWEBUI_BASE_URL:-}"
@@ -153,6 +169,15 @@ services:
       CLAUDE_WRAPPER_AGENT_PORT: "${CLAUDE_WRAPPER_AGENT_PORT:-8791}"
       CLAUDE_WRAPPER_AGENT_TOKEN: "${CLAUDE_WRAPPER_AGENT_TOKEN:-}"
       CLAUDE_WRAPPER_REQUEST_TIMEOUT: "${CLAUDE_WRAPPER_REQUEST_TIMEOUT:-1800}"
+
+      # The CLI is spawned in THIS container, so the knobs that shape the
+      # subprocess have to be here too — on the API service alone they are
+      # inert. STREAM_PARTIAL picks incremental deltas over whole blocks;
+      # the clarify trio decides whether the ask-then-stop prompt is injected.
+      CLAUDE_WRAPPER_STREAM_PARTIAL: "${CLAUDE_WRAPPER_STREAM_PARTIAL:-true}"
+      CLAUDE_WRAPPER_CLARIFY: "${CLAUDE_WRAPPER_CLARIFY:-on}"
+      CLAUDE_WRAPPER_CLARIFY_PROMPT: "${CLAUDE_WRAPPER_CLARIFY_PROMPT:-}"
+      CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS: "${CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS:-}"
 
       # CLI credentials (only needed if you skip the interactive login).
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"

@@ -59,7 +59,15 @@ RUN userdel -r node 2>/dev/null || true \
 
 USER claude
 
-ENV CLAUDE_WRAPPER_DATA=/data \
+# By default the CLI splits its state either side of the volume boundary:
+# ~/.claude/ holds credentials, projects and sessions, but ~/.claude.json —
+# the config, including which directories are trusted — sits at HOME root.
+# Only the directory is on the claude-home volume, so `run --rm` logins wrote
+# the config to the container layer and lost it on exit, leaving the CLI to
+# report a missing config next to a backup that did persist. Pointing
+# CLAUDE_CONFIG_DIR at the mounted directory puts all of it on the volume.
+ENV CLAUDE_CONFIG_DIR=/home/claude/.claude \
+    CLAUDE_WRAPPER_DATA=/data \
     CLAUDE_WRAPPER_WORKSPACE=/data/workspace \
     CLAUDE_WRAPPER_FILES=/data/files \
     CLAUDE_WRAPPER_SESSIONS=/data/sessions \

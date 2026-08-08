@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CLAUDE_HOME="${HOME:-/home/claude}/.claude"
+CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-${HOME:-/home/claude}/.claude}"
 mkdir -p "${CLAUDE_WRAPPER_WORKSPACE}" "${CLAUDE_WRAPPER_FILES}" "${CLAUDE_WRAPPER_SESSIONS}" "${CLAUDE_HOME}"
 
 has_saved_login() {

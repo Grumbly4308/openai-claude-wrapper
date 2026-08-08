@@ -682,7 +682,10 @@ The compose file mounts two named volumes:
 - `claude-data` → `/data` (uploaded + generated files, session registry,
   per-session workspaces).
 - `claude-home` → `/home/claude/.claude` (Claude Code's own state,
-  including the OAuth credentials from `login` / `setup-token`).
+  including the OAuth credentials from `login` / `setup-token`). The image
+  sets `CLAUDE_CONFIG_DIR` to this path so the CLI's config file lands here
+  too — by default it writes `~/.claude.json` at HOME root, outside the
+  volume, where a `run --rm` login would discard it on exit.
 
 …plus one host bind mount:
 

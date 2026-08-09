@@ -195,6 +195,13 @@ services:
       https_proxy: "http://squid:3128"
       NO_PROXY: "claude-wrapper,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
       no_proxy: "claude-wrapper,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
+      # The backend network is internal, so Docker's embedded DNS refuses
+      # external lookups (rcode NOTIMP). The CLI resolves target hosts locally
+      # by default even when tunnelling through a proxy — this flag makes it
+      # hand the bare hostname to Squid instead, which resolves it on the
+      # egress network. Without it every run dies with ENOTIMP before the
+      # CONNECT is even attempted.
+      CLAUDE_CODE_PROXY_RESOLVES_HOSTS: "1"
 
       # The KB curl calls execute here.
       OPENWEBUI_BASE_URL: "${OPENWEBUI_BASE_URL:-}"

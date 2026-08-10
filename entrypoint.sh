@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CLAUDE_HOME="${HOME:-/home/claude}/.claude"
+CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-${HOME:-/home/claude}/.claude}"
 mkdir -p "${CLAUDE_WRAPPER_WORKSPACE}" "${CLAUDE_WRAPPER_FILES}" "${CLAUDE_WRAPPER_SESSIONS}" "${CLAUDE_HOME}"
 
 has_saved_login() {
@@ -17,7 +17,7 @@ has_env_auth() {
     [[ -n "${ANTHROPIC_API_KEY:-}" ]] || [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]
 }
 
-cmd_serve() {
+warn_if_no_auth() {
     if ! has_saved_login && ! has_env_auth; then
         cat >&2 <<'MSG'
 ================================================================
@@ -39,12 +39,27 @@ cmd_serve() {
 ================================================================
 MSG
     fi
+}
+
+cmd_serve() {
+    warn_if_no_auth
     exec uvicorn src.main:app \
         --host "${CLAUDE_WRAPPER_HOST}" \
         --port "${CLAUDE_WRAPPER_PORT}" \
         --workers "${CLAUDE_WRAPPER_WORKERS:-1}" \
         --proxy-headers \
         --forwarded-allow-ips='*'
+}
+
+cmd_agent() {
+    # Sandboxed topology: the agent shim (src/agent_shim.py) is this
+    # container's only inbound surface; the API container sends it runs via
+    # CLAUDE_WRAPPER_AGENT_URL. The CLI executes HERE, so credentials must
+    # live here too — the no-auth warning applies to this role, not serve.
+    warn_if_no_auth
+    exec uvicorn src.agent_shim:app \
+        --host "${CLAUDE_WRAPPER_HOST}" \
+        --port "${CLAUDE_WRAPPER_AGENT_PORT:-8791}"
 }
 
 cmd_login() {
@@ -82,6 +97,10 @@ case "${1:-serve}" in
     ""|serve|start|run)
         shift || true
         cmd_serve
+        ;;
+    agent|shim)
+        shift
+        cmd_agent
         ;;
     login|init)
         shift

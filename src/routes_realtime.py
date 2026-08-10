@@ -17,16 +17,13 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 import uuid
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-from .claude_runner import StreamEvent
 from .config import SETTINGS
-from .converters import derive_session_id
 from .deps import PREPARER, RUNNER
 from .models import ChatMessage
 

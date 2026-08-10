@@ -1,0 +1,264 @@
+# Sandboxed topology — three containers, one inbound door:
+#
+#   [clients] ──> claude-wrapper (FastAPI — the ONLY published port)
+#                     │
+#                     │  backend network (internal: no route to the outside)
+#                     ├──> claude-agent  (Claude Code CLI behind src/agent_shim.py)
+#                     │        │
+#                     │        │  proxied egress only (HTTP(S)_PROXY)
+#                     └───────>└──> squid ──> egress network ──> allowlist hosts
+#
+# The agent container — where model-driven tool use actually executes — sits on
+# an internal network with no external route. Its only way out is Squid, which
+# enforces sandbox/allowlist.txt as a CONNECT-only domain allowlist. The API
+# container routes its own upstream calls (the tool bridge's direct Messages
+# API requests, client-supplied image_url fetches) through the same proxy via
+# proxy env vars. Note the asymmetry: the agent's isolation is enforced by
+# network topology (hard); the API container's is enforced by proxy env (soft —
+# its own code is trusted, the agent's tool use is not).
+#
+# Works with docker compose and podman-compose:
+#   docker compose -f docker-compose.sandbox.yml up -d
+#   podman-compose -f docker-compose.sandbox.yml up -d
+#
+# Under ROOTLESS podman two things differ from docker, both host-side:
+#   - `user:` below is a uid INSIDE the user namespace, so it does not name the
+#     host account. If the inbox bind mount reads as owned by a stranger, run
+#     with `--userns=keep-id` (or run podman as root).
+#   - On an SELinux host (Fedora/RHEL) the bind-mounted squid.conf, allowlist
+#     and inbox need a `:z` suffix, or the container is denied access to them.
+#     Left off here because relabeling touches files in your checkout.
+#
+# One-time CLI login happens in the AGENT container (the CLI runs there):
+#   docker compose -f docker-compose.sandbox.yml run --rm -it claude-agent login
+#
+# Feature caveats vs the single-container layout (see README "Sandboxed
+# deployment"): first-use model downloads for /v1/audio and /v1/embeddings
+# delegation need huggingface.co on the allowlist (or pre-baked models), and
+# the OpenWebUI knowledge-base host must be added to SANDBOX_EXTRA_NO_PROXY
+# if it lives on your internal network.
+
+services:
+  claude-wrapper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CLAUDE_UID: "${CLAUDE_UID:-1000}"
+        CLAUDE_GID: "${CLAUDE_GID:-1000}"
+    image: claude-wrapper:latest
+    container_name: claude-wrapper
+    restart: unless-stopped
+    user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["serve"]
+    depends_on:
+      - claude-agent
+      - squid
+    ports:
+      - "0.0.0.0:${CLAUDE_WRAPPER_PORT:-8000}:${CLAUDE_WRAPPER_PORT:-8000}"
+    environment:
+      CLAUDE_WRAPPER_PORT: "${CLAUDE_WRAPPER_PORT:-8000}"
+      CLAUDE_WRAPPER_HOST: "0.0.0.0"
+
+      # Runs execute in the agent container, not here. If you override the URL,
+      # override CLAUDE_WRAPPER_AGENT_PORT to match — the port is spelled out in
+      # both places.
+      CLAUDE_WRAPPER_AGENT_URL: "${CLAUDE_WRAPPER_AGENT_URL:-http://claude-agent:8791}"
+      CLAUDE_WRAPPER_AGENT_TOKEN: "${CLAUDE_WRAPPER_AGENT_TOKEN:-}"
+
+      # The tool bridge (function-calling requests) and client-supplied
+      # image_url fetches leave THIS container; send them through the same
+      # allowlist. The shim hop is internal and must bypass the proxy.
+      HTTP_PROXY: "http://squid:3128"
+      HTTPS_PROXY: "http://squid:3128"
+      http_proxy: "http://squid:3128"
+      https_proxy: "http://squid:3128"
+      NO_PROXY: "claude-agent,squid,localhost,127.0.0.1"
+      no_proxy: "claude-agent,squid,localhost,127.0.0.1"
+
+      # Everything below is identical to docker-compose.yml — the API surface
+      # and its features are unchanged by the sandbox.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:-}"
+      CLAUDE_WRAPPER_API_KEYS: "${CLAUDE_WRAPPER_API_KEYS:-}"
+      CLAUDE_WRAPPER_PUBLIC_BASE_URL: "${CLAUDE_WRAPPER_PUBLIC_BASE_URL:-}"
+      CLAUDE_WRAPPER_DERIVE_BASE_URL: "${CLAUDE_WRAPPER_DERIVE_BASE_URL:-on}"
+      CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY: "${CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY:-}"
+      CLAUDE_WRAPPER_DOWNLOAD_URL_TTL: "${CLAUDE_WRAPPER_DOWNLOAD_URL_TTL:-2592000}"
+      CLAUDE_WRAPPER_WORKSPACE_HINT: "${CLAUDE_WRAPPER_WORKSPACE_HINT:-on}"
+      CLAUDE_WRAPPER_WORKSPACE_PROMPT: "${CLAUDE_WRAPPER_WORKSPACE_PROMPT:-}"
+      CLAUDE_WRAPPER_DEFAULT_MODEL: "${CLAUDE_WRAPPER_DEFAULT_MODEL:-claude-opus-4-8}"
+      CLAUDE_WRAPPER_EFFORT: "${CLAUDE_WRAPPER_EFFORT:-medium}"
+      CLAUDE_WRAPPER_MAX_UPLOAD_BYTES: "${CLAUDE_WRAPPER_MAX_UPLOAD_BYTES:-2147483648}"
+      CLAUDE_WRAPPER_REQUEST_TIMEOUT: "${CLAUDE_WRAPPER_REQUEST_TIMEOUT:-1800}"
+      CLAUDE_WRAPPER_WORKERS: "${CLAUDE_WRAPPER_WORKERS:-1}"
+      CLAUDE_WRAPPER_SESSION_PLAN: "${CLAUDE_WRAPPER_SESSION_PLAN:-max 5x}"
+      CLAUDE_WRAPPER_PRO_SESSION_TOKENS: "${CLAUDE_WRAPPER_PRO_SESSION_TOKENS:-1500000}"
+      CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE: "${CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE:-0}"
+      CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT: "${CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT:-5}"
+      CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD: "${CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD:-continue,proceed,keep going,go on,yes}"
+      # The SSE frames are emitted HERE — this is the container that owns the
+      # client connection — so the streaming knobs belong on this service.
+      # CLARIFY and STREAM_PARTIAL are repeated on claude-agent below: they
+      # feed the same SETTINGS object in both containers, and letting the two
+      # disagree gives an API that advertises one behaviour and a CLI that
+      # runs another.
+      CLAUDE_WRAPPER_REASONING_CHANNEL: "${CLAUDE_WRAPPER_REASONING_CHANNEL:-details}"
+      CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY: "${CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY:-true}"
+      CLAUDE_WRAPPER_SSE_HEARTBEAT: "${CLAUDE_WRAPPER_SSE_HEARTBEAT:-15}"
+      CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES: "${CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES:-2048}"
+      CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS: "${CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS:-25}"
+      CLAUDE_WRAPPER_STREAM_PARTIAL: "${CLAUDE_WRAPPER_STREAM_PARTIAL:-true}"
+      CLAUDE_WRAPPER_CLARIFY: "${CLAUDE_WRAPPER_CLARIFY:-on}"
+      CLAUDE_WRAPPER_CLARIFY_PROMPT: "${CLAUDE_WRAPPER_CLARIFY_PROMPT:-}"
+      CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS: "${CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS:-}"
+      CLAUDE_WRAPPER_MODEL_DISCOVERY: "${CLAUDE_WRAPPER_MODEL_DISCOVERY:-auto}"
+      # The KB addendum is BUILT here (the prompt text); the curl calls it
+      # teaches run in the agent container, which carries the same vars below.
+      OPENWEBUI_BASE_URL: "${OPENWEBUI_BASE_URL:-}"
+      OPENWEBUI_API_KEY: "${OPENWEBUI_API_KEY:-}"
+      OPENWEBUI_DEFAULT_COLLECTION: "${OPENWEBUI_DEFAULT_COLLECTION:-}"
+    volumes:
+      # File store, session registry, usage ledgers, batches — API-only state.
+      - claude-data:/data
+      # Per-session workspaces, shared with the agent AT THE SAME PATH: the
+      # wrapper materializes uploads and collects generated files here; the
+      # CLI runs here.
+      - claude-workspace:/data/workspace
+      # Read-only: the tool bridge needs the CLI's refreshed OAuth token for
+      # direct Messages API calls. The agent owns the writable mount.
+      - claude-home:/home/claude/.claude:ro
+    networks:
+      - frontend
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CLAUDE_WRAPPER_PORT:-8000}/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  claude-agent:
+    # Same image as the API container. It declares the build explicitly rather
+    # than relying on claude-wrapper having been built first: this service is
+    # started BEFORE claude-wrapper (depends_on, above), and podman-compose only
+    # builds services that carry a build section — without one, a first `up` on
+    # a clean machine tries to resolve claude-wrapper:latest as a registry pull.
+    # Both services tag the same image, so the second build is a cache hit.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CLAUDE_UID: "${CLAUDE_UID:-1000}"
+        CLAUDE_GID: "${CLAUDE_GID:-1000}"
+    image: claude-wrapper:latest
+    container_name: claude-agent
+    restart: unless-stopped
+    user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["agent"]
+    environment:
+      CLAUDE_WRAPPER_HOST: "0.0.0.0"
+      CLAUDE_WRAPPER_AGENT_PORT: "${CLAUDE_WRAPPER_AGENT_PORT:-8791}"
+      CLAUDE_WRAPPER_AGENT_TOKEN: "${CLAUDE_WRAPPER_AGENT_TOKEN:-}"
+      CLAUDE_WRAPPER_REQUEST_TIMEOUT: "${CLAUDE_WRAPPER_REQUEST_TIMEOUT:-1800}"
+
+      # The CLI is spawned in THIS container, so the knobs that shape the
+      # subprocess have to be here too — on the API service alone they are
+      # inert. STREAM_PARTIAL picks incremental deltas over whole blocks;
+      # the clarify trio decides whether the ask-then-stop prompt is injected.
+      CLAUDE_WRAPPER_STREAM_PARTIAL: "${CLAUDE_WRAPPER_STREAM_PARTIAL:-true}"
+      CLAUDE_WRAPPER_CLARIFY: "${CLAUDE_WRAPPER_CLARIFY:-on}"
+      CLAUDE_WRAPPER_CLARIFY_PROMPT: "${CLAUDE_WRAPPER_CLARIFY_PROMPT:-}"
+      CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS: "${CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS:-}"
+
+      # CLI credentials (only needed if you skip the interactive login).
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:-}"
+
+      # THE sandbox integration: this container sits on an internal network,
+      # so these proxy vars are the only route out. The runner copies its
+      # environment into every CLI run, and the CLI's Bash subshells inherit
+      # it — curl, pip, git and the CLI itself all flow through Squid's
+      # allowlist with no code changes. Add internal hosts the agent must
+      # reach directly (e.g. your OpenWebUI) to SANDBOX_EXTRA_NO_PROXY.
+      HTTP_PROXY: "http://squid:3128"
+      HTTPS_PROXY: "http://squid:3128"
+      http_proxy: "http://squid:3128"
+      https_proxy: "http://squid:3128"
+      NO_PROXY: "claude-wrapper,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
+      no_proxy: "claude-wrapper,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
+      # The backend network is internal, so Docker's embedded DNS refuses
+      # external lookups (rcode NOTIMP). The CLI resolves target hosts locally
+      # by default even when tunnelling through a proxy — this flag makes it
+      # hand the bare hostname to Squid instead, which resolves it on the
+      # egress network. Without it every run dies with ENOTIMP before the
+      # CONNECT is even attempted.
+      CLAUDE_CODE_PROXY_RESOLVES_HOSTS: "1"
+
+      # The KB curl calls execute here.
+      OPENWEBUI_BASE_URL: "${OPENWEBUI_BASE_URL:-}"
+      OPENWEBUI_API_KEY: "${OPENWEBUI_API_KEY:-}"
+      OPENWEBUI_DEFAULT_COLLECTION: "${OPENWEBUI_DEFAULT_COLLECTION:-}"
+    volumes:
+      - claude-workspace:/data/workspace
+      # The CLI's own state and credentials live HERE (writable); log in with:
+      #   docker compose -f docker-compose.sandbox.yml run --rm -it claude-agent login
+      - claude-home:/home/claude/.claude
+      # Host drop folder: files are read by the CLI, which runs in this
+      # container — so the inbox mounts here, not on the API.
+      - ${CLAUDE_INBOX_DIR:-./inbox}:/data/inbox:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CLAUDE_WRAPPER_AGENT_PORT:-8791}/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  squid:
+    image: docker.io/ubuntu/squid:latest
+    container_name: claude-squid
+    restart: unless-stopped
+    # Unprivileged from the first instruction: squid never runs as root, so it
+    # cannot write /var/run/squid.pid — squid.conf points the pid file at
+    # /var/cache/squid instead, and both writable paths are tmpfs.
+    user: "proxy"
+    entrypoint: ["squid", "-N", "-Y", "-C", "-f", "/etc/squid/squid.conf"]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ./sandbox/squid.conf:/etc/squid/squid.conf:ro
+      - ./sandbox/allowlist.txt:/etc/squid/allowlist.txt:ro
+    tmpfs:
+      - /var/cache/squid
+      - /var/log/squid
+    networks:
+      - backend
+      - egress
+
+networks:
+  # Inbound: the published API port. Non-internal, which also means the API
+  # container retains a direct route out — its egress discipline comes from
+  # the proxy env above. Firewall the host if you want that hardened too.
+  frontend: {}
+  # The sandbox: no external route. API <-> agent <-> squid only.
+  backend:
+    internal: true
+  # Squid's way out.
+  egress: {}
+
+volumes:
+  claude-data:
+  claude-workspace:
+  claude-home:

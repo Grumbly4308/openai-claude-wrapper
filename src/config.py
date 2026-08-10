@@ -189,6 +189,19 @@ class Settings:
     workspace_hint_enabled: bool
     workspace_system_prompt: str
     stream_partial_messages: bool
+    agent_url: str
+    agent_token: str
+
+    @property
+    def download_links_signed(self) -> bool:
+        """Whether download-link capabilities are actually *enforced*.
+
+        deps.download_auth_dependency returns before any signature check when
+        require_auth is off, so a signing key alone only stamps exp/sig onto
+        links nobody verifies. Anything reporting on link security must key off
+        this, not off download_signing_key.
+        """
+        return self.require_auth and bool(self.download_signing_key)
 
     @property
     def session_block_tokens(self) -> int:
@@ -259,7 +272,7 @@ class Settings:
             claude_bin=os.environ.get("CLAUDE_WRAPPER_CLAUDE_BIN", "claude"),
             max_upload_bytes=int(os.environ.get("CLAUDE_WRAPPER_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024))),
             request_timeout_seconds=int(os.environ.get("CLAUDE_WRAPPER_REQUEST_TIMEOUT", "1800")),
-            public_base_url=os.environ.get("CLAUDE_WRAPPER_PUBLIC_BASE_URL", "").rstrip("/"),
+            public_base_url=os.environ.get("CLAUDE_WRAPPER_PUBLIC_BASE_URL", "").strip().rstrip("/"),
             # Generated-file links must be absolute to be clickable in a chat
             # UI. public_base_url stays authoritative when set; otherwise the
             # inbound request's own origin is used. Set
@@ -270,8 +283,11 @@ class Settings:
             # Lifetime of a download link's capability, in seconds (30 days).
             # Expiry is the only revocation short of deleting the blob, and
             # these links live forever in the chat client's message history.
-            # 0 = never expires (still signed).
-            download_url_ttl_seconds=_int_env("CLAUDE_WRAPPER_DOWNLOAD_URL_TTL", 2592000),
+            # 0 = never expires (still signed). Clamped so a negative value —
+            # a plausible "disable" idiom — is the same 0 that mint() would
+            # treat it as anyway, and everything downstream (the boot log
+            # included) sees one consistent "never expires" instead of "-1s".
+            download_url_ttl_seconds=max(0, _int_env("CLAUDE_WRAPPER_DOWNLOAD_URL_TTL", 2592000)),
             openwebui_base_url=os.environ.get("OPENWEBUI_BASE_URL", "").rstrip("/"),
             openwebui_api_key=os.environ.get("OPENWEBUI_API_KEY", ""),
             openwebui_default_collection=os.environ.get("OPENWEBUI_DEFAULT_COLLECTION", ""),
@@ -331,6 +347,16 @@ class Settings:
             # whole block per step. On by default; set CLAUDE_WRAPPER_STREAM_PARTIAL
             # =off to fall back to whole-block events.
             stream_partial_messages=_bool_env("CLAUDE_WRAPPER_STREAM_PARTIAL", True),
+            # Sandboxed topology (docker-compose.sandbox.yml): when set, the CLI
+            # is not spawned in this container — every run is sent to the agent
+            # shim (src.agent_shim) at this base URL, which lives on an internal
+            # network whose only egress is the allowlisting proxy. Empty (the
+            # default) keeps the classic single-container local subprocess.
+            agent_url=os.environ.get("CLAUDE_WRAPPER_AGENT_URL", "").strip().rstrip("/"),
+            # Optional shared secret the shim requires as a bearer token. The
+            # shim sits on an internal network either way; this guards against
+            # anything else that can reach that network.
+            agent_token=os.environ.get("CLAUDE_WRAPPER_AGENT_TOKEN", "").strip(),
         )
 
 

@@ -15,7 +15,6 @@ completions pipeline, preserving state via session_id.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time

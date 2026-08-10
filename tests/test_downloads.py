@@ -30,8 +30,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src import deps as src_deps
-from src import download_tokens, request_origin
+from src import download_tokens, request_origin, routes_batches
 from src import main as src_main
+from src.config import Settings
 from src.deps import FILE_STORE
 from src.file_store import FileStore
 from src.main import app
@@ -97,6 +98,51 @@ def test_empty_key_mints_nothing_and_verifies_nothing():
 def _split(query: str) -> tuple[str, str]:
     parts = dict(p.split("=", 1) for p in query.split("&"))
     return parts["exp"], parts["sig"]
+
+
+# ---------- download-related Settings derivation ----------
+
+
+def _settings_from_env(monkeypatch, **env) -> Settings:
+    for k, v in env.items():
+        if v is None:
+            monkeypatch.delenv(k, raising=False)
+        else:
+            monkeypatch.setenv(k, v)
+    return Settings.from_env()
+
+
+def test_negative_download_ttl_is_clamped_to_never_expires(monkeypatch):
+    """mint() treats every ttl <= 0 as never-expiring, so the settings value is
+    clamped to the 0 it behaves as — otherwise the boot log reports "-1s" as an
+    active expiry while every issued link is a permanent capability."""
+    s = _settings_from_env(monkeypatch, CLAUDE_WRAPPER_DOWNLOAD_URL_TTL="-1")
+    assert s.download_url_ttl_seconds == 0
+
+
+def test_public_base_url_is_stripped_before_use(monkeypatch):
+    # " / " must not survive as a link base; it collapses to unset.
+    s = _settings_from_env(monkeypatch, CLAUDE_WRAPPER_PUBLIC_BASE_URL=" / ")
+    assert s.public_base_url == ""
+
+
+def test_download_links_signed_requires_enforcement_not_just_a_key(monkeypatch):
+    """An explicit signing key with no API keys stamps exp/sig onto links that
+    the route never verifies (download_auth_dependency returns before verify()
+    when require_auth is off). Reporting must key off this property, not off
+    the raw key."""
+    s = _settings_from_env(
+        monkeypatch,
+        CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY="k" * 32,
+        CLAUDE_WRAPPER_API_KEYS=None,
+    )
+    assert s.download_signing_key and not s.download_links_signed
+    s2 = _settings_from_env(
+        monkeypatch,
+        CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY="k" * 32,
+        CLAUDE_WRAPPER_API_KEYS="secret-key",
+    )
+    assert s2.download_links_signed is True
 
 
 # ---------- _file_download_url ----------
@@ -285,6 +331,34 @@ def test_a_task_spawned_in_a_request_inherits_that_origin():
 
     assert asyncio.run(scenario()) == ["https://chat.example"]
     assert request_origin.current_origin() == ""
+
+
+def test_batch_dispatch_forwards_the_submitters_origin():
+    """The context copy above is necessary but not sufficient: _dispatch
+    re-enters the app over ASGI, and RequestOriginMiddleware runs again on the
+    inner request, deriving the origin from the inner client's base URL. Before
+    the fix that base was the literal "http://batch", so every generated-file
+    link in a batch output pointed at a dead host; _dispatch now forwards the
+    copied origin as the base URL."""
+    seen: list[str] = []
+
+    @app.post("/_test_batch_origin")
+    async def _probe():
+        seen.append(request_origin.current_origin())
+        return {}
+
+    async def scenario():
+        token = request_origin._ORIGIN.set("https://chat.example")
+        try:
+            await routes_batches._dispatch("/_test_batch_origin", {})
+        finally:
+            request_origin._ORIGIN.reset(token)
+
+    try:
+        asyncio.run(scenario())
+        assert seen == ["https://chat.example"]
+    finally:
+        app.router.routes = [r for r in app.router.routes if getattr(r, "path", "") != "/_test_batch_origin"]
 
 
 # ---------- the download route ----------

@@ -113,18 +113,6 @@ class ResponseFormat(BaseModel):
     json_schema: Optional[dict[str, Any]] = None
 
 
-class ResponseFormat(BaseModel):
-    """OpenAI structured-output request (the ``response_format`` parameter).
-
-    ``json_schema`` holds the OpenAI envelope ({"name", "schema", "strict"})
-    or, from lenient clients, the bare JSON Schema itself.
-    """
-
-    model_config = ConfigDict(extra="allow")
-    type: str = "text"  # "text" | "json_object" | "json_schema"
-    json_schema: Optional[dict[str, Any]] = None
-
-
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str

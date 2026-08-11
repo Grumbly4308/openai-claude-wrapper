@@ -1275,16 +1275,12 @@ For the **single-container** layout:
 docker compose run --rm -it claude-wrapper login   # opens the TUI; type /login
 ```
 
-For the **sandboxed** layout there is one trap:
-
-- The agent has no direct route out and defers DNS to Squid, and OAuth fails
-  there with `OAuth error: Invalid IP address: undefined`. This affects **any**
-  OAuth flow in that container, not just the interactive one — `setup-token`
-  fails identically, which rules out the callback as the cause.
-
-Note what is *not* the problem: `claude-home` is mounted **writable** on
-`claude-agent` (it is read-only only on `claude-wrapper`), so the volume is not
-what blocks a login aimed at the agent.
+For the **sandboxed** layout, the interactive flows need a browser, which the
+agent container will never have — `/login` and `setup-token` both stall at
+"Opening browser to sign in…" there. (If you instead see
+`OAuth error: Invalid IP address: undefined`, that's a different problem:
+`CLAUDE_CODE_PROXY_RESOLVES_HOSTS` is set — it's off by default for exactly
+this reason; see CREDENTIALS-FIX.md Round 4.)
 
 The reliable approach is to do the one-time login in a container with ordinary
 networking, writing into the same volume the agent reads. This is a legitimate
@@ -1584,7 +1580,7 @@ Each of the corresponding misconfigurations otherwise fails silently.
 | Symptom | Likely cause |
 | --- | --- |
 | `PermissionError: … '/data/assistants'` at boot | `CLAUDE_UID` disagrees with the uid baked into the image — see [below](#changing-claude_uid-after-first-run) |
-| `OAuth error: Invalid IP address: undefined` | Any OAuth flow attempted inside the sandboxed agent — `setup-token` fails the same way — see [First-time login](#first-time-login) |
+| `OAuth error: Invalid IP address: undefined` | `CLAUDE_CODE_PROXY_RESOLVES_HOSTS` is set (off by default since 2026-08-11) — unset it and recreate; see CREDENTIALS-FIX.md Round 4 |
 | `claude login` opens a chat session instead of authenticating | There is no `login` subcommand; the word is parsed as a prompt. Use the TUI's `/login` |
 | `claude failed: claude exited 1:` with empty stderr | Usually an expired credential. The boot log names it; `claude -p hi` inside the agent prints the real 401 — see [Keeping the credential alive](#keeping-the-credential-alive) |
 | squid `FATAL: failed to open /var/cache/squid/squid.pid` | tmpfs mode under rootless podman; check `RestartCount` — see [Rootless podman caveats](#rootless-podman-caveats) |
@@ -1599,7 +1595,6 @@ Each of the corresponding misconfigurations otherwise fails silently.
 | KB queries return nothing | A collection *name* was used where the *id* is required |
 | Claude answers on assumptions instead of asking | `CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS` interpolated empty from compose |
 | Every sandbox run dies instantly | The target host isn't on the allowlist; on older CLIs possibly DNS (see the `CLAUDE_CODE_PROXY_RESOLVES_HOSTS` note — do not set it casually, it disables in-agent OAuth) |
-| Login/refresh fails with `Invalid IP address: undefined` | `CLAUDE_CODE_PROXY_RESOLVES_HOSTS` is set — unset it and recreate; see CREDENTIALS-FIX.md Round 4 |
 | Inbox files unreadable under rootless podman | Host uid maps to container 0; needs `userns_mode: keep-id` |
 | Old chats fail fast, new chats work | A dead `--resume` target; the wrapper self-heals on the next turn |
 

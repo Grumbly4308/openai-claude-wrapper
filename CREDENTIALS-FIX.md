@@ -1,5 +1,16 @@
 # Credential handling: what broke and how to fix it
 
+> **CLOSED 2026-08-11 — read this box, treat everything below as history.**
+> Root cause of every OAuth failure in the sandbox: `CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1`
+> with a hostname-addressed proxy breaks the CLI's OAuth client (Round 4).
+> The flag is now off by default and in-agent refresh is verified working on
+> the live stack. Final state: log in once from outside the sandbox (README
+> "First-time login"); the agent renews its own token through Squid; the
+> `claude-refresher` service covers idle stretches; the boot report warns
+> before any expiry. This document is the investigation record — several
+> interim conclusions below were later overturned, each marked where it
+> happens.
+
 Three separate problems got tangled into one confusing experience. Untangling
 them first, because the fix for each is different.
 
@@ -47,8 +58,8 @@ refresh even in principle. Resolved, but it masked problems 1 and 2 throughout.
 
 | Artefact | Where it lives | Lifetime | What renews it |
 | --- | --- | --- | --- |
-| Access token | `.credentials.json` → `expiresAt` | ~8 hours | CLI, from the refresh token, when it runs — **but not inside the sandbox; measured, see Outcome** |
-| Refresh token | `.credentials.json` → `refreshTokenExpiresAt` | ~30 days (yours: Sep 9) | Nothing, since the renewal it would drive never fires here |
+| Access token | `.credentials.json` → `expiresAt` | ~8 hours | CLI, from the refresh token, when it runs — *including inside the sandbox, once Round 4's fix landed* |
+| Refresh token | `.credentials.json` → `refreshTokenExpiresAt` | ~30 days (yours: Sep 9) | Open question — watch the refresher's log to see whether it rolls forward |
 | Setup token | printed to stdout; now in `.env` | ~1 year | Nothing; static until it expires |
 
 There is no contradiction. The 8h and 30d numbers describe the **old
@@ -116,9 +127,10 @@ questions before concluding anything.
 
 - [x] Run `tools/credential_refresh_test.sh`, which forces the question in one
       go rather than waiting ~8h for a natural expiry
-- [x] **Result: it does not work here.** See Outcome. Steps 1 and 2 therefore do
-      not give you a self-sustaining deployment, and the long-lived token is the
-      primary credential under the sandbox topology, not the break-glass one.
+- [x] ~~**Result: it does not work here.**~~ *Overturned by Round 4: it failed
+      because of `CLAUDE_CODE_PROXY_RESOLVES_HOSTS`, not the topology. With the
+      flag off the same test passes — `REFRESH WORKS`, verified live — and the
+      login is self-sustaining after all.*
 
 ### 4. Documentation corrections
 
@@ -185,13 +197,12 @@ token sat there unused. The control is in the record above: the same request
 path succeeded from this same volume credential while its access token was
 fresh, so the difference between working and failing is expiry alone.
 
-**Consequence: a login cannot sustain itself under the sandbox topology** — on
-its own. The conclusion this section first drew (long-lived token as primary,
-step 2 in reverse) held for a few hours; "The fix, round 2" below supersedes
-it by renewing the login from outside the sandbox, which restores the login as
-primary and the token as break-glass. The remaining question about *why*
-in-agent renewal is blocked is still the `CLAUDE_CODE_PROXY_RESOLVES_HOSTS`
-experiment below.
+**Consequence: a login cannot sustain itself under the sandbox topology** — a
+conclusion that was overturned twice. Round 2 below worked around it by
+renewing from outside the sandbox; Round 4 then found the actual cause
+(`CLAUDE_CODE_PROXY_RESOLVES_HOSTS`) and removed it, after which the login
+sustains itself in-agent too. The long-lived token ended where it started:
+break-glass.
 
 ## The fix, round 2 (2026-08-11): log in once, run forever
 
@@ -255,7 +266,9 @@ whole path works without minting anything.
 meets:**
 
 1. `HTTP(S)_PROXY` set — the refresh client honors it (measured, both versions)
-2. `CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` where DNS returns NOTIMP (docker)
+2. ~~`CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` where DNS returns NOTIMP (docker)~~
+   *— overturned in Round 4: the flag is the root cause of the failure, not a
+   requirement, and current CLIs don't need it*
 3. CONNECT to `platform.claude.com:443` allowed — allowlisted since `2a5440f`
 4. A refresh token the server still accepts — **the one link the in-stack
    failure never tested in isolation**

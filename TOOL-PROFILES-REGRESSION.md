@@ -142,12 +142,15 @@ default. Set a real model id there.
 
 ## C. Profiles (edit `sandbox/profiles.json`, `$DC restart claude-wrapper`)
 
-Use this test profile:
+Use this test profile. It casts one model as "restricted" and one as
+"augmented"; pick ids that exist in **your** RT-1 output — deployments whose
+CLI build ships no haiku should use `claude-sonnet-4-5` as the restricted
+model, as here:
 
 ```json
 {"models": [
-  {"match": "claude-haiku-*", "remove": ["client_tools", "web_search"]},
-  {"match": "claude-sonnet-*", "add": ["time_calc", "memory"]}
+  {"match": "claude-sonnet-4-5", "remove": ["client_tools", "web_search"]},
+  {"match": "claude-sonnet-5", "add": ["time_calc", "memory"]}
 ]}
 ```
 
@@ -157,25 +160,27 @@ Use this test profile:
   **fails to start, naming the entry** (`$DC logs claude-wrapper`). Restore
   the file.
 
-- [ ] **RT-11 — CLI web-search gating** — Haiku, Function Calling = *Default*:
+- [ ] **RT-11 — CLI web-search gating** — the restricted model, Function
+  Calling = *Default*:
   > "Search the web for today's top tech headline."
 
-  Haiku says it can't browse; the same prompt on Sonnet searches (via squid —
-  no allowlist change involved).
+  The restricted model says it can't browse; the same prompt on the
+  augmented model searches (via squid — no allowlist change involved).
 
-- [ ] **RT-12 — bridge denial is a hard 400** — Haiku, Function Calling =
-  *Native*, send any message. OpenWebUI surfaces an error naming
+- [ ] **RT-12 — bridge denial is a hard 400** — the restricted model,
+  Function Calling = *Native*, send any message. OpenWebUI surfaces an error naming
   `client_tools` and the declared tool names — not silent prose. (Designed
   behavior; note UX feedback here if 400 feels wrong in practice.)
 
-- [ ] **RT-13 — wrapper calculator, streaming, invisible** — Sonnet, *Native*:
+- [ ] **RT-13 — wrapper calculator, streaming, invisible** — the augmented
+  model (`claude-sonnet-5`), *Native*:
   > "What is 234.7 * 89.3 / 1.7, exactly? Don't estimate."
 
   Exact answer streams as plain text (≈ 12329.48…); **no tool-call card**
   for `calculate` appears; OpenWebUI's own tools still work in the same chat.
 
-- [ ] **RT-14 — wrapper memory, per conversation** — Sonnet, *Native*, one
-  conversation:
+- [ ] **RT-14 — wrapper memory, per conversation** — the augmented model,
+  *Native*, one conversation:
   > "Remember that my favorite deployment target is Podman."
 
   …then a few turns later:

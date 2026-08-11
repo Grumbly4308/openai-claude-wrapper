@@ -122,8 +122,20 @@ def test_health() -> None:
 def test_models() -> None:
     r = client.get("/v1/models")
     check("models.list", r.status_code == 200 and isinstance(r.json().get("data"), list))
+    entries = r.json().get("data") or [{}]
+    check(
+        "models.list.capabilities",
+        all(isinstance(m.get("capabilities"), list) and m["capabilities"] for m in entries),
+    )
+    # Terminal is env-gated (CLAUDE_WRAPPER_EXPOSE_TERMINAL, unset here) and
+    # must never be advertised without the operator opting in.
+    check(
+        "models.list.terminal_gated",
+        all("terminal" not in m.get("capabilities", []) for m in entries),
+    )
     r = client.get("/v1/models/claude-sonnet-4-6")
     check("models.retrieve", r.status_code == 200 and r.json()["id"] == "claude-sonnet-4-6")
+    check("models.retrieve.capabilities", "vision" in (r.json().get("capabilities") or []))
     r = client.get("/v1/models/does-not-exist")
     check("models.retrieve.404", r.status_code == 404)
 

@@ -28,68 +28,68 @@ Check items off as they land; keep one PR per phase where practical.
 
 ## Phase 1 — Advertise
 
-- [ ] Attach resolved capabilities as extra fields on `/v1/models` entries
-- [ ] Extend `tests/test_endpoints.py` for the enriched model list
-- [ ] Write `deploy/openwebui_capability_sync.py` — a **puller that resides
+- [x] Attach resolved capabilities as extra fields on `/v1/models` entries
+- [x] Extend `tests/test_endpoints.py` for the enriched model list
+- [x] Write `deploy/openwebui_capability_sync.py` — a **puller that resides
       on the OpenWebUI host**: reads the wrapper's `/v1/models` (capabilities
       included) and writes the toggles via OpenWebUI's local admin API. The
       wrapper never contacts OpenWebUI. (Needed because OpenWebUI doesn't map
       pulled metadata into its capability toggles; delete if it ever does)
 - [ ] Confirm the OpenWebUI model-update endpoint shape against the deployed
       version; pin the minimum supported OpenWebUI version in the script
-- [ ] Document puller usage (env vars: wrapper URL, OpenWebUI URL + admin
+- [x] Document puller usage (env vars: wrapper URL, OpenWebUI URL + admin
       key; run via cron or OpenWebUI startup hook)
 
 ## Phase 2 — Enforce: CLI path
 
-- [ ] Map capabilities → Claude Code tool names (terminal→Bash,
+- [x] Map capabilities → Claude Code tool names (terminal→Bash,
       web_search→WebSearch/WebFetch, sub_agents→Task)
-- [ ] Build per-request `--disallowedTools` from the model's profile in
+- [x] Build per-request `--disallowedTools` from the model's profile in
       `claude_runner.py` — **chat runs only**; delegation runs (audio,
       images, embeddings — they do their work through Bash) are never gated
-- [ ] Fold `clarify_disallowed_tools` into the same mechanism (keep the env
+- [x] Fold `clarify_disallowed_tools` into the same mechanism (keep the env
       var working; deprecation note in README)
-- [ ] Tests: terminal-off model gets Bash disallowed in chat; delegation argv
+- [x] Tests: terminal-off model gets Bash disallowed in chat; delegation argv
       never gated; with `CLAUDE_WRAPPER_EXPOSE_TERMINAL` set the default
       profile's argv is byte-for-byte today's
 
 ## Phase 3 — Enforce: tool bridge
 
-- [ ] Filter client-declared tools against the profile; return a 400 naming
+- [x] Filter client-declared tools against the profile; return a 400 naming
       the denied tool (decided: hard-fail over silent strip)
-- [ ] Inject server-side web search when profiled: `web_search_20260209` for
+- [x] Inject server-side web search when profiled: `web_search_20260209` for
       capable families, `web_search_20250305` otherwise
-- [ ] Inject server-side code execution when profiled
+- [x] Inject server-side code execution when profiled
 - [ ] Enable citations on document blocks when profiled
-- [ ] Keep injected + client tools deterministically ordered (cache safety)
-- [ ] Extend `tests/test_tool_bridge.py`: allow, deny, injection, version
+- [x] Keep injected + client tools deterministically ordered (cache safety)
+- [x] Extend `tests/test_tool_bridge.py`: allow, deny, injection, version
       selection per family, ordering stability
 
 ## Phase 4 — Wrapper-owned tools (hybrid loop)
 
 - [x] Decide memory storage shape — file-path model (what Claude Code uses
       organically; matches `memory_20250818` semantics)
-- [ ] Implement the hybrid loop in the bridge: wrapper-owned tools execute
+- [x] Implement the hybrid loop in the bridge: wrapper-owned tools execute
       inline, client tools still return to the caller
-- [ ] Guard against infinite loops (max iterations per turn)
-- [ ] Implement Time & Calc as the first wrapper-owned tool (proves the loop)
-- [ ] Implement Memory (`memory_20250818`) with per-conversation storage
+- [x] Guard against infinite loops (max iterations per turn)
+- [x] Implement Time & Calc as the first wrapper-owned tool (proves the loop)
+- [x] Implement Memory (`memory_20250818`) with per-conversation storage
       under the existing data dir
-- [ ] Tests: hybrid turn with one wrapper tool + one client tool; memory
+- [x] Tests: hybrid turn with one wrapper tool + one client tool; memory
       persists across turns; iteration cap trips cleanly
 
 ## Phase 5 — Image generation
 
 - [ ] Choose/configure the external backend (env: backend URL + key)
-- [ ] Wire `routes_images.py` to the backend
+- [x] Wire `routes_images.py` to the backend
 - [ ] Expose image generation as a wrapper-owned tool for profiled models
-- [ ] Tests with the backend faked
+- [x] Tests with the backend faked
 
 ## Phase 6 — Docs & hardening
 
-- [ ] README: profiles configuration reference + example profile file,
+- [x] README: profiles configuration reference + example profile file,
       including `CLAUDE_WRAPPER_EXPOSE_TERMINAL` and why it defaults off
-- [ ] Ship `deploy/` example profile matching current default behavior
+- [x] Ship `deploy/` example profile matching current default behavior
 - [ ] End-to-end pass against a live OpenWebUI (toggles, tool calls, denials)
-- [ ] Migration note: absent profile file == today's behavior
-- [ ] Run full test suite + `qa` if available; fix fallout
+- [x] Migration note: absent profile file == today's behavior
+- [x] Run full test suite + `qa` if available; fix fallout

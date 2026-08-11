@@ -16,6 +16,10 @@ from pathlib import Path
 _TMP = tempfile.mkdtemp(prefix="claude-wrapper-clarify-")
 os.environ["CLAUDE_WRAPPER_DATA"] = _TMP
 os.environ["CLAUDE_WRAPPER_MODEL_DISCOVERY"] = "off"
+# These tests pin the clarify flag mechanics, not capability gating: run with
+# the terminal gate open so the profile layer contributes nothing to the argv
+# (the gating variants are pinned in test_profile_argv.py).
+os.environ["CLAUDE_WRAPPER_EXPOSE_TERMINAL"] = "true"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.claude_runner import ClaudeRunner, SessionRegistry  # noqa: E402

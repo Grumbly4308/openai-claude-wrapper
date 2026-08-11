@@ -37,7 +37,7 @@ already relays or can relay; nothing to execute.
 | Usage | native `usage` passthrough (already works) | both |
 | Citations | `citations: {enabled}` on document blocks / web search results | bridge |
 | Status Updates | existing reasoning/activity stream frames | CLI |
-| Web Search | server-side `web_search_20260209` (older families: `_20250305`); CLI's own WebSearch tool on the CLI path | both |
+| Web Search | CLI's own WebSearch tool on the CLI path; on the bridge, server-side `web_search_20260209` (older families: `_20250305`) behind the extra `CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH` opt-in, because the capability defaults on for the CLI's sake and silent server-tool billing would break the no-op-default promise | both |
 | Code Interpreter | server-side `code_execution` tool (Anthropic sandbox) | bridge |
 | Terminal | Claude Code's bash tool; profile grant **and** the `CLAUDE_WRAPPER_EXPOSE_TERMINAL` env gate both required; enforced via `--disallowedTools` on chat runs only | CLI |
 | Memory | `memory_20250818` client-side tool, wrapper-owned storage per conversation | bridge |

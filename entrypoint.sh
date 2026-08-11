@@ -92,14 +92,15 @@ cmd_agent() {
 }
 
 cmd_refresher() {
-    # Keeps the volume login alive from OUTSIDE the sandbox. Measured fact
-    # (tools/credential_refresh_test.sh): the CLI cannot renew its OAuth token
-    # through the allowlist proxy, so a login exercised only in-sandbox dies
-    # ~8h after its last renewal. This role runs the same CLI against the same
-    # claude-home volume from a container with ordinary networking — the
-    # position the first-time /login already works from — and spends one
-    # minimal turn whenever the access token nears expiry, which makes the
-    # CLI rewrite .credentials.json for every reader of the volume.
+    # Keeps the volume login alive regardless of traffic. Renewal happens only
+    # when the CLI runs, so an idle deployment drifts past expiry no matter
+    # how healthy its network path is (CREDENTIALS-FIX.md, Round 3: the
+    # refresh client itself is proxy-capable). This role runs the same CLI
+    # against the same claude-home volume from a container with ordinary
+    # networking — the position the first-time /login already works from —
+    # and spends one minimal turn whenever the access token nears expiry,
+    # which makes the CLI rewrite .credentials.json for every reader of the
+    # volume.
     #
     # An environment credential would make the CLI ignore the file entirely,
     # so this loop would burn turns renewing nothing. Refuse rather than

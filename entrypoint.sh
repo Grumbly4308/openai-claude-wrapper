@@ -5,10 +5,30 @@ CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-${HOME:-/home/claude}/.claude}"
 mkdir -p "${CLAUDE_WRAPPER_WORKSPACE}" "${CLAUDE_WRAPPER_FILES}" "${CLAUDE_WRAPPER_SESSIONS}" "${CLAUDE_HOME}"
 
 has_saved_login() {
-    # Claude Code stores credentials in ~/.claude/ — presence of any of
-    # these files means a previous login is persisted.
-    [[ -f "${CLAUDE_HOME}/.credentials.json" ]] \
-        || [[ -f "${CLAUDE_HOME}/credentials.json" ]] \
+    # Claude Code stores credentials in ~/.claude/ — but presence alone is not
+    # enough: the file survives its own expiry, and once the refresh window is
+    # past, re-login is needed regardless of what is on disk. Treating a dead
+    # file as "logged in" is how the no-auth warning never fired on a
+    # deployment that was already failing every turn.
+    if [[ -f "${CLAUDE_HOME}/.credentials.json" ]]; then
+        python3 - "${CLAUDE_HOME}/.credentials.json" <<'PY' 2>/dev/null
+import json, sys, time
+try:
+    o = json.load(open(sys.argv[1])).get('claudeAiOauth') or {}
+except Exception:
+    raise SystemExit(1)
+if not o.get('accessToken'):
+    raise SystemExit(1)
+# The refresh window decides viability when recorded (an expired access token
+# with live refresh is renewable); a file with no readable expiry counts as
+# viable rather than dead — opaque is not the same as expired.
+exp = o.get('refreshTokenExpiresAt') or o.get('expiresAt')
+if isinstance(exp, (int, float)) and exp / 1000 <= time.time():
+    raise SystemExit(1)
+PY
+        return
+    fi
+    [[ -f "${CLAUDE_HOME}/credentials.json" ]] \
         || [[ -f "${CLAUDE_HOME}/auth.json" ]] \
         || [[ -d "${CLAUDE_HOME}/projects" && -n "$(ls -A "${CLAUDE_HOME}/projects" 2>/dev/null || true)" ]]
 }
@@ -21,18 +41,26 @@ warn_if_no_auth() {
     if ! has_saved_login && ! has_env_auth; then
         cat >&2 <<'MSG'
 ================================================================
-  claude-wrapper: no saved Claude Code login found and no
-  ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN env var set.
+  claude-wrapper: no usable Claude Code credential. No
+  ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN env var is set,
+  and the volume login is missing or past its refresh window.
 
-  Mint a long-lived token once — it persists to the mounted
-  volume and does not depend on the CLI refreshing it:
+  Bootstrap a login into the volume from a container with
+  ordinary networking (see README "First-time login"):
+
+      docker compose run --rm -it claude-wrapper claude
+      # type /login at the prompt, complete the flow, /exit
+
+  Under the sandbox topology the claude-refresher service keeps
+  that login renewed from there — no further action needed.
+
+  …or mint a ~1-year token and set it in .env (it is PRINTED,
+  not saved to the volume; also record the date so the boot
+  report can warn before it dies):
 
       docker compose run --rm -it claude-wrapper setup-token
-
-  …or, for a desktop-style interactive login (shorter-lived, and
-  its OAuth callback cannot complete inside the sandbox topology):
-
-      docker compose run --rm -it claude-wrapper login
+      # CLAUDE_CODE_OAUTH_TOKEN=<token>
+      # CLAUDE_CODE_OAUTH_TOKEN_MINTED=<today, YYYY-MM-DD>
 
   Then `docker compose up -d` as normal.
 
@@ -61,6 +89,80 @@ cmd_agent() {
     exec uvicorn src.agent_shim:app \
         --host "${CLAUDE_WRAPPER_HOST}" \
         --port "${CLAUDE_WRAPPER_AGENT_PORT:-8791}"
+}
+
+cmd_refresher() {
+    # Keeps the volume login alive from OUTSIDE the sandbox. Measured fact
+    # (tools/credential_refresh_test.sh): the CLI cannot renew its OAuth token
+    # through the allowlist proxy, so a login exercised only in-sandbox dies
+    # ~8h after its last renewal. This role runs the same CLI against the same
+    # claude-home volume from a container with ordinary networking — the
+    # position the first-time /login already works from — and spends one
+    # minimal turn whenever the access token nears expiry, which makes the
+    # CLI rewrite .credentials.json for every reader of the volume.
+    #
+    # An environment credential would make the CLI ignore the file entirely,
+    # so this loop would burn turns renewing nothing. Refuse rather than
+    # silently measure the wrong thing.
+    if [[ -n "${ANTHROPIC_API_KEY:-}" || -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+        echo "refresher: ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN is set — the" >&2
+        echo "CLI ignores the volume login while one is present, so this loop" >&2
+        echo "cannot renew anything. Compose pins both empty for this service;" >&2
+        echo "find what overrode that." >&2
+        exit 1
+    fi
+
+    local check="${CLAUDE_REFRESH_CHECK_SECONDS:-900}"
+    local below="${CLAUDE_REFRESH_BELOW_SECONDS:-14400}"
+    local retry="${CLAUDE_REFRESH_RETRY_SECONDS:-3600}"
+
+    # Prints "<access-remaining-s> <refresh-remaining-s|none>", or "none" when
+    # there is no readable login at all.
+    cred_expiry() {
+        python3 - "${CLAUDE_HOME}/.credentials.json" <<'PY' 2>/dev/null || echo none
+import json, sys, time
+o = json.load(open(sys.argv[1]))['claudeAiOauth']
+n = time.time()
+def rem(k):
+    v = o.get(k)
+    return str(int(v / 1000 - n)) if isinstance(v, (int, float)) else 'none'
+print(rem('expiresAt'), rem('refreshTokenExpiresAt'))
+PY
+    }
+
+    echo "refresher: watching ${CLAUDE_HOME}/.credentials.json" >&2
+    echo "refresher: check every ${check}s, renew below ${below}s, retry after ${retry}s" >&2
+    while :; do
+        local access refresh
+        read -r access refresh <<<"$(cred_expiry)"
+        if [[ "${access}" == "none" ]]; then
+            echo "refresher: no readable login in the volume — bootstrap one" >&2
+            echo "refresher: (README 'First-time login'); checking again in ${check}s" >&2
+            sleep "${check}"; continue
+        fi
+        # Both expiries logged every pass on purpose: whether refreshTokenExpiresAt
+        # rolls forward on renewal is an open question this log answers.
+        echo "refresher: access $((access / 60))m, refresh $([[ "${refresh}" == none ]] && echo none || echo "$((refresh / 86400))d ($((refresh / 60))m)")" >&2
+        if (( access < below )); then
+            echo "refresher: inside the renewal window — spending one CLI turn" >&2
+            claude -p ok --output-format json >/dev/null 2>&1 || true
+            local after after_refresh
+            read -r after after_refresh <<<"$(cred_expiry)"
+            if [[ "${after}" != "none" ]] && (( after > access )); then
+                echo "refresher: renewed — access $((after / 60))m, refresh $([[ "${after_refresh}" == none ]] && echo none || echo "$((after_refresh / 86400))d")" >&2
+            elif (( access > 0 )); then
+                # The CLI may decline to refresh a still-valid token; back off
+                # rather than burning a turn every pass until it does.
+                echo "refresher: turn ran but the token did not renew; retrying in ${retry}s" >&2
+                sleep "${retry}"; continue
+            else
+                # Expired is an outage — every agent turn is failing — so keep
+                # the short cadence and close it as fast as possible.
+                echo "refresher: token EXPIRED and the turn did not renew it; retrying in ${check}s" >&2
+            fi
+        fi
+        sleep "${check}"
+    done
 }
 
 cmd_login() {
@@ -106,6 +208,10 @@ case "${1:-serve}" in
     agent|shim)
         shift
         cmd_agent
+        ;;
+    refresher|refresh)
+        shift
+        cmd_refresher
         ;;
     login|init)
         shift

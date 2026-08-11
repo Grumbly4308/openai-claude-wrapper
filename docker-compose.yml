@@ -44,6 +44,7 @@ services:
       # OAuth login. Leave blank once you've run `compose run … login`.
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:-}"
+      CLAUDE_CODE_OAUTH_TOKEN_MINTED: "${CLAUDE_CODE_OAUTH_TOKEN_MINTED:-}"
 
       # Comma-separated bearer tokens clients must send as
       # `Authorization: Bearer <key>`. Leave unset to disable wrapper auth.

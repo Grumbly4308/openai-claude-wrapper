@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 log = logging.getLogger("claude_wrapper.config")
 
@@ -515,3 +518,194 @@ def split_model_effort(model: str) -> tuple[str, str | None]:
         if base.strip() and lvl.strip().lower() in _EFFORT_CHOICE_SET:
             return base.strip(), lvl.strip().lower()
     return m, None
+
+
+# ---------- Claude Code credentials ----------
+
+# Where the CLI persists an interactive login. The tool bridge reads the same
+# file for its direct Messages API calls, which is why it is configurable.
+CREDENTIALS_FILE = Path(
+    os.environ.get(
+        "CLAUDE_WRAPPER_CREDENTIALS_FILE",
+        str(Path.home() / ".claude" / ".credentials.json"),
+    )
+)
+
+# A login that expires within a month is treated as short-lived. The CLI renews
+# its token whenever it runs, so that kind of credential only stays valid while
+# the wrapper is *used* and its egress works — an idle deployment, or one whose
+# proxy is down, drifts past expiry with nothing in the logs until every turn
+# starts failing with a 401 the CLI reports as its own error. `claude
+# setup-token` mints a credential measured in months instead, which is what a
+# headless deployment wants.
+_LONG_LIVED_SECONDS = 30 * 24 * 3600
+
+# A login renews itself, so its refresh window only deserves a warning once
+# re-authenticating is actually near. A fresh login is ~30 days, and warning
+# about that at every boot would train you to ignore the line.
+_RELOGIN_SOON_SECONDS = 7 * 24 * 3600
+
+
+def _describe_duration(seconds: float) -> str:
+    """Coarse, human-readable duration: the boot log wants '12d', not '12.4d'."""
+    seconds = abs(int(seconds))
+    if seconds >= 86400:
+        return f"{seconds // 86400}d"
+    if seconds >= 3600:
+        return f"{seconds // 3600}h"
+    if seconds >= 60:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+@dataclass(frozen=True)
+class CredentialStatus:
+    """The credential this container will actually authenticate with.
+
+    ``kind`` follows tool_bridge.resolve_auth's precedence exactly, so what gets
+    reported at boot is what a request would really use — not merely what is
+    present. ``expires_in`` is None when there is no expiry to read: an API key,
+    an opaque env token, or a credentials file without an ``expiresAt``.
+    """
+
+    kind: str  # "api-key" | "env-token" | "oauth-file" | "none"
+    expires_in: Optional[float] = None
+    # The file actually inspected. Carried on the status rather than read from
+    # the module constant so the log names the path that was checked, which is
+    # the whole point of printing it.
+    path: Optional[Path] = None
+    # Seconds until the REFRESH token dies. This is the number that decides
+    # whether you ever have to log in again — expires_in only describes the
+    # access token, which the CLI renews by itself.
+    refresh_in: Optional[float] = None
+
+    @property
+    def expired(self) -> bool:
+        return self.expires_in is not None and self.expires_in <= 0
+
+    @property
+    def short_lived(self) -> bool:
+        """Whether this credential runs out soon in the way that matters.
+
+        Keyed off the refresh window when there is one: an access token good for
+        8 hours is not short-lived if a 30-day refresh token renews it, and
+        warning about that is noise. Only when no refresh token is present does
+        the access token's own expiry become the deadline.
+        """
+        if self.refresh_in is not None:
+            return 0 < self.refresh_in < _RELOGIN_SOON_SECONDS
+        return self.expires_in is not None and 0 < self.expires_in < _LONG_LIVED_SECONDS
+
+    def describe(self) -> str:
+        where = self.path or CREDENTIALS_FILE
+        if self.kind == "api-key":
+            return "ANTHROPIC_API_KEY (no expiry)"
+        if self.kind == "env-token":
+            return "CLAUDE_CODE_OAUTH_TOKEN from the environment (expiry not readable here)"
+        if self.kind == "none":
+            return f"NONE — no API key, no env token, and no usable login in {where}"
+        if self.expires_in is None:
+            return f"Claude Code login ({where}, no expiry recorded)"
+        renew = (
+            f", re-login needed in {_describe_duration(self.refresh_in)}"
+            if self.refresh_in is not None and self.refresh_in > 0
+            else ""
+        )
+        if self.expired:
+            return (
+                f"Claude Code login ({where}) EXPIRED "
+                f"{_describe_duration(self.expires_in)} ago{renew}"
+            )
+        return (
+            f"Claude Code login ({where}), access valid for "
+            f"{_describe_duration(self.expires_in)}{renew}"
+        )
+
+
+def _epoch_seconds(raw: object) -> Optional[float]:
+    """Milliseconds-since-epoch -> seconds from now, or None when unreadable."""
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        return None
+    return raw / 1000 - time.time()
+
+
+def read_file_credential(path: Optional[Path] = None) -> CredentialStatus:
+    """Inspect the on-disk login, ignoring the environment entirely.
+
+    Separate from read_credential_status because an env credential wins but does
+    NOT renew this file — so the boot report has to be able to look underneath.
+    """
+    where = path or CREDENTIALS_FILE
+    try:
+        data = json.loads(where.read_text())
+    except (OSError, json.JSONDecodeError):
+        return CredentialStatus("none", path=where)
+    oauth = data.get("claudeAiOauth") or {}
+    if not str(oauth.get("accessToken") or ""):
+        return CredentialStatus("none", path=where)
+    return CredentialStatus(
+        "oauth-file",
+        _epoch_seconds(oauth.get("expiresAt")),
+        where,
+        _epoch_seconds(oauth.get("refreshTokenExpiresAt")),
+    )
+
+
+def read_credential_status(path: Optional[Path] = None) -> CredentialStatus:
+    """Inspect the credential in force, without validating it against the API."""
+    where = path or CREDENTIALS_FILE
+    if os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return CredentialStatus("api-key", path=where)
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
+        return CredentialStatus("env-token", path=where)
+    return read_file_credential(where)
+
+
+def log_credential_status(where: str, path: Optional[Path] = None) -> CredentialStatus:
+    """Report the credential state at boot. Called by every role that needs one.
+
+    Escalates deliberately: an expired credential is an error because nothing
+    will work until it is replaced, and a short-lived one is a warning because
+    it works now and fails later, which is the case that reaches production.
+    """
+    status = read_credential_status(path)
+    if status.kind == "none":
+        log.warning(
+            "%s credentials: %s — run `setup-token` (see README 'First-time login')",
+            where,
+            status.describe(),
+        )
+    elif status.expired:
+        log.error(
+            "%s credentials: %s. Every turn will fail with a 401 until this is "
+            "replaced — log in again with the CLI's /login, or set "
+            "CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`.",
+            where,
+            status.describe(),
+        )
+    elif status.short_lived:
+        log.warning(
+            "%s credentials: %s. Renewal depends on the CLI running with working "
+            "egress before then; if it lapses you need a fresh interactive login "
+            "(the CLI's /login — `claude login` is not an auth command).",
+            where,
+            status.describe(),
+        )
+    else:
+        log.info("%s credentials: %s", where, status.describe())
+
+    # An env credential wins, and the CLI then stops touching the on-disk login
+    # entirely — so a perfectly good volume credential sits there decaying, and
+    # the day the env token is removed you fall through to something that
+    # expired weeks ago. Nothing else surfaces that, so say it here.
+    if status.kind in ("api-key", "env-token"):
+        shadowed = read_file_credential(path)
+        if shadowed.kind != "none":
+            log.warning(
+                "%s credentials: a login also exists (%s) but is SHADOWED by the "
+                "environment credential — the CLI will not refresh it while that "
+                "is set, so it decays until it needs a fresh login.",
+                where,
+                shadowed.describe(),
+            )
+    return status

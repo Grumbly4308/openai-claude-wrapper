@@ -44,11 +44,20 @@ from .claude_runner import (
     _drain_stderr,
     _read_lines,
 )
-from .config import SETTINGS
+from .config import SETTINGS, log_credential_status
 
 log = logging.getLogger("claude_wrapper.agent_shim")
 
 app = FastAPI(title="Claude Wrapper Agent Shim", version="0.1.0")
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    # This container owns the writable credentials mount and is where the CLI
+    # actually authenticates, so an expired login shows up here first — as
+    # `claude exited 1` with empty stderr, which says nothing about the cause.
+    log_credential_status("Claude")
+
 
 # How much stderr to ship back in the exit record. The wrapper only ever quotes
 # the last 500 bytes into an error message; 2000 leaves headroom for logs.

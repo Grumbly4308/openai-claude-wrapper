@@ -1,121 +1,171 @@
 # claude-wrapper
 
-OpenAI-compatible HTTP API in front of [Claude Code](https://docs.claude.com/en/docs/claude-code), packaged as a Docker container.
+OpenAI-compatible HTTP API in front of [Claude Code](https://docs.claude.com/en/docs/claude-code), packaged as a container.
 
 - Drop-in replacement for `https://api.openai.com` in any OpenAI client.
-- Handles text, images, audio, video, and arbitrary binary files through
-  `chat/completions` multimodal content and a full `/v1/files` API.
+- Handles text, images, audio, video, PDFs and arbitrary binary files through
+  `chat/completions` multimodal content and a `/v1/files` API.
 - Serves many concurrent clients in parallel; requests that target the
   same conversation are serialized automatically to keep Claude Code's
   session log consistent.
+- Runs as a single container, or as a three-container sandbox where the
+  agent has no route to the internet except a domain allowlist.
+
+---
+
+## Contents
+
+- [Requirements](#requirements)
+- [Quick start (Docker Compose)](#quick-start-docker-compose)
+- [Quick start (Podman)](#quick-start-podman)
+- [Sandboxed deployment](#sandboxed-deployment-network-isolated-agent)
+- [Configuration reference](#configuration-reference)
+- [Endpoints](#endpoints)
+- [Chat features](#chat-features)
+- [Files in and out](#files-in-and-out)
+- [Conversation continuity](#conversation-continuity)
+- [Per-conversation usage cap](#per-conversation-usage-cap-usage-checkpoint)
+- [Models and reasoning effort](#models-and-reasoning-effort)
+- [Auth](#auth)
+- [Data and persistence](#data-and-persistence)
+- [Concurrency](#concurrency)
+- [Running the tests](#running-the-tests)
+- [Troubleshooting](#troubleshooting)
+- [Repository layout](#repository-layout)
+- [Limitations and known gaps](#limitations-and-known-gaps)
+
+---
 
 ## Requirements
 
-- Docker Engine 24+ with Compose v2 (`docker compose`, not `docker-compose`).
+- A container runtime with Compose v2 semantics. Either:
+  - **Docker Engine** with the `docker compose` plugin, or
+  - **Podman** (rootless is fine) — see [Quick start (Podman)](#quick-start-podman)
+    for the two ways to drive it and the caveats of each.
 - An Anthropic account that can log into Claude Code, **or** an
   `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`.
-- ~3 GB free disk for the image and persisted volumes.
+- Disk: budget **~5 GB** to be comfortable. The image itself lands around
+  2–3 GB (ffmpeg, imagemagick, librsvg, the Claude Code CLI, and `fastembed`,
+  which pulls `onnxruntime`). On top of that, the default embedding model
+  (~100 MB) downloads on first use, `faster-whisper` is installed lazily on
+  the first transcription, and `CLAUDE_WRAPPER_MAX_UPLOAD_BYTES` defaults to
+  2 GiB **per upload**.
 
-## 1. Configure
+The compose files use `${VAR:-default}` interpolation throughout and do not
+declare a `version:` key, so any Compose v2-compatible frontend works.
+
+---
+
+## Quick start (Docker Compose)
+
+### 1. Configure
 
 ```bash
 git clone <this-repo>
 cd claude-wrapper
 cp .env.example .env
+
+# Set the container identity from the account that will RUN the containers.
+# This is not auto-detected, and the shipped default (1000) is wrong for you
+# if `id -u` says anything else.
+sed -i "s/^CLAUDE_UID=.*/CLAUDE_UID=$(id -u)/; s/^CLAUDE_GID=.*/CLAUDE_GID=$(id -g)/" .env
+grep CLAUDE_.ID .env
 ```
 
-Open `.env` and set anything you need:
+> **Get this right before the first build.** `CLAUDE_UID` is used in two places
+> in every compose file: as a **build arg** (which creates the in-image `claude`
+> user and chowns `/data` to it) and as `user:` (the uid the process actually
+> runs as). If those disagree, `/data` is owned by one uid and written by
+> another, and the server crash-loops at import with
+> `PermissionError: [Errno 13] Permission denied: '/data/assistants'`. Because
+> it is a build arg, changing it later needs `--build`, and if volumes already
+> exist it needs the re-own procedure in
+> [Changing CLAUDE_UID after first run](#changing-claude_uid-after-first-run).
 
-| Variable | Purpose |
-| --- | --- |
-| `CLAUDE_UID` / `CLAUDE_GID` | Uid/gid the container runs as. Must match the host account that owns any bind-mounted path. Defaults to `1000`. |
-| `CLAUDE_INBOX_DIR` | Host drop folder, bind-mounted read-only at `/data/inbox`. Defaults to `./inbox`. |
-| `CLAUDE_WRAPPER_API_KEYS` | Comma-separated bearer tokens clients must send. Leave blank on a trusted network. |
-| `CLAUDE_WRAPPER_PORT` | Host + container port. Defaults to `8000`. |
-| `CLAUDE_WRAPPER_DEFAULT_MODEL` | Used when a request sets `"model": "auto"`. |
-| `ANTHROPIC_API_KEY` | Skip the interactive login — use API key auth instead. |
-| `CLAUDE_CODE_OAUTH_TOKEN` | Skip the interactive login — use a pre-minted OAuth token. |
+Then open `.env` and set what else you need. The full list is in
+[Configuration reference](#configuration-reference); these are the ones that
+matter on day one:
 
-Set `CLAUDE_UID` / `CLAUDE_GID` first, before you build. The container
-runs unprivileged as an in-image `claude` user, and that uid has to
-match the host account owning the inbox (and the credentials file, if
-you use the overlay in [Auth](#auth)) — otherwise the container reads
-those paths as a stranger and mode-600 files are simply unreadable:
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `CLAUDE_UID` / `CLAUDE_GID` | Uid/gid the container runs as. Must match the host account owning any bind-mounted path. | `1000` |
+| `CLAUDE_INBOX_DIR` | Host drop folder, bind-mounted read-only at `/data/inbox`. | `./inbox` |
+| `CLAUDE_WRAPPER_API_KEYS` | Comma-separated bearer tokens clients must send. Blank = unauthenticated. | blank |
+| `CLAUDE_WRAPPER_PORT` | Host + container port. | `8000` |
+| `CLAUDE_WRAPPER_DEFAULT_MODEL` | Used when a request sets `"model": "auto"` or omits the model. | `claude-opus-4-8` |
+| `ANTHROPIC_API_KEY` | Skip the interactive login — use API key auth instead. | blank |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Skip the interactive login — use a pre-minted OAuth token. | blank |
 
-```bash
-id -u   # -> CLAUDE_UID
-id -g   # -> CLAUDE_GID
-```
+The uid also has to match the host account owning the inbox (and the credentials
+file, if you use the overlay in [Auth](#auth)) — otherwise the container reads
+those paths as a stranger and mode-600 files are simply unreadable.
 
-These are baked into the image at build time, so changing them later
-needs `docker compose up -d --build`, not just a restart.
+**Copy `.env.example` to `.env` even if you change nothing in it.** Several
+compose defaults are deliberately different from the code defaults, and the
+compose file interpolates an *empty string* where `.env` would supply a value.
+The one that bites: `CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS` defaults to
+`AskUserQuestion` in code but interpolates to empty from compose, which silently
+turns off the AskUserQuestion suppression described under
+[Clarifying questions](#clarifying-questions-interactive). See
+[Defaults that differ](#defaults-that-differ-between-code-and-compose).
 
-If both `ANTHROPIC_API_KEY` and a persisted OAuth login are set, the
-env var wins. Most users should leave the auth vars blank and run the
-interactive login in step 3.
-
-## 2. Build the image
+### 2. Build the image
 
 ```bash
 docker compose build
 ```
 
-Builds `claude-wrapper:latest` from the pinned `node:22-bookworm-slim`
-base. Takes ~3 min on a cold cache. Re-runs are cached at the layer
-level, so only the layer holding your source changes rebuilds after
-you edit `src/`.
+Builds `claude-wrapper:latest` from `node:22-bookworm-slim`. Layer caching means
+only the layer holding `src/` rebuilds after you edit code, but note the build
+is **not reproducible**: the base image is a mutable tag (not digest-pinned) and
+`Dockerfile:28` installs `@anthropic-ai/claude-code@latest`, so two builds a week
+apart can ship different CLI versions — and therefore a different `/v1/models`
+list.
 
-Verify the build:
+Verify:
 
 ```bash
 docker images claude-wrapper:latest
 ```
 
-## 3. Initialize Claude Code credentials (one time)
+### 3. Initialize Claude Code credentials (one time)
 
-This runs Claude's OAuth flow inside the container and stores the
-resulting credentials in the `claude-home` Docker volume. They survive
-restarts, rebuilds, and `docker compose down`.
+Runs Claude's OAuth flow inside the container and stores the credentials in the
+`claude-home` volume, where they survive restarts, rebuilds and
+`docker compose down`.
 
 ```bash
-# Interactive — opens a browser-based OAuth flow (recommended):
+# Interactive — browser-based OAuth (recommended):
 docker compose run --rm -it claude-wrapper login
 
-# OR, for headless / CI — prints a URL + code, accepts a long-lived token:
+# OR headless / CI — prints a URL + code, accepts a long-lived token:
 docker compose run --rm -it claude-wrapper setup-token
 ```
 
-Skip this step entirely if you set `ANTHROPIC_API_KEY` or
-`CLAUDE_CODE_OAUTH_TOKEN` in `.env`.
+Skip this entirely if you set `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`
+in `.env`.
 
-## 4. Run the server
+### 4. Run the server
 
 ```bash
 docker compose up -d
 ```
 
-The container binds `0.0.0.0:${CLAUDE_WRAPPER_PORT:-8000}` and is
-reachable from loopback, LAN, or any peer container.
-
-Confirm it's up:
+The container binds `0.0.0.0:${CLAUDE_WRAPPER_PORT:-8000}` and is reachable from
+loopback, LAN, or any peer container. Confirm:
 
 ```bash
-curl -fsS http://localhost:8000/healthz
-# {"status":"ok"}
-
-docker compose ps
-# claude-wrapper  Up (healthy)
-```
-
-Tail logs:
-
-```bash
+curl -fsS http://localhost:8000/healthz     # {"status":"ok"}
+docker compose ps                           # claude-wrapper  Up (healthy)
 docker compose logs -f claude-wrapper
 ```
 
-## 5. First request
+The startup log reports the resolved model list, whether runs execute locally or
+remotely, and the state of the knowledge base, clarification and download-link
+features. Read it once — every one of those misconfigurations otherwise fails
+quietly. See [Troubleshooting](#troubleshooting).
 
-Point any OpenAI-compatible client at `http://<host>:8000/v1`:
+### 5. First request
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -138,54 +188,398 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-If `CLAUDE_WRAPPER_API_KEYS` is set, pass one of those tokens as the
-OpenAI `api_key` / `Authorization: Bearer …` header instead of
-`sk-anything`.
+If `CLAUDE_WRAPPER_API_KEYS` is set, pass one of those tokens as the OpenAI
+`api_key` / `Authorization: Bearer …` header instead of `sk-anything`.
 
-## Lifecycle cheatsheet
-
-```bash
-# stop the server (keeps volumes + credentials)
-docker compose down
-
-# stop and wipe everything (uploads, sessions, credentials, batches)
-docker compose down -v
-
-# rebuild after a code change, keeping credentials
-docker compose build && docker compose up -d
-
-# drop into a shell inside the running container
-docker compose exec claude-wrapper bash
-
-# run arbitrary claude CLI commands
-docker compose run --rm -it claude-wrapper claude --help
-
-# view what Claude wrote to disk (per-session)
-docker compose exec claude-wrapper ls /data/workspace
-```
-
-## Running the endpoint tests
-
-There's an ASGI-level smoke test that stubs Claude Code and hits every
-OpenAI-shaped route:
+### Lifecycle cheatsheet
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python tests/test_endpoints.py
-# RESULT pass=45 fail=0
+docker compose down                          # stop (keeps volumes + credentials)
+docker compose down -v                       # stop and wipe everything
+docker compose build && docker compose up -d # rebuild after a code change
+docker compose exec claude-wrapper bash      # shell inside the running container
+docker compose run --rm -it claude-wrapper claude --help   # any claude CLI command
+docker compose exec claude-wrapper ls /data/workspace      # what Claude wrote
 ```
 
-No Docker or Anthropic credentials required — the test monkey-patches
-the subprocess runner.
+---
+
+## Quick start (Podman)
+
+Podman runs this stack unmodified. Nothing in the project calls `podman`
+directly — the isolation comes from the compose topology, so whichever runtime
+you have is the one it uses. Rootless podman is a good fit here: the containers
+already run unprivileged (`USER claude` in the image, plus `user:`,
+`cap_drop: ALL` and `no-new-privileges:true` in compose), and rootless adds a
+user namespace underneath that.
+
+**Drive it with Compose v2 against the rootless podman socket.** That is the one
+path this README documents. Compose v2 is a client that speaks the Docker API
+over `DOCKER_HOST`, and podman's socket serves that API — so **no Docker daemon,
+no `docker` CLI and no `docker` group are involved**, and the containers still
+run under rootless podman. Everything in the
+[Docker quick start](#quick-start-docker-compose) then works verbatim; only the
+spelling changes, from `docker compose` to `docker-compose`.
+
+### Setup (one time)
+
+```bash
+# 1. Enable podman's Docker-compatible API socket (rootless, user-level)
+systemctl --user enable --now podman.socket
+loginctl enable-linger "$USER"          # keep containers alive after logout
+systemctl --user enable --now podman-restart.service   # honour restart: policies at boot
+
+# 2. Install the standalone Compose v2 binary (a single static file)
+sudo curl -fsSL -o /usr/local/bin/docker-compose \
+  "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$(uname -m)"
+sudo chmod +x /usr/local/bin/docker-compose
+docker-compose version                  # expect v2.x
+
+# 3. Point it at podman, persistently
+echo "export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock" >> ~/.bashrc
+export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock
+docker-compose ps                       # smoke test: connects, lists nothing
+```
+
+Then follow [1. Configure](#1-configure) onward, substituting `docker-compose`
+for `docker compose`. Steps 1–5 are otherwise identical.
+
+### Confirm you are still rootless
+
+```bash
+podman info --format '{{.Host.Security.Rootless}}'   # true
+systemctl --user status podman.socket                # a *user* unit
+ps -o user=,pid= -p "$(podman inspect -f '{{.State.Pid}}' claude-wrapper)"
+```
+
+**Do not run the compose command under `sudo`,** do not enable `podman.socket`
+as a system unit, and do not point `DOCKER_HOST` at `/run/podman/podman.sock`.
+Any of the three moves the containers to root-owned podman. Because `DOCKER_HOST`
+lives in your shell profile, `sudo docker-compose …` silently drops it and falls
+back to the root socket — so a command that "only works with sudo" is a signal
+something is misconfigured, not a reason to escalate.
+
+### Rootless podman caveats
+
+- **tmpfs mounts are root-owned 0755, not 1777.** Docker's default lets an
+  unprivileged service write its own tmpfs; podman's does not. Squid runs as
+  `proxy` and puts its pid file on the tmpfs at `/var/cache/squid`, so under
+  podman it fails at startup with
+  `FATAL: failed to open /var/cache/squid/squid.pid: (13) Permission denied`.
+  `docker-compose.sandbox.yml` pins `mode=1777` on both squid tmpfs mounts to
+  make the two runtimes agree. Pin the mode on any tmpfs you add for the same
+  reason — and note how this one presents, because it is the worst kind of
+  failure: `restart: unless-stopped` turns the crash into an invisible loop, so
+  `ps` shows the container "up" and only the restart count gives it away.
+
+  ```bash
+  podman inspect claude-squid --format '{{.State.Status}} restarts={{.RestartCount}}'
+  ```
+
+  A four-digit restart count means squid has never once started, and the agent
+  container has had no egress the entire time — which surfaces as CLI runs that
+  hang or exit 1, nowhere near the actual cause.
+- **Your host uid maps to container uid 0, not to itself.** Named volumes live
+  inside the user namespace and are unaffected, but a **bind mount** owned by
+  you appears root-owned inside the container, so mode-600 files in the inbox
+  are unreadable by the `claude` user. The fix is `userns_mode: keep-id` on the
+  app services, which makes host and container uid the same identity. Decide
+  this **before** you populate volumes — switching later remaps ownership under
+  data you have already written.
+- **SELinux hosts (Fedora/RHEL).** The bind-mounted `sandbox/squid.conf`,
+  `sandbox/allowlist.txt` and the inbox need a `:z` suffix or the container is
+  denied access. It is deliberately left out of the checked-in compose files
+  because relabeling touches files in your checkout — add it locally if your host
+  enforces SELinux.
+
+### If you are stuck with podman-compose
+
+It works, but it is not what this README is written against, and it diverges in
+two ways that have both caused real failures here:
+
+- **`run` rejects `-i`/`-t`.** `podman-compose run` allocates a TTY itself and
+  errors with `unrecognized arguments: -it`. Drop the flags, or bypass compose
+  for that step: `podman exec -it claude-wrapper /app/entrypoint.sh login`.
+- **`${VAR:-default}` may not expand.** The symptom is a service whose
+  environment holds the literal string, e.g. uvicorn dying with
+  `Invalid value for '--port': '${CLAUDE_WRAPPER_AGENT_PORT:-8791}'`. Check with
+  `podman exec claude-agent printenv CLAUDE_WRAPPER_AGENT_PORT`. Fix by
+  upgrading (`pipx install podman-compose`) or by setting every value explicitly
+  in `.env` rather than relying on the inline defaults.
+
+It also creates a **pod** per project, which Compose v2 does not. If you switch,
+tear the old world down first or `up` will fail with `container name … already
+in use` and leave a half-started stack:
+
+```bash
+podman rm -f claude-wrapper claude-agent claude-squid 2>/dev/null
+podman pod ls && podman pod rm -f <pod-name>
+```
+
+---
+
+## Sandboxed deployment (network-isolated agent)
+
+`docker-compose.sandbox.yml` splits the wrapper into three containers so the
+FastAPI server is the **only** externally reachable service and the agent —
+where model-driven tool use actually executes — has no route to the internet
+except through a domain allowlist:
+
+```
+[clients] ──> claude-wrapper (FastAPI — the only published port)
+                  │  backend network (internal: no external route)
+                  ├──> claude-agent  (Claude Code CLI behind src/agent_shim.py)
+                  │        │  HTTP(S)_PROXY egress only
+                  └───────>└──> squid ──> sandbox/allowlist.txt hosts
+```
+
+```bash
+docker compose -f docker-compose.sandbox.yml up -d --build
+```
+
+**Do the one-time login before you rely on it, and read
+[First-time login](#first-time-login) first.** It targets `claude-agent`, not
+`claude-wrapper` — that is where the CLI runs and where its credentials live —
+and the interactive OAuth callback cannot complete from inside the isolated
+agent, so the bootstrap needs a throwaway container with ordinary networking.
+
+Verify the allowlist end-to-end once it is up:
+
+```bash
+# allowed host — completes
+docker compose -f docker-compose.sandbox.yml exec claude-agent \
+    curl -sS -o /dev/null -w '%{http_code}\n' https://api.anthropic.com/
+# unlisted host — 403 from squid, in milliseconds
+docker compose -f docker-compose.sandbox.yml exec claude-agent \
+    curl -sS -o /dev/null -w '%{http_code}\n' https://example.com/
+```
+
+### How it works
+
+- When `CLAUDE_WRAPPER_AGENT_URL` is set, the wrapper stops spawning `claude`
+  locally and sends each run to the **agent shim** (`src/agent_shim.py`), a
+  minimal service exposing `GET /healthz` and `POST /run` that spawns the CLI and
+  streams its stream-json stdout back verbatim. The shim never takes the binary
+  path from the caller, confines `cwd` to the shared workspace volume, and can
+  require a bearer token (`CLAUDE_WRAPPER_AGENT_TOKEN`).
+- The per-session workspace is a volume mounted **at the same path in both
+  containers**, so uploads materialized by the API and files generated by the CLI
+  need no copying. The file store, session registry and usage ledgers stay
+  API-only; the CLI's credentials and session logs stay agent-only (the API mounts
+  `claude-home` read-only, for the tool bridge).
+- Squid is a **CONNECT-only** proxy — no TLS interception (`ssl_bump` appears
+  nowhere), no caching, no buffering of the token stream. It runs unprivileged
+  (`user: proxy`, `cap_drop: ALL`, pid file in `/var/cache/squid`) and enforces
+  `sandbox/allowlist.txt`: one host per line, a leading dot matching all
+  subdomains, exactly squid's `dstdomain` semantics. Denied hosts fail in
+  milliseconds, so the CLI's probes to unlisted hosts don't read as latency.
+  Plain HTTP on port 80 to an allowlisted host is permitted too, not only CONNECT.
+- The agent's proxy env (`HTTP_PROXY`/`HTTPS_PROXY`) is inherited by the CLI and
+  every Bash subshell it runs — curl, pip and git all flow through the allowlist
+  with no code changes.
+- `CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` is set on the agent and is **mandatory**.
+  The backend network is internal, so the embedded DNS refuses external lookups
+  (rcode NOTIMP); this flag makes the CLI hand the bare hostname to Squid, which
+  resolves it on the egress network. Without it every run dies before the CONNECT
+  is attempted.
+
+### The shipped allowlist
+
+Thirteen hosts are active out of the box:
+
+`api.anthropic.com`, `claude.ai`, `claude.com`, `code.claude.com`,
+`platform.claude.com`, `downloads.claude.ai`, `bridge.claudeusercontent.com`,
+`mcp-proxy.anthropic.com`, `.github.com`, `.gitlab.com`, `.npmjs.org`,
+`pypi.org`, `files.pythonhosted.org`.
+
+The eight Claude/Anthropic endpoints beyond `api.anthropic.com` support the
+interactive OAuth login and CLI features; `sandbox/allowlist.txt`'s own comments
+recommend deleting them on an API-key-only deployment. To change the list, edit
+the file and restart the squid container — the `./sandbox allow` helper referenced
+in that file's comments **does not exist in this repository**.
+
+### Operational notes
+
+Every API feature works identically to the single-container layout — chat and
+Responses (streaming included), generated-file download links, sessions and
+`--resume`, the token budget, JSON mode, the tool bridge, and the delegated
+endpoints — with these caveats:
+
+- **Knowledge base:** the `curl` calls to `$OPENWEBUI_BASE_URL` run in the agent
+  container. If OpenWebUI is on your internal network, add its host to
+  `SANDBOX_EXTRA_NO_PROXY` (direct, needs a route) or to the allowlist (via squid).
+- **Audio/embeddings first use:** `faster-whisper` and `sentence-transformers`
+  download weights from `huggingface.co` — add it (and `cdn-lfs.huggingface.co`)
+  to the allowlist, or pre-install the models. pip itself is already covered.
+- **Function calling (`tools`)** is served by the API container's direct
+  Messages-API call, routed through the same proxy, so `api.anthropic.com` must
+  stay on the allowlist.
+- **`http(s)` `image_url` fetches** leave the API container and are governed by
+  the allowlist too — which turns the SSRF surface noted under
+  [Multimodal input](#multimodal-input) into a policy decision.
+- **The host-credentials overlay does not apply here.**
+  `docker-compose.host-credentials.yml` targets the `claude-wrapper` service, but
+  the CLI runs in `claude-agent` under this topology, so the overlay is inert.
+- The agent's isolation is enforced by network topology (hard); the API
+  container's egress discipline is proxy-env only (soft), because its inbound port
+  needs a non-internal network. Firewall the host if you want both hard.
+- Both the squid image (`docker.io/ubuntu/squid:latest`) and the Claude Code CLI
+  are unpinned. Pin them yourself if you need reproducibility.
+
+---
+
+## Configuration reference
+
+Everything is environment-driven. `.env.example` is the annotated master copy;
+this table is the code-level truth. Booleans are false only for
+`0`/`false`/`no`/`off`/`disabled` (case-insensitive); anything else is true.
+
+### Identity, paths, ports
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `CLAUDE_UID` / `CLAUDE_GID` | Build arg + runtime uid/gid. | `1000` |
+| `CLAUDE_WRAPPER_PORT` | uvicorn port, published host port, healthcheck. | `8000` |
+| `CLAUDE_WRAPPER_HOST` | uvicorn bind address. | `0.0.0.0` |
+| `CLAUDE_WRAPPER_WORKERS` | `uvicorn --workers`. **Leave at 1** — see [Concurrency](#concurrency). | `1` |
+| `CLAUDE_INBOX_DIR` | Host drop folder → `/data/inbox` (read-only). | `./inbox` |
+| `CLAUDE_WRAPPER_DATA` | Root data dir. | `/data` |
+| `CLAUDE_WRAPPER_WORKSPACE` | Per-conversation CLI workspaces. | `$DATA/workspace` |
+| `CLAUDE_WRAPPER_FILES` | Blob store. | `$DATA/files` |
+| `CLAUDE_WRAPPER_SESSIONS` | Session registry (usage ledgers in `usage/` beneath it). | `$DATA/sessions` |
+| `CLAUDE_CONFIG_DIR` | Where the CLI keeps all its state. | `/home/claude/.claude` |
+| `CLAUDE_WRAPPER_CLAUDE_BIN` | Path or name of the `claude` executable. | `claude` |
+
+The four path variables are baked into the image; `entrypoint.sh` dereferences
+them with no fallback, so a stripped environment aborts at start.
+
+### Auth
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `CLAUDE_WRAPPER_API_KEYS` | Comma-separated bearer tokens. Non-empty turns auth on for every `/v1/*` route. | blank (auth off) |
+| `ANTHROPIC_API_KEY` | Anthropic API key for the CLI and the tool bridge. | blank |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Pre-minted OAuth token. | blank |
+| `CLAUDE_HOST_CREDENTIALS` | Host `~/.claude/.credentials.json` for the overlay. Compose errors if the overlay is used and this is unset. | none |
+| `CLAUDE_WRAPPER_CREDENTIALS_FILE` | Where the tool bridge reads the CLI's OAuth token. | `~/.claude/.credentials.json` |
+
+### Model and effort
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `CLAUDE_WRAPPER_DEFAULT_MODEL` | Model for `"model": "auto"` or an absent model. Always added to the advertised list. | `claude-opus-4-8` |
+| `CLAUDE_WRAPPER_EFFORT` | Server-default reasoning effort. Empty means the `--effort` flag is not passed at all. | code: empty · compose: `medium` |
+| `CLAUDE_WRAPPER_MODEL_DISCOVERY` | `auto` scans the installed CLI binary; `off` serves the static fallback list. | `auto` |
+| `CLAUDE_WRAPPER_ANTHROPIC_BASE_URL` | Messages API base for the tool bridge. | `https://api.anthropic.com` |
+| `CLAUDE_WRAPPER_TOOLS_MAX_TOKENS` | `max_tokens` when a tool-bridge client omits it. | `8192` |
+
+### Requests, uploads, timeouts
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `CLAUDE_WRAPPER_MAX_UPLOAD_BYTES` | Upload ceiling; over it returns 413. | `2147483648` (2 GiB) |
+| `CLAUDE_WRAPPER_REQUEST_TIMEOUT` | Per-request / CLI-read timeout, seconds. | `1800` |
+| `CLAUDE_WRAPPER_PDF_INLINE_MAX_CHARS` | `>0` inlines extracted PDF text into the prompt; `0` hands Claude the file path instead. | `0` (off) |
+
+These three parse with a bare `int()` — a malformed value raises at import and
+the process never starts. Every other numeric variable falls back to its default.
+
+### Generated-file download links
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `CLAUDE_WRAPPER_PUBLIC_BASE_URL` | Absolute base for download links. Wins over derivation. | blank |
+| `CLAUDE_WRAPPER_DERIVE_BASE_URL` | Derive the base from `Host` / `X-Forwarded-*`. | `on` |
+| `CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY` | HMAC key for capability links. If blank and API keys exist, derived from them via scrypt. | derived |
+| `CLAUDE_WRAPPER_DOWNLOAD_URL_TTL` | Link lifetime in seconds; `0` = never expires (still signed). | `2592000` (30 days) |
+| `CLAUDE_WRAPPER_WORKSPACE_HINT` | Tell Claude its working directory is delivered to the user. | code: **off** · compose: `on` |
+| `CLAUDE_WRAPPER_WORKSPACE_PROMPT` | Override the injected hint text. | built-in |
+
+### Streaming and reasoning
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `CLAUDE_WRAPPER_REASONING_CHANNEL` | Where reasoning/progress frames go: `details`, `reasoning_content`, `think_tags`, `none`. | `details` |
+| `CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY` | Surface tool/subagent activity as reasoning frames. | `true` |
+| `CLAUDE_WRAPPER_SSE_HEARTBEAT` | Seconds between keep-alive SSE comments. | `15` |
+| `CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES` | One-time comment padding to flush buffering proxies; `0` disables. | `2048` |
+| `CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS` | Silence before a visible "still working" tick; `0` disables. | `25` |
+| `CLAUDE_WRAPPER_STREAM_PARTIAL` | Pass `--include-partial-messages` for token-by-token deltas. | `true` |
+
+`details` is the default because Open WebUI's OpenAI provider renders **neither**
+the `reasoning_content` field nor inline `<think>` tags — it does render a
+`<details type="reasoning">` block embedded in the content.
+
+### Clarification protocol
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `CLAUDE_WRAPPER_CLARIFY` | Inject the ask-then-stop protocol on chat/responses. | `on` |
+| `CLAUDE_WRAPPER_CLARIFY_PROMPT` | Override the injected instruction. | built-in |
+| `CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS` | Comma-separated tools passed to `--disallowedTools`. | code: `AskUserQuestion` · compose: **empty** |
+
+### Usage cap
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `CLAUDE_WRAPPER_SESSION_PLAN` | `pro` \| `max 5x` \| `max 20x` \| `off`. | `max 5x` |
+| `CLAUDE_WRAPPER_PRO_SESSION_TOKENS` | Pro-tier anchor; Max scales ×5 / ×20 from it. | `1500000` |
+| `CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE` | Explicit allowance; `>0` overrides the plan. | `0` |
+| `CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT` | Block size as a percentage of the allowance; `<=0` disables. | `5` |
+| `CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD` | Keywords that grant another block. | `continue,proceed,keep going,go on,yes` |
+
+Plan matching is substring-based: anything containing `pro` is Pro, `20x`/`200`
+is Max 20×, `5x`/`100`/`max` is Max 5×, and anything else (`off`, `none`,
+`disabled`) disables the cap.
+
+### OpenWebUI knowledge base
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `OPENWEBUI_BASE_URL` | Master switch for the KB prompt addendum. | blank (off) |
+| `OPENWEBUI_API_KEY` | Bearer for OpenWebUI's retrieval API. | blank |
+| `OPENWEBUI_DEFAULT_COLLECTION` | Default knowledge-base **id** (not display name). | blank |
+
+Note these three have no `CLAUDE_WRAPPER_` prefix.
+
+### Sandbox topology
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `CLAUDE_WRAPPER_AGENT_URL` | Set → runs execute in the agent container instead of a local subprocess. | blank (local) |
+| `CLAUDE_WRAPPER_AGENT_TOKEN` | Shared bearer the shim requires. | blank (no check) |
+| `CLAUDE_WRAPPER_AGENT_PORT` | Port the shim binds inside the agent container. | `8791` |
+| `SANDBOX_EXTRA_NO_PROXY` | Extra hosts appended to the agent's `NO_PROXY`. | blank |
+
+If you change `CLAUDE_WRAPPER_AGENT_PORT`, change the port inside
+`CLAUDE_WRAPPER_AGENT_URL` to match — the number is spelled out in both places.
+
+### Defaults that differ between code and compose
+
+Three variables resolve differently depending on whether you run under compose
+with a populated `.env` or import the app directly:
+
+| Variable | Code default | Compose default | Consequence |
+| --- | --- | --- | --- |
+| `CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS` | `AskUserQuestion` | empty string | Compose passes an empty value, which **overrides** the code default and stops `--disallowedTools` from being passed at all. The dead `AskUserQuestion` tool is then reachable again. |
+| `CLAUDE_WRAPPER_EFFORT` | empty (no flag) | `medium` | A compose deployment pins effort at medium; a bare-Python run lets the CLI pick. |
+| `CLAUDE_WRAPPER_WORKSPACE_HINT` | `false` | `on` | Off in code deliberately, because the hint changes the *shape* of the reply and `/v1/completions`, assistants runs and the batches worker share the same path. |
+
+Removed and ignored: `CLAUDE_WRAPPER_JSON_SNIFF`. It is documented as removed in
+`.env.example` and read nowhere in the code.
+
+---
 
 ## Endpoints
 
-The wrapper implements the full OpenAI surface one-for-one. Endpoints
-that aren't naturally served by an LLM (audio, images, embeddings) are
-implemented by having Claude Code do the work inside its per-request
-workspace — it installs whatever tools it needs via Bash the first
-time and reuses them afterwards. See "Delegation design" below.
+The wrapper covers the commonly used OpenAI surface, not all of it — see
+[Limitations and known gaps](#limitations-and-known-gaps) for the routes OpenAI
+has that this does not. Endpoints that aren't naturally served by an LLM (audio,
+images, embeddings) are implemented by having Claude Code do the work inside a
+per-request workspace; see [Delegation design](#delegation-design).
+
+Every `/v1/*` route requires `Authorization: Bearer <key>` when
+`CLAUDE_WRAPPER_API_KEYS` is set, **except** the two noted below.
 
 ### Text
 
@@ -193,158 +587,304 @@ time and reuses them afterwards. See "Delegation design" below.
 | --- | --- | --- |
 | `POST` | `/v1/chat/completions` | Streaming + non-streaming multimodal chat |
 | `POST` | `/v1/completions` | Legacy text-prompt completion |
-| `POST` | `/v1/responses` | OpenAI Responses API — streaming + multi-turn chaining |
-| `POST` | `/v1/embeddings` | Dense vectors via fastembed / sentence-transformers |
+| `POST` | `/v1/responses` | Responses API — streaming + multi-turn chaining |
+| `POST` | `/v1/embeddings` | Dense vectors |
 | `POST` | `/v1/moderations` | Content classification via Claude |
 
-`/v1/responses` is the modern "ask and response" primitive. It accepts a
-string or structured `input` (plus optional `instructions`), and returns a
-`response` object whose `output_text` flattens the assistant message.
+`/v1/completions` accepts multiple prompts in one request (each becomes a
+separate run) and returns 400 if you combine `stream` with multiple prompts.
+When streaming, it emits **chat-shaped** `chat.completion.chunk` frames rather
+than `text_completion` chunks — clients tolerate this in practice.
+
+`/v1/embeddings` tries four backends in order: fastembed →
+sentence-transformers → Claude-generated vectors → a deterministic hash
+embedding, so a response is always produced even with no embedding library
+present. `dimensions` truncation and `encoding_format: base64` are supported.
+
+`/v1/responses` is the modern "ask and response" primitive. It accepts a string
+or structured `input` (plus optional `instructions`) and returns a `response`
+object whose `output_text` flattens the assistant message.
 
 - **Streaming** (`"stream": true`) emits the typed Responses event protocol —
-  `response.created` → `response.output_text.delta` … → `response.completed` —
-  not `chat.completion.chunk`s. There is no `[DONE]` sentinel; the stream ends
-  on the terminal `response.completed`/`response.failed` event.
-- **Multi-turn chaining**: pass a prior response's `id` back as
-  `previous_response_id` to continue the same Claude session. The id is derived
-  from the session key, so the thread deterministically reattaches rather than
-  forking a new session.
-
-#### Structured output (`response_format`)
-
-`/v1/chat/completions` honors the OpenAI `response_format` parameter. With
-`{"type": "json_object"}` or `{"type": "json_schema", "json_schema": {…}}` the
-wrapper appends a raw-JSON-only instruction to the prompt (including the schema
-for `json_schema`) and reduces the reply to the bare JSON value before it
-leaves the wrapper — markdown fences and any surrounding prose are stripped,
-and the file-reference trailer is suppressed. Streamed JSON-mode requests
-buffer the answer (fences can span chunk deltas) and deliver the cleaned JSON
-as a single content chunk before the terminator; reasoning/progress frames are
-suppressed so the concatenated content is pure JSON.
-
-This is what clients built on the Vercel AI SDK's `generateObject` expect —
-e.g. Vane, whose `JSON.parse` chokes on ` ```json `-fenced replies
-([Vane#959](https://github.com/ItzCrazyKns/Vane/issues/959)). Requests without
-`response_format` (or with `{"type": "text"}`) are completely unaffected. If
-the model produces no parseable JSON at all, the reply passes through
-unchanged rather than masking what it said.
-
-#### Streaming feedback on long runs
-
-On a hard problem at high/max/ultracode effort, Claude may think or run
-tools for many minutes before the first answer token. To keep
-`/v1/chat/completions` streams alive and visibly *working* (rather than
-looking stalled — or being severed by a buffering proxy before any headers
-reach the client), the wrapper:
-
-- sends a one-time comment preamble to flush the response head past buffering
-  proxies immediately;
-- emits lightweight keep-alive comments, plus periodic **visible** "⏳ Still
-  working… (elapsed)" ticks on the `reasoning_content` channel during silence;
-- surfaces **tool/subagent activity** (`🔧 Bash: …`, `🔧 Read: …`) on the same
-  channel, so a tool-heavy phase shows real progress.
-
-Progress rides `reasoning_content` (Open WebUI's collapsible "Thinking"
-section), never the answer content. Tune via `CLAUDE_WRAPPER_SSE_*` (see
-`.env.example`); set `CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS=0` /
-`CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY=false` to quiet it.
-
-#### Clarifying questions (interactive)
-
-Headless Claude Code has no interactive question UI: its `AskUserQuestion`
-card gets auto-dismissed, so Claude proceeds on assumptions and you never get
-to answer. With the **clarification protocol** on (default), the wrapper:
-
-- injects a system prompt (`--append-system-prompt`) teaching Claude that, when
-  a decision genuinely changes the result, it should ask its questions as plain
-  numbered text **and stop** — making the questions the whole turn — so you
-  answer in your next message and the session resumes automatically;
-- disables the dead interactive tool (`--disallowedTools AskUserQuestion`) so
-  questions always arrive as answerable text.
-
-Only chat/responses opt in; delegated task endpoints (audio, images, …) never
-pause. Disable globally with `CLAUDE_WRAPPER_CLARIFY=off`, override the injected
-instruction with `CLAUDE_WRAPPER_CLARIFY_PROMPT`, or opt a single request out
-with `"clarify": false` in the request body. (No clickable option buttons —
-Open WebUI has no way to feed those back; this is well-formatted text Q&A.)
+  `response.created` → `response.output_text.delta` … → `response.completed`.
+  There is no `[DONE]` sentinel; the stream ends on the terminal
+  `response.completed` / `response.failed` event.
+- **Multi-turn chaining:** pass a prior response's `id` back as
+  `previous_response_id` to continue the same Claude session.
 
 ### Audio
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/v1/audio/transcriptions` | Speech-to-text (whisper installed on first call) |
-| `POST` | `/v1/audio/translations` | Speech → English text |
-| `POST` | `/v1/audio/speech` | Text-to-speech via espeak-ng |
+| `POST` | `/v1/audio/transcriptions` | Speech-to-text via faster-whisper (pip-installed on first call) + ffmpeg |
+| `POST` | `/v1/audio/translations` | Speech → English text, same pipeline |
+| `POST` | `/v1/audio/speech` | Text-to-speech via espeak-ng, transcoded by ffmpeg |
+
+Transcriptions support the `json`, `verbose_json`, `text`, `srt` and `vtt`
+response formats.
 
 ### Images
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/v1/images/generations` | Prompt → SVG → PNG (rsvg-convert) |
+| `POST` | `/v1/images/generations` | Claude authors an SVG → PNG via rsvg-convert (imagemagick fallback) |
 | `POST` | `/v1/images/edits` | Apply a prompt + optional mask to an image |
-| `POST` | `/v1/images/variations` | Produce N imagemagick-driven variations |
+| `POST` | `/v1/images/variations` | N imagemagick-driven variations |
 
-### Files, batches, fine-tuning
+`/v1/images/generations` returns `b64_json` when asked; otherwise it returns a
+**relative** `url` of `/v1/files/{id}/content` plus a non-standard `file_id`
+field.
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST/GET/DELETE` | `/v1/files`, `/v1/files/{id}`, `/v1/files/{id}/content` | Binary storage |
-| `POST/GET` | `/v1/batches`, `/v1/batches/{id}`, `/v1/batches/{id}/cancel` | JSONL batch submission (local queue) |
-| `GET/POST` | `/v1/fine_tuning/jobs` | Stubs — Claude isn't user-fine-tunable (returns 501) |
-
-### Assistants + threads
+### Files
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST/GET/DELETE` | `/v1/assistants`, `/v1/assistants/{id}` | Saved (model, instructions) configs |
-| `POST/GET/DELETE` | `/v1/threads`, `/v1/threads/{id}` | Persistent conversation threads |
-| `POST/GET` | `/v1/threads/{id}/messages` | Append / list thread messages |
-| `POST/GET` | `/v1/threads/{id}/runs`, `/v1/threads/{id}/runs/{id}` | Execute an assistant on a thread |
+| `POST` | `/v1/files` | Upload (multipart `file`, `purpose`; 413 over the size limit) |
+| `GET` | `/v1/files` | List records, optional `?purpose=` filter |
+| `GET` | `/v1/files/{id}` | Metadata |
+| `DELETE` | `/v1/files/{id}` | Delete |
+| `GET` | `/v1/files/{id}/content` | Stream the blob |
+
+`GET /v1/files/{id}/content` is the one route with **dual auth**: a normal API
+key *or* a valid unexpired `?exp=…&sig=…` capability link. Listing, metadata and
+delete always require a real key.
+
+### Batches
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/batches` | Create from an uploaded JSONL `input_file_id` |
+| `GET` | `/v1/batches` | List |
+| `GET` | `/v1/batches/{id}` | Retrieve |
+| `POST` | `/v1/batches/{id}/cancel` | Mark `cancelling` |
+
+Only `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
+`/v1/responses` and `/v1/moderations` are permitted as batch endpoints; anything
+else is a 400. Execution starts immediately in-process via `asyncio.create_task`
+— this is **not a durable queue**, and in-flight batches are lost on restart.
+
+### Fine-tuning (stubs)
+
+| Method | Path | Behavior |
+| --- | --- | --- |
+| `POST` | `/v1/fine_tuning/jobs` | **501** — Claude isn't user-tunable; the body points you at `/v1/assistants` |
+| `GET` | `/v1/fine_tuning/jobs` | **200** with an empty list |
+| `GET` | `/v1/fine_tuning/jobs/{id}` | **404** |
+| `POST` | `/v1/fine_tuning/jobs/{id}/cancel` | **501** |
+| `GET` | `/v1/fine_tuning/jobs/{id}/events` | **200** with an empty list |
+
+### Assistants, threads, runs
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/assistants` | Create a saved (model, instructions) config |
+| `GET` | `/v1/assistants` | List |
+| `GET` | `/v1/assistants/{id}` | Retrieve |
+| `POST` | `/v1/assistants/{id}` | Modify (OpenAI's POST-to-update idiom) |
+| `DELETE` | `/v1/assistants/{id}` | Delete |
+| `POST` | `/v1/threads` | Create, optionally seeded with `messages` |
+| `GET` | `/v1/threads/{id}` | Retrieve |
+| `DELETE` | `/v1/threads/{id}` | Delete thread + messages |
+| `POST` | `/v1/threads/{id}/messages` | Append |
+| `GET` | `/v1/threads/{id}/messages` | List |
+| `POST` | `/v1/threads/{id}/runs` | Create **and synchronously execute** a run |
+| `GET` | `/v1/threads/{id}/runs` | List runs |
+| `GET` | `/v1/threads/{id}/runs/{run_id}` | Retrieve a run |
+
+`POST /v1/threads/{id}/runs` blocks until the run finishes and returns an
+already-terminal run object, so OpenAI's poll-until-`completed` loop is a no-op
+here. Runs always use the thread id as the session key.
 
 ### Vector stores
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST/GET/DELETE` | `/v1/vector_stores`, `/v1/vector_stores/{id}` | Embedding-backed vector collections |
-| `POST/GET/DELETE` | `/v1/vector_stores/{id}/files`, `/v1/vector_stores/{id}/files/{id}` | Manage indexed files |
+| `POST` | `/v1/vector_stores` | Create, optionally ingesting `file_ids` |
+| `GET` | `/v1/vector_stores` | List |
+| `GET` | `/v1/vector_stores/{id}` | Retrieve |
+| `DELETE` | `/v1/vector_stores/{id}` | Delete |
+| `POST` | `/v1/vector_stores/{id}/files` | Index a file (chunk → embed → append) |
+| `GET` | `/v1/vector_stores/{id}/files` | List indexed files |
+| `DELETE` | `/v1/vector_stores/{id}/files/{vsfile_id}` | Detach a file entry |
 | `POST` | `/v1/vector_stores/{id}/search` | Cosine similarity search |
+
+Detaching a file removes its entry but **not its vectors** from the matrix, so
+detached content can still surface in search results.
 
 ### Realtime
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `WS` | `/v1/realtime` | Text-only WebSocket bridge to chat completions |
-| `GET` | `/v1/realtime/sessions` | Discovery helper for OpenAI SDKs |
+| `WS` | `/v1/realtime` | Text-only realtime protocol |
+| `GET` | `/v1/realtime/sessions` | Discovery helper for OpenAI SDKs — **no auth** |
 
-### Models + health
+The WebSocket handles `session.update`, `response.create` and
+`input_text.append`, and streams `response.output_text.delta` …
+`response.completed`. It checks the `Authorization` header itself and closes with
+code `4401` on failure. It calls the runner **directly** rather than going
+through `/v1/chat/completions`, so none of the chat-endpoint behavior applies —
+no tool bridge, no usage-ledger gate, no JSON mode, no generated-file trailer —
+and it always uses `CLAUDE_WRAPPER_DEFAULT_MODEL`, ignoring any model the client
+sends.
+
+### Models, usage, health
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET`  | `/v1/models`, `/v1/models/{id}` | Advertise supported Claude models |
-| `GET`  | `/v1/usage/{session_id}` | Per-conversation token spend + remaining allowance (see usage cap) |
-| `GET`  | `/healthz` | Liveness probe |
+| `GET` | `/v1/models`, `/v1/models/{id}` | Advertise supported Claude models |
+| `GET` | `/v1/usage/{session_id}` | Per-conversation token spend and remaining allowance |
+| `GET` | `/healthz` | Liveness probe — **no auth** |
 
-## Delegation design
+FastAPI's `/docs`, `/redoc` and `/openapi.json` are also served, and are
+**unauthenticated**. Block them at your reverse proxy if that matters to you.
 
-Non-text endpoints delegate to Claude Code through a per-request
-workspace. The pattern:
+### Non-standard request and response fields
 
-1. Caller writes any input bytes into `workspace/uploads/`.
-2. Caller invokes Claude with a structured prompt that names the exact
-   output file(s) to produce under `workspace/outputs/`.
-3. Claude uses its Bash / Read / Write tools to do the work — install
-   faster-whisper, invoke ffmpeg or espeak-ng, render an SVG with
-   rsvg-convert, etc.
-4. Caller reads the named output file(s) and packages them in the
+`ChatCompletionRequest` allows extra fields; these are the meaningful ones:
+
+| Field | Effect |
+| --- | --- |
+| `session_id` | Pin the conversation explicitly instead of deriving it |
+| `inline_generated_files` | Return generated bytes inline as base64 (non-streaming only) |
+| `clarify` | `false` opts this one request out of the clarification protocol |
+
+Responses echo `session_id`, and carry an `effort` object
+(`{"applied", "source", "requested"}`) so clients can confirm which reasoning
+effort actually took effect. While streaming, `effort` rides the first chunk.
+
+### Delegation design
+
+Non-text endpoints delegate to Claude Code through a per-request workspace:
+
+1. The caller writes input bytes into `workspace/uploads/`.
+2. It invokes Claude with a structured prompt naming the exact output file(s) to
+   produce under `workspace/outputs/`.
+3. Claude uses Bash / Read / Write to do the work — pip-install faster-whisper,
+   invoke ffmpeg or espeak-ng, render an SVG with rsvg-convert.
+4. The caller collects every file under `outputs/` and packages them in the
    endpoint's OpenAI-shaped response.
 
-This keeps the image small — only `ffmpeg`, `espeak-ng`, `imagemagick`,
-`librsvg2-bin` and a couple of fast Python packages (`fastembed`,
-`numpy`) are preinstalled. Heavier dependencies (faster-whisper, etc.)
-are installed lazily by Claude on first use and cached for subsequent
-calls.
+Each delegated request gets a fresh workspace keyed by a random id, so
+concurrent requests never collide. Heavy dependencies are installed lazily on
+first use and cached for later calls, which is why a cold call to
+`/v1/audio/transcriptions` is slow and later ones are not.
 
-## Multimodal input
+---
+
+## Chat features
+
+### Structured output (`response_format`)
+
+`/v1/chat/completions` and `/v1/responses` honor OpenAI's `response_format`. With
+`{"type": "json_object"}` or `{"type": "json_schema", "json_schema": {…}}` the
+wrapper appends a raw-JSON-only instruction to the prompt (including the schema
+for `json_schema`) and reduces the reply to the bare JSON value before it leaves
+the wrapper — markdown fences and surrounding prose are stripped, and the
+file-reference trailer is suppressed. Streamed JSON-mode requests buffer the
+answer (fences can span chunk deltas) and deliver the cleaned JSON as a single
+content chunk; reasoning/progress frames are suppressed so the concatenated
+content is pure JSON.
+
+This is what clients built on the Vercel AI SDK's `generateObject` expect.
+Requests without `response_format` (or with `{"type": "text"}`) are completely
+unaffected. If the model produces no parseable JSON at all, the reply passes
+through unchanged rather than masking what it said.
+
+One interaction worth knowing: the instant replies described under
+[usage cap](#per-conversation-usage-cap-usage-checkpoint) are wrapper-authored
+prose, which would corrupt a structured-output client. In JSON mode they return
+**HTTP 502** instead of the prose message.
+
+### Streaming feedback on long runs
+
+At high/max/ultracode effort Claude may think or run tools for many minutes
+before the first answer token. To keep streams alive and visibly *working* —
+rather than looking stalled, or being severed by a buffering proxy before any
+headers reach the client — the wrapper:
+
+- sends a one-time comment preamble to flush the response head past buffering
+  proxies immediately;
+- emits keep-alive comments, plus periodic **visible** "⏳ Still working…"
+  ticks during silence;
+- surfaces **tool/subagent activity** (`🔧 Bash: …`, `🔧 Read: …`).
+
+Progress rides the reasoning channel, never the answer content. Tune it with the
+`CLAUDE_WRAPPER_SSE_*` and `CLAUDE_WRAPPER_REASONING_CHANNEL` variables; set
+`CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS=0` and
+`CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY=false` to quiet it, or
+`CLAUDE_WRAPPER_REASONING_CHANNEL=none` to suppress reasoning frames entirely.
+
+### Clarifying questions (interactive)
+
+Headless Claude Code has no interactive question UI: its `AskUserQuestion` card
+is auto-dismissed, so Claude proceeds on assumptions and you never get to answer.
+With the clarification protocol on (default), the wrapper:
+
+- injects a system prompt (`--append-system-prompt`) teaching Claude that, when a
+  decision genuinely changes the result, it should ask its questions as plain
+  numbered text **and stop** — making the questions the whole turn — so you
+  answer in your next message and the session resumes automatically;
+- disables the dead interactive tool via `--disallowedTools AskUserQuestion`, so
+  questions always arrive as answerable text.
+
+Only chat and responses opt in; delegated task endpoints never pause. Disable
+globally with `CLAUDE_WRAPPER_CLARIFY=off`, override the instruction with
+`CLAUDE_WRAPPER_CLARIFY_PROMPT`, or opt a single request out with
+`"clarify": false`.
+
+Note the compose caveat in [Defaults that differ](#defaults-that-differ-between-code-and-compose):
+the tool-suppression half of this only takes effect if
+`CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS` is actually set in your `.env`.
+
+### If your client sends `tools` (Open WebUI native function calling)
+
+A request that declares `tools` is served by the **tool bridge**, which calls the
+Anthropic Messages API directly — no Claude Code CLI, so no workspace, no `Write`
+tool, and **no generated files on those turns**. Open WebUI in *Native* function
+calling mode sends its whole tool roster on every message, which silently
+disables file downloads for the entire chat.
+
+The fix is client-side: in Open WebUI set the model's **Function Calling**
+setting from **Native** to **Default**. Open WebUI then runs its own
+tool-selection call and sends no `tools[]` on the completion, so the request
+takes the CLI path — downloads work, and function calling stays intact.
+
+There is deliberately no wrapper-side switch. A single turn cannot be served both
+ways: the CLI runs its own tool loop and cannot surface a caller-declared tool.
+Routing a tools-carrying turn to the CLI anyway would silently drop the client's
+tools, so a real agentic client offering a tool on its opening turn would get
+prose instead of a `tool_call` and its loop would stall.
+
+### OpenWebUI knowledge base
+
+Set `OPENWEBUI_BASE_URL` (plus `OPENWEBUI_API_KEY`, and optionally
+`OPENWEBUI_DEFAULT_COLLECTION`) and the wrapper appends a **knowledge-base
+addendum** to the system prompt on every CLI-path turn. This is not a retrieval
+integration inside the wrapper — it teaches Claude to query OpenWebUI's RAG API
+itself with its own Bash/curl tools:
+
+1. **Discover:** `GET $OPENWEBUI_BASE_URL/api/v1/knowledge/` to list knowledge
+   bases and their ids.
+2. **Query:** `POST $OPENWEBUI_BASE_URL/api/v1/retrieval/query/collection` with
+   `{"collection_names": ["<id>"], "query": "…", "k": 5}`.
+
+The addendum is explicit that `collection_names` takes the knowledge base's
+**id, not its display name** — the single most common cause of empty results.
+It also instructs Claude to search before answering rather than answering from
+memory, and to cite the chunks it used.
+
+Secrets are never interpolated into the prompt: only the `$OPENWEBUI_*` variable
+*names* appear in the injected text, and the values reach Claude through the
+subprocess environment. The addendum applies to chat, completions, responses,
+assistants runs and the batches worker; it does not apply to the delegated
+endpoints or the tool-bridge path. Startup logs report whether it is enabled and
+warn if the base URL is set without a key (every call would 401).
+
+---
+
+## Files in and out
+
+### Multimodal input
 
 The chat endpoint accepts the standard OpenAI content-part union:
 
@@ -364,47 +904,62 @@ Accepted URL schemes inside `image_url.url`:
 
 - `data:<mime>;base64,<payload>` — inline bytes.
 - `https://…` / `http://…` — fetched by the server.
-- `file-<id>` — reference to something previously uploaded to `/v1/files`.
+- `file-<id>` — a reference to something uploaded to `/v1/files`.
 
-Note that the `http(s)` form makes the *server* fetch whatever URL the
-client names — including hosts on your internal network that the client
-couldn't reach directly (an SSRF surface, reachable by anyone holding an
-API key). Fine when the container's egress is restricted or its callers
-are trusted; if neither holds, front the wrapper with an egress
-allowlist or strip `image_url` parts at your gateway.
+`file_data` parts accept both a data URL and raw base64 with the type in a
+sibling `mime_type` field; an explicit `mime_type` wins over the data URL's own.
 
-Uploaded and inlined binaries are written into the per-session workspace
-before Claude Code is invoked, so Claude can open them with its `Read`
-tool (including images, PDFs, audio, and video — use ffmpeg inside the
-container for the latter).
+> **SSRF note.** The `http(s)` form makes the *server* fetch whatever URL the
+> client names — including hosts on your internal network the client couldn't
+> reach directly, reachable by anyone holding an API key. Fine when the
+> container's egress is restricted or its callers are trusted; if neither holds,
+> front the wrapper with an egress allowlist (see
+> [Sandboxed deployment](#sandboxed-deployment-network-isolated-agent)) or strip
+> `image_url` parts at your gateway.
+
+Uploaded and inlined binaries are written into the per-session workspace before
+Claude Code is invoked, so Claude can open them with its `Read` tool — images,
+PDFs, audio and video (use ffmpeg inside the container for the last).
+
+### PDFs
+
+By default a PDF is handed to Claude as a **file path** and Claude reads the
+pages it needs. Set `CLAUDE_WRAPPER_PDF_INLINE_MAX_CHARS` above zero to inline
+extracted text into the prompt instead, wrapped in `<<<PDF-START …>>>` /
+`<<<PDF-END …>>>` markers with per-page `--- page N ---` separators. Extraction
+stops once it is over budget, so a 900-page book is not fully materialized just
+to be truncated, and the header line tells Claude it was truncated and that the
+full file is still readable at the given path. A per-page extraction error
+becomes an inline note rather than failing the request.
+
+`tools/split_pdf.py` slices a PDF by page range or outline chapter host-side if
+you would rather send only the relevant pages.
 
 ### Host drop folder (`/data/inbox`)
 
-Some clients (Open WebUI in particular) extract a document to text
-before it ever reaches the wrapper, so Claude sees the client's
-transcription rather than the file. The inbox sidesteps that: whatever
-you put in `CLAUDE_INBOX_DIR` on the host appears read-only inside the
-container at `/data/inbox`, and Claude reads the real bytes.
+Some clients (Open WebUI in particular) extract a document to text before it ever
+reaches the wrapper, so Claude sees the client's transcription rather than the
+file. The inbox sidesteps that: whatever you put in `CLAUDE_INBOX_DIR` on the
+host appears read-only inside the container at `/data/inbox`, and Claude reads
+the real bytes.
 
 ```bash
 cp report.pdf ./inbox/          # CLAUDE_INBOX_DIR on the host
 ```
 
-Then just name the path in chat:
-
-> "Read /data/inbox/report.pdf and summarise section 3."
+Then name the path in chat: *"Read /data/inbox/report.pdf and summarise section 3."*
 
 Two requirements, both easy to get wrong:
 
-- **The host path must already exist.** Docker creates a missing bind
-  source as a *root-owned* directory, which the container then can't
-  read.
-- **It must be readable by `CLAUDE_UID`** (see [1. Configure](#1-configure)).
+- **The host path must already exist.** A missing bind source is created as a
+  root-owned directory, which the container then can't read.
+- **It must be readable by `CLAUDE_UID`.**
 
-The mount is read-only, so Claude can't modify or delete anything you
-drop there; it writes results to the session workspace as usual.
+The mount is read-only, so Claude can't modify or delete anything you drop there.
+Under the sandbox topology the inbox mounts on the **agent** container, since
+that is where the CLI runs.
 
-### Upload a file
+### Uploading a file
 
 ```bash
 curl -X POST http://localhost:8000/v1/files \
@@ -412,7 +967,7 @@ curl -X POST http://localhost:8000/v1/files \
     -F 'purpose=user_data'
 ```
 
-Then reference the returned `id` in a subsequent chat turn:
+Then reference the returned `id`:
 
 ```python
 client.chat.completions.create(
@@ -427,89 +982,86 @@ client.chat.completions.create(
 )
 ```
 
-## Generated files (Claude writes binaries back)
+### Generated files (Claude writes binaries back)
 
-When Claude writes a file into the session workspace, the wrapper detects it
-and:
+When Claude writes a file into the session workspace, the wrapper:
 
-1. Registers each one with `/v1/files` (`purpose=assistant_output`).
-2. Appends a "Generated files" block to the assistant message listing
-   each file as a markdown download link (mime, size, and `file_id`).
-3. If the request body sets `"inline_generated_files": true`, the raw
-   bytes are included inline as base64 under `message.attachments[*].content_base64`.
-   (Non-streaming chat only — there is no field to carry them while streaming.)
+1. Registers it with `/v1/files` (`purpose=assistant_output`).
+2. Appends a "Generated files" block to the assistant message listing each file
+   as a markdown download link (mime, size, `file_id`).
+3. If the request sets `"inline_generated_files": true`, includes the raw bytes
+   as base64 under `message.attachments[*].content_base64` (non-streaming chat
+   only — there is no field to carry them while streaming).
 
-A typical prompt:
-
-> "Transcode the attached `.wav` to MP3 and write it to
-> `outputs/result.mp3`."
-
-…produces a response with a link the user can click, plus a `file_id` the client
-can download with `GET /v1/files/{id}/content`.
+Attachment objects also carry a non-standard `url` key so SDK clients don't have
+to parse markdown.
 
 Files are excluded from delivery if they live under `uploads/` (the user's own
 attachments) or under any dot-prefixed path — so `.scratch/` is a free channel
-for intermediate work that shouldn't be handed back.
+for intermediate work.
 
-### Making the link clickable
+#### Making the link clickable
 
 Two things have to be true, and both have safe defaults:
 
-- **An absolute URL.** `CLAUDE_WRAPPER_PUBLIC_BASE_URL` wins whenever it is set.
+- **An absolute URL.** `CLAUDE_WRAPPER_PUBLIC_BASE_URL` wins whenever set.
   Otherwise the wrapper derives the base from the request's own `Host` /
   `X-Forwarded-Host` / `X-Forwarded-Proto` headers, which is correct behind a
-  typical reverse proxy and needs no configuration. Set
-  `CLAUDE_WRAPPER_DERIVE_BASE_URL=off` to go back to the old non-clickable
-  `→ file_id=…` text.
-- **Auth the browser can satisfy.** A link click sends no `Authorization`
-  header, so with `CLAUDE_WRAPPER_API_KEYS` set every download used to 401.
-  Each link now carries `?exp=…&sig=…`: an HMAC over exactly that one file id
-  and expiry. It grants reading that one blob — listing, metadata and delete
-  still require a real API key, and no API key ever appears in chat text.
-  The signing key defaults to one derived from `CLAUDE_WRAPPER_API_KEYS`
-  (stable across workers and restarts); set `CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY`
-  explicitly if you don't want an API-key rotation to invalidate outstanding
-  links. Links expire after `CLAUDE_WRAPPER_DOWNLOAD_URL_TTL` seconds
-  (default 30 days; `0` = never).
+  typical reverse proxy and needs no configuration. Forwarded headers are trusted
+  deliberately: uvicorn's `--proxy-headers` only trusts `forwarded_allow_ips`,
+  which a containerized reverse proxy is not, so without this a TLS-terminated
+  deployment emits `http://` links that browsers block as mixed content. A forged
+  `Host` only poisons links in the forger's own reply, because the download
+  signature does not cover the host. Set `CLAUDE_WRAPPER_DERIVE_BASE_URL=off` for
+  non-clickable `→ file_id=…` text instead.
+- **Auth the browser can satisfy.** A link click sends no `Authorization` header,
+  so with `CLAUDE_WRAPPER_API_KEYS` set every download would 401. Each link
+  carries `?exp=…&sig=…`: an HMAC over exactly that one file id and expiry, with
+  the expiry inside the MAC so a holder can neither extend it nor forge a
+  never-expires link. It grants reading that one blob — listing, metadata and
+  delete still require a real API key, and no API key appears in chat text.
 
-### Getting Claude to write a file at all
+  The signing key defaults to one derived from `CLAUDE_WRAPPER_API_KEYS` via
+  **scrypt**, deliberately expensive because a published link is a known MAC pair
+  over that key and a cheap hash would make any leaked link an offline oracle for
+  your API keys. Set `CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY` explicitly if you want
+  the link secret independent of your API keys and stable across key rotation.
+  Links expire after `CLAUDE_WRAPPER_DOWNLOAD_URL_TTL` seconds (default 30 days;
+  `0` = never).
 
-`CLAUDE_WRAPPER_WORKSPACE_HINT` (on by default) tells Claude that its working
-directory is delivered to the user, so it writes a requested document or dataset
-to a file instead of pasting the whole thing into the reply. Without it Claude
-has no way to know the file goes anywhere, and mostly won't create one. It is
-forced off for JSON-mode requests, where the client wants the value in the reply
-body. Override the text with `CLAUDE_WRAPPER_WORKSPACE_PROMPT`.
+  Signature verification is gated on `CLAUDE_WRAPPER_API_KEYS` being set. A
+  signing key with no API keys stamps signatures nobody checks — the boot log
+  warns about exactly this.
 
-### If your client sends `tools` (Open WebUI native function calling)
+#### Getting Claude to write a file at all
 
-A request that declares `tools` is served by the **tool bridge**, which calls the
-Anthropic Messages API directly — no Claude Code CLI, so no workspace, no `Write`
-tool, and **no generated files on those turns**. Open WebUI in *Native* function
-calling mode sends its whole tool roster on every message, so this silently
-disables file downloads for the entire chat.
+`CLAUDE_WRAPPER_WORKSPACE_HINT` tells Claude that its working directory is
+delivered to the user, so it writes a requested document or dataset to a file
+instead of pasting the whole thing into the reply. Without it Claude has no way
+to know the file goes anywhere, and mostly won't create one.
 
-The fix is client-side, and needs no wrapper configuration: in Open WebUI set
-the model's **Function Calling** setting from **Native** to **Default**. Open
-WebUI then runs its own tool-selection call and sends no `tools[]` on the
-completion, so the request takes the CLI path — downloads work, and function
-calling stays fully intact.
+**It is off in code and on in the shipped compose files.** Off is the right
+default for programmatic callers: it changes the shape of the reply, and
+`/v1/completions`, assistants runs and the batches worker share the same path, so
+a script doing `completions.create("write me a python script…")` and reading
+`choices[0].text` would silently start getting "I wrote it to script.py" plus a
+link. Turn it on for chat-UI deployments. It is forced off for JSON-mode
+requests, where the client wants the value in the reply body. Override the text
+with `CLAUDE_WRAPPER_WORKSPACE_PROMPT`.
 
-There is deliberately no wrapper-side switch for this. A single turn cannot be
-served both ways: the CLI runs its own tool loop and cannot surface a
-caller-declared tool. Routing a tools-carrying turn to the CLI anyway would
-silently drop the client's tools, so a real agentic client (the Vercel AI SDK,
-LangChain) offering a tool on its opening turn would get prose instead of a
-`tool_call` and its loop would stall on the first hop.
+---
 
 ## Conversation continuity
 
-OpenAI's Chat Completions API is stateless — the client sends the full
-history every request. The wrapper mirrors that: it hashes the
-history-excluding-last-user-turn and maps that to a Claude Code session
-id, which is resumed on follow-up turns.
+OpenAI's Chat Completions API is stateless — the client sends the full history
+every request. The wrapper mirrors that by hashing the conversation's **anchor**
+(its system/developer messages plus the **first** user turn) and mapping that
+hash to a Claude Code session id, which is resumed on follow-up turns. Hashing
+only the anchor, rather than the whole transcript, is what makes every turn of
+the same conversation land on the same session key so `--resume` works
+indefinitely.
 
-To pin a session explicitly pass `session_id` in the request body:
+To pin a session explicitly, pass `session_id` in the request body:
 
 ```json
 {
@@ -521,16 +1073,32 @@ To pin a session explicitly pass `session_id` in the request body:
 
 The response body echoes `session_id` so clients can round-trip it.
 
+### Self-healing resume
+
+If Claude Code's transcript for a session disappears while the wrapper's
+`session_key → uuid` mapping survives, `claude --resume <uuid>` fails identically
+on every retry and the conversation is bricked. The failure string is not
+"session not found" — it is `error_during_execution`, often with exit code 0 —
+so a naive error match never fires.
+
+The wrapper therefore drops the mapping whenever a resumed turn ends with an
+error and produced **no assistant text at all**. The next turn mints a fresh
+session id and replays the full transcript, costing one extra full-history turn
+but recovering the conversation. A resume that streamed a real answer before a
+late error is deliberately left intact.
+
+---
+
 ## Per-conversation usage cap (usage checkpoint)
 
-Every request spends your Anthropic session/subscription quota, and a single
-long conversation — especially at `max`/`ultracode` effort — can eat a large
-slice of it with no warning. The wrapper can cap that **per conversation** and
-ask before spending more.
+Every request spends your Anthropic session/subscription quota, and a single long
+conversation — especially at `max`/`ultracode` effort — can eat a large slice of
+it with no warning. The wrapper caps that **per conversation** and asks before
+spending more.
 
 **The cap is ON by default at the Max 5× ($100) plan** (allowance 7,500,000,
-checkpoint every 375,000 tokens). Override it **by plan**, **by an explicit
-number**, or turn it **off**:
+checkpoint every 375,000 tokens). Override it by plan, by an explicit number, or
+turn it off:
 
 ```bash
 # (a) By subscription plan — pro | max 5x ($100) | max 20x ($200)  [default: max 5x]
@@ -538,27 +1106,24 @@ CLAUDE_WRAPPER_SESSION_PLAN="max 5x"
 CLAUDE_WRAPPER_PRO_SESSION_TOKENS=1500000        # Pro anchor; Max scales 5x/20x from it
 
 # (b) Or set the allowance directly (this wins over the plan)
-CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE=0         # one "session's worth" of tokens (0 = use plan)
+CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE=0         # 0 = use the plan
 
 # Disable entirely:
 CLAUDE_WRAPPER_SESSION_PLAN=off
 
-CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT=5            # block = 5% of the allowance
+CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT=5
 CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD=continue,proceed,keep going,go on,yes
 ```
 
 > ⚠️ **The per-plan token figures are estimates.** Anthropic does not publish a
-> token number for the Pro/Max *session* windows, and the wrapper can't query it
-> (the subscription quota is exposed nowhere in the API — see below). What's
-> defined is the *relationship*: Max is "5×" ($100) and "20×" ($200) of Pro. So
-> the plan setting anchors on `CLAUDE_WRAPPER_PRO_SESSION_TOKENS` and scales from
-> there. The default anchor (1,500,000) is **calibrated from real usage** — a
-> heavy ~2h Claude Code session measured ~1.54M billable tokens (input +
-> cache-creation + output, excluding near-free cache reads), which the operator
-> reported as 21% of a Max-5× window → ~7.5M per window → ~1.5M Pro anchor. Tune
-> it to your own usage; the cap is a safety checkpoint, not an exact mirror of
-> Anthropic's accounting. On startup the wrapper logs the resolved `plan` /
-> `allowance` / `block` so you can confirm.
+> token number for the Pro/Max *session* windows, and the wrapper can't query it.
+> What's defined is the *relationship*: Max is "5×" ($100) and "20×" ($200) of
+> Pro. So the plan setting anchors on `CLAUDE_WRAPPER_PRO_SESSION_TOKENS` and
+> scales from there. The default anchor (1,500,000) is calibrated from real usage
+> — a heavy ~2h Claude Code session measured ~1.54M billable tokens, reported as
+> 21% of a Max-5× window → ~7.5M per window → ~1.5M Pro anchor. Tune it to your
+> own usage; this is a safety checkpoint, not a mirror of Anthropic's accounting.
+> On startup the wrapper logs the resolved plan / allowance / block.
 
 | Plan setting | Multiplier | Allowance (default anchor 1.5M) | Block @ 5% |
 |---|---|---|---|
@@ -569,22 +1134,28 @@ CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD=continue,proceed,keep going,go on,yes
 
 How it works:
 
-- The wrapper tracks tokens (input + output) spent by each conversation.
-- A **block** is `allowance × percent` (e.g. 1,000,000 × 5% = 50,000 tokens).
-  Each conversation starts with one block of headroom.
+- The wrapper tracks input + output tokens spent by each conversation, in a JSON
+  ledger under `sessions/usage/`.
+- A **block** is `allowance × percent`. Each conversation starts with one block
+  of headroom.
 - Once a conversation has spent its current block, the **next** request doesn't
   call Claude — it returns a checkpoint message:
   > ⏸️ **Usage checkpoint.** This conversation has used **52,000 tokens**,
   > reaching its **50,000-token** budget block (5% of the configured session
   > allowance). Reply **continue** to allow another block, or start a new chat
   > to reset.
-- Replying with a continue keyword grants one more block and proceeds. Starting
-  a **new chat** (new session) begins with a fresh budget.
+- Replying with a continue keyword grants one more block and proceeds. The
+  keyword matches as the whole message *or* as a leading/trailing word, so
+  "yes, continue" and "continue please" both work. A **new chat** starts fresh.
+
+Note the block size is recomputed from current config on every read rather than
+stored, so changing `CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT` reinterprets existing
+ledgers.
 
 ### Checking usage: `stats` / `context`
 
 Send **`stats`** or **`context`** (or `/stats`, `/context`) as the whole chat
-message and the wrapper answers **instantly, without spawning Claude** — even
+message and the wrapper answers instantly, **without spawning Claude** — even
 while the conversation is paused at a checkpoint, and at zero token cost:
 
 > 📊 **Usage stats**
@@ -593,216 +1164,440 @@ while the conversation is paused at a checkpoint, and at zero token cost:
 > - **Session allowance:** 7,500,000 tokens (max_5x plan), 5% per block
 > - **Session key:** `conv-1a2b3c…`
 
-Only a message that *is* the command triggers it — a prompt that merely
-mentions "stats" goes to Claude as usual. The same numbers are exposed
-programmatically at `GET /v1/usage/{session_id}` (the session key that chat
-responses return in their `session_id` field):
+Only a message that *is* the command triggers it (surrounding punctuation and a
+leading `/` are tolerated) — a prompt that merely mentions "stats" goes to Claude
+as usual. The same numbers are available at `GET /v1/usage/{session_id}`:
 
 ```bash
 curl -fsS -H "Authorization: Bearer $KEY" http://localhost:8000/v1/usage/conv-1a2b3c | jq
 ```
 
 Because the check happens before Claude is spawned, a paused conversation costs
-nothing until you confirm. The cap ships **enabled** at the Max 5× plan; set
-`CLAUDE_WRAPPER_SESSION_PLAN=off` to disable it.
+nothing until you confirm.
 
-## Concurrency
+---
 
-- FastAPI + uvicorn serve requests async. Different sessions execute
-  fully in parallel.
-- Requests addressing the **same** `session_id` (or deriving the same
-  hash) are serialized by an in-process `asyncio.Lock`, because Claude
-  Code's session JSONL file is not safe to write from two processes
-  simultaneously.
-- Scale horizontally by running multiple containers behind a sticky
-  load balancer keyed on `session_id`.
+## Models and reasoning effort
 
-## Auth
-
-There are two independent auth layers:
-
-**1. Claude Code → Anthropic.** The container needs to authenticate
-itself to Anthropic. In order of preference:
-
-- **Interactive OAuth (recommended).** Run `docker compose run --rm -it
-  claude-wrapper login` once. This executes `claude login` inside the
-  container and writes the resulting credentials to
-  `/home/claude/.claude/`, which is backed by the `claude-home` named
-  volume so they survive `docker compose down/up`, image rebuilds, and
-  machine reboots.
-- **Long-lived OAuth token.** `docker compose run --rm -it
-  claude-wrapper setup-token` runs `claude setup-token`, which prints a
-  URL + code, accepts the resulting token, and stores it in the same
-  volume. Good for headless / CI setups where you never want to
-  interactively log in again.
-- **Env vars.** Set `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` in
-  `.env`. Takes precedence over nothing; skip if you've done the
-  interactive login.
-- **Share the host account's login.** If the host already has a Claude
-  Code login you'd rather reuse, point `CLAUDE_HOST_CREDENTIALS` at its
-  `~/.claude/.credentials.json` and add the optional overlay:
-
-  ```bash
-  docker compose -f docker-compose.yml -f docker-compose.host-credentials.yml up -d
-  ```
-
-  This bind-mounts that single file read-only. Because it's one file
-  rather than a directory, an in-container token refresh can't replace
-  the inode — refreshes have to happen host-side, and an expired token
-  means logging in again *on the host*. The file is mode 600, so
-  `CLAUDE_UID` must match its owner. Prefer the container's own login
-  for anything long-running or headless.
-
-  Note this is a deliberately narrow mount. Bind-mounting the host's
-  whole `~/.claude` instead co-mingles its live daemon, session locks,
-  and 700-mode sessions dir, which breaks `claude --resume`: the first
-  turn of a chat succeeds and every follow-up fails with
-  `error_during_execution`.
-
-Entrypoint subcommands available via `docker compose run --rm -it
-claude-wrapper <cmd>`:
-
-| Command | Purpose |
-| --- | --- |
-| `serve` (default) | Start the uvicorn API server |
-| `login` / `init` | Interactive Claude Code OAuth login |
-| `setup-token` | Mint a long-lived OAuth token |
-| `shell` | Drop into bash inside the container |
-| `claude …` | Run any other `claude` CLI command |
-
-**2. Client → wrapper.** If `CLAUDE_WRAPPER_API_KEYS` is set
-(comma-separated), every request to the wrapper must include
-`Authorization: Bearer <one-of-those-keys>`. When unset, the server is
-unauthenticated — bind it to loopback or a private network only.
-
-## Data & persistence
-
-The compose file mounts two named volumes:
-
-- `claude-data` → `/data` (uploaded + generated files, session registry,
-  per-session workspaces).
-- `claude-home` → `/home/claude/.claude` (Claude Code's own state,
-  including the OAuth credentials from `login` / `setup-token`). The image
-  sets `CLAUDE_CONFIG_DIR` to this path so the CLI's config file lands here
-  too — by default it writes `~/.claude.json` at HOME root, outside the
-  volume, where a `run --rm` login would discard it on exit.
-
-…plus one host bind mount:
-
-- `${CLAUDE_INBOX_DIR:-./inbox}` → `/data/inbox`, read-only. See
-  [Host drop folder](#host-drop-folder-datainbox).
-
-The container runs unprivileged as `CLAUDE_UID:CLAUDE_GID` with
-`cap_drop: ALL` and `no-new-privileges`, so everything it touches on the
-host must be readable by that uid.
-
-## Sandboxed deployment (network-isolated agent)
-
-`docker-compose.sandbox.yml` splits the wrapper into three containers so the
-FastAPI server is the **only** externally reachable service and the agent —
-where model-driven tool use actually executes — has no route to the internet
-except through a domain allowlist:
-
-```
-[clients] ──> claude-wrapper (FastAPI — the only published port)
-                  │  backend network (internal: no external route)
-                  ├──> claude-agent  (Claude Code CLI behind src/agent_shim.py)
-                  │        │  HTTP(S)_PROXY egress only
-                  └───────>└──> squid ──> sandbox/allowlist.txt hosts
-```
-
-```bash
-docker compose -f docker-compose.sandbox.yml up -d          # or podman-compose
-docker compose -f docker-compose.sandbox.yml run --rm -it claude-agent login
-```
-
-How it works:
-
-- When `CLAUDE_WRAPPER_AGENT_URL` is set, the wrapper stops spawning `claude`
-  locally and sends each run to the **agent shim** (`src/agent_shim.py`), a
-  minimal service that spawns the CLI and streams its stream-json stdout back
-  verbatim. The shim never takes the binary path from the caller, confines
-  `cwd` to the shared workspace volume, and can require a bearer token
-  (`CLAUDE_WRAPPER_AGENT_TOKEN`).
-- The per-session workspace is a volume mounted **at the same path in both
-  containers**, so uploads materialized by the API and files generated by the
-  CLI need no copying. The file store, session registry and usage ledgers stay
-  API-only; the CLI's credentials and session logs stay agent-only (the API
-  mounts them read-only for the tool bridge).
-- Squid is a **CONNECT-only** proxy — no TLS interception, no caching, and no
-  buffering of the token stream. It runs unprivileged (`user: proxy`,
-  `cap_drop: ALL`; the pid file is pointed at `/var/cache/squid`, which the
-  squid user owns) and enforces `sandbox/allowlist.txt`: one host per line, a
-  leading dot matching all subdomains, exactly squid's `dstdomain` semantics.
-  Denied hosts fail in milliseconds, so the CLI's probes to unlisted hosts
-  (feature flags, update checks) don't read as latency.
-- The agent's proxy env (`HTTP_PROXY`/`HTTPS_PROXY`) is inherited by the CLI
-  and every Bash subshell it runs — curl, pip and git all flow through the
-  allowlist with no code changes.
-
-Every API feature works identically to the single-container layout — chat and
-Responses (streaming included), generated-file download links, sessions and
-`--resume`, the token budget, JSON mode, the tool bridge, and the delegated
-endpoints — with these operational notes:
-
-- **Knowledge base:** the `curl` calls to `$OPENWEBUI_BASE_URL` run in the
-  agent container. If OpenWebUI lives on your internal network, add its host
-  to `SANDBOX_EXTRA_NO_PROXY` (direct, needs a route) or to the allowlist
-  (via squid).
-- **Audio/embeddings first use:** `faster-whisper` and `sentence-transformers`
-  download model weights from `huggingface.co` — add it (and
-  `cdn-lfs.huggingface.co`) to the allowlist, or pre-install the models in the
-  image. pip itself is already covered by `pypi.org` +
-  `files.pythonhosted.org`.
-- **Function calling (`tools`)** is served by the API container's direct
-  Messages-API call; the sandbox compose routes it through the same proxy, so
-  `api.anthropic.com` must stay on the allowlist.
-- **`http(s)` `image_url` fetches** leave the API container and are governed
-  by the allowlist too — which turns the SSRF surface noted under
-  [Multimodal input](#multimodal-input) into a policy decision.
-- The agent's isolation is enforced by network topology (hard); the API
-  container's egress discipline is proxy-env only (soft) because its inbound
-  port needs a non-internal network. Firewall the host if you want both hard.
-
-## Supported models
-
-The `/v1/models` endpoint lists the Claude models the wrapper accepts. The
-list is **built once at startup by scanning the installed Claude Code binary**
-for the model ids it ships with (the current Opus / Sonnet / Haiku families and
-the `fable` / `mythos` codename families, including the `[1m]` long-context
-variants), so it tracks whatever Claude Code version is installed instead of a
-hardcoded set. Set
-`CLAUDE_WRAPPER_MODEL_DISCOVERY=off` to serve a static built-in list instead;
-discovery also falls back to that list automatically if the binary can't be
-read. Pass `"model": "auto"` to use `CLAUDE_WRAPPER_DEFAULT_MODEL`.
+`/v1/models` lists the Claude models the wrapper accepts. The list is **built
+once at startup by scanning the installed Claude Code binary** for the model ids
+it ships with, so it tracks whatever CLI version is installed instead of a
+hardcoded set. A maintained denylist drops models Anthropic has deprecated
+(deprecation isn't encoded in the binary). Set
+`CLAUDE_WRAPPER_MODEL_DISCOVERY=off` to serve a static built-in list; discovery
+also falls back to that list automatically if the binary can't be read. Pass
+`"model": "auto"` to use `CLAUDE_WRAPPER_DEFAULT_MODEL`.
 
 Each effort-capable model is advertised with one variant per effort level it
-accepts (the *family rule*): Opus 4.5+ and the `fable` / `mythos` codename
-families expose `(low)`/`(medium)`/`(high)`/`(xhigh)`/`(max)` plus `(ultracode)`;
-Sonnet 4.6+ exposes through `(xhigh)`; Haiku and older models expose none.
-Selecting a variant like `claude-opus-4-8 (xhigh)` sets the per-request effort.
+accepts (the *family rule*):
+
+| Family | Advertised efforts |
+| --- | --- |
+| Opus 4.5+ and the `fable` / `mythos` codename families | `(low)` `(medium)` `(high)` `(xhigh)` `(max)` `(ultracode)` |
+| Sonnet 4.6+ | `(low)` `(medium)` `(high)` `(xhigh)` |
+| Haiku and older models | none |
+
+Selecting `claude-opus-4-8 (xhigh)` sets the per-request effort. A
+`claude-opus-4-8:xhigh` shorthand also parses. A bare model id uses the server
+default (`CLAUDE_WRAPPER_EFFORT`), and an explicitly empty effort means no
+`--effort` flag is passed at all, letting the CLI choose. The `[1m]`
+long-context suffix passes through the effort machinery untouched.
+
+Responses report what actually happened in the `effort` field —
+`{"applied": "xhigh", "source": "request", "requested": "xhigh"}` — where
+`source` is one of `request`, `server-default`, `model-incapable` or
+`effort-unsupported`. That is how you confirm a variant took effect rather than
+being silently dropped for a model that doesn't support it.
 
 The `(ultracode)` variant is special: it requests xhigh effort **plus** Claude
 Code's dynamic-workflow (multi-agent) orchestration. Because ultracode is gated
 on dynamic workflows being enabled — and that setting defaults off in a headless
 container — the wrapper turns it on in the same overlay
-(`--settings '{"enableWorkflows": true, "ultracode": true}'`). An org-policy
-`disableWorkflows` or an account-level launch gate can still override this; those
-are account-side and cannot be set by the wrapper.
+(`--settings '{"enableWorkflows": true, "ultracode": true}'`) and passes no
+`--effort` flag. An org-policy `disableWorkflows` or an account-level launch gate
+can still override this; those are account-side and cannot be set by the wrapper.
 
-## Limitations
+---
 
-- A single turn can serve the client's tools or run Claude Code, never both.
-  Requests carrying `tools` go to the tool bridge (Messages API, `tool_calls`
-  returned, no CLI and therefore no generated files); requests without them run
-  the agentic CLI path, where Claude manages its own tools internally
-  (Read/Write/Bash/etc.) and only the final assistant text is surfaced. See
-  "Generated files" for the Open WebUI setting that avoids the choice entirely.
-- Fine-tuning endpoints return 501: Claude models aren't user-tunable
-  through this path. Use `/v1/assistants` to save per-customer
-  instructions instead.
-- Delegated endpoints (audio, images) rely on Claude installing tools
-  the first time they're invoked. Cold-call latency is high; subsequent
-  calls reuse the cached install.
-- The realtime WebSocket is text-only — audio goes through
-  `/v1/audio/*` instead of the realtime socket.
+## Auth
+
+There are two independent auth layers.
+
+### First-time login
+
+**`claude login` is not an authentication command.** CLI 2.1.226 has no `login`
+subcommand — the word is parsed as a prompt, so the CLI opens a chat session,
+writes `history.jsonl` and `sessions/`, and never touches `.credentials.json`.
+The only interactive auth path is the TUI's `/login` slash command. (The
+`login` entrypoint subcommand detects this and drops you into the TUI.)
+
+For the **single-container** layout:
+
+```bash
+docker compose run --rm -it claude-wrapper login   # opens the TUI; type /login
+```
+
+For the **sandboxed** layout there is one trap:
+
+- The agent has no direct route out and defers DNS to Squid, and OAuth fails
+  there with `OAuth error: Invalid IP address: undefined`. This affects **any**
+  OAuth flow in that container, not just the interactive one — `setup-token`
+  fails identically, which rules out the callback as the cause.
+
+Note what is *not* the problem: `claude-home` is mounted **writable** on
+`claude-agent` (it is read-only only on `claude-wrapper`), so the volume is not
+what blocks a login aimed at the agent.
+
+The reliable approach is to do the one-time login in a throwaway container with
+ordinary networking, writing into the same volume the agent reads. This is a
+legitimate bootstrap, not a workaround: the sandbox exists to constrain
+model-driven tool use, not the operator's initial setup.
+
+Get the volume name from the running container rather than guessing it — a
+`-v` naming a volume that does not exist **creates an empty one**, so the login
+succeeds into a volume nothing reads:
+
+```bash
+podman inspect claude-agent \
+    --format '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{"\n"}}{{end}}'
+
+podman run --rm -it -v <that-name>:/home/claude/.claude claude-wrapper:latest claude
+# type /login at the prompt, complete the flow, then /exit
+
+podman exec claude-agent stat -c '%y' /home/claude/.claude/.credentials.json
+```
+
+That last line is the check that matters: the mtime must be from just now. If it
+has not moved, the credential did not land, whatever the CLI printed.
+
+`setup-token` is **not** an alternative route into the volume. It prints a token
+and nothing else — verified with `claude-home` mounted writable, where it left
+`.credentials.json` untouched. Its output is for `CLAUDE_CODE_OAUTH_TOKEN`, and
+setting that suppresses file refresh entirely (see
+[Keeping the credential alive](#keeping-the-credential-alive)). On an
+API-key-only deployment you can delete the eight `claude.ai` / `claude.com`
+entries from `sandbox/allowlist.txt`, which that file's own comments recommend.
+
+### 1. Claude Code → Anthropic
+
+The two mechanisms are genuinely different, and they cannot both be active —
+an environment credential wins and then nothing renews the file underneath it.
+
+- **Interactive login (renews itself).** Run the TUI and use `/login`. Writes
+  `.credentials.json` to `/home/claude/.claude/`, backed by the `claude-home`
+  volume so it survives `down`/`up`, rebuilds and reboots. The access token
+  lasts hours and the CLI renews it from a refresh token — good for ~30 days —
+  every time it runs with working egress. This is the only credential that
+  sustains itself, and the only one that lives in the volume. Under the sandbox
+  topology, bootstrap it from a throwaway container: see
+  [First-time login](#first-time-login).
+- **Long-lived token (static).** `claude setup-token` prints a token valid for
+  about a year. It is **not** written to the volume — the output is meant for
+  `CLAUDE_CODE_OAUTH_TOKEN`. Nothing renews it and nothing can read its expiry,
+  so it is best kept as a break-glass credential rather than the primary. Note
+  that setting it stops the CLI refreshing any login in the volume, which then
+  decays silently; the boot report warns when it detects this.
+- **Env vars.** Set `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` in `.env`.
+  The wrapper does not arbitrate between these and a persisted login — it only
+  reports what it found. Precedence is decided by the Claude Code CLI (and,
+  for the tool bridge, `ANTHROPIC_API_KEY` is checked before
+  `CLAUDE_CODE_OAUTH_TOKEN`, which is checked before the on-disk credentials).
+- **Share the host account's login.** Point `CLAUDE_HOST_CREDENTIALS` at the
+  host's `~/.claude/.credentials.json` and add the overlay:
+
+  ```bash
+  docker compose -f docker-compose.yml -f docker-compose.host-credentials.yml up -d
+  ```
+
+  This bind-mounts that single file read-only. Because it's one file rather than
+  a directory, an in-container token refresh can't replace the inode — refreshes
+  have to happen host-side, and an expired token means logging in again *on the
+  host*. The file is mode 600, so `CLAUDE_UID` must match its owner. Prefer the
+  container's own login for anything long-running or headless.
+
+  This is a deliberately narrow mount. Bind-mounting the host's whole `~/.claude`
+  instead co-mingles its live daemon, session locks and 700-mode sessions dir,
+  which breaks `claude --resume`: the first turn of a chat succeeds and every
+  follow-up fails with `error_during_execution`.
+
+  The overlay targets `claude-wrapper` and is therefore **inert under the sandbox
+  topology**, where the CLI runs in `claude-agent`.
+
+### Keeping the credential alive
+
+An access token always expires; what you control is whether it gets renewed
+before it does. The CLI rewrites `.credentials.json` when it runs — but only
+when it runs, and only if it can reach the network. So a deployment that sits
+idle, or whose egress breaks, drifts past expiry with nothing in its own logs,
+and then answers every turn with:
+
+```
+Failed to authenticate. API Error: 401 OAuth access token has expired.
+```
+
+which the wrapper surfaces as `claude failed: claude exited 1:` — empty stderr,
+no mention of credentials. Three things keep that from happening:
+
+1. **Mint a long-lived token** with `setup-token` rather than using the desktop
+   `login` flow. It does not depend on the refresh cycle at all.
+2. **Exercise the CLI on a timer** if you are on a short-lived login. A daily
+   throwaway invocation is enough to keep the refresh current:
+
+   ```bash
+   cat > ~/.config/systemd/user/claude-token-refresh.service <<'EOF'
+   [Unit]
+   Description=Keep the Claude Code OAuth token fresh
+
+   [Service]
+   Type=oneshot
+   ExecStart=/usr/bin/podman exec claude-agent claude -p hi --output-format json
+   EOF
+
+   cat > ~/.config/systemd/user/claude-token-refresh.timer <<'EOF'
+   [Unit]
+   Description=Daily Claude OAuth refresh
+
+   [Timer]
+   OnCalendar=daily
+   Persistent=true
+
+   [Install]
+   WantedBy=timers.target
+   EOF
+
+   systemctl --user daemon-reload
+   systemctl --user enable --now claude-token-refresh.timer
+   ```
+
+   `loginctl enable-linger "$USER"` must be on or the timer stops when you log
+   out — the same prerequisite the podman socket has.
+3. **Read the boot log.** Every role reports the credential it will actually
+   authenticate with, at a severity that matches how much trouble you are in:
+
+   ```
+   INFO  Claude credentials: Claude Code login (/home/claude/.claude/.credentials.json), valid for 89d
+   WARN  Claude credentials: ... valid for 7h. This is a short-lived login that only stays valid while …
+   ERROR Claude credentials: ... EXPIRED 3h ago. Every turn will fail with a 401 until this is replaced …
+   ```
+
+   Note that `/healthz` will keep returning 200 through all of this — it reports
+   that uvicorn is alive, nothing more. It is not a credential check, and it was
+   not one when squid was down either.
+
+Back the credential up once it is minted; restoring a file beats re-running an
+interactive flow through the sandbox:
+
+```bash
+podman exec claude-agent cat /home/claude/.claude/.credentials.json > ~/claude-oauth-backup.json
+chmod 600 ~/claude-oauth-backup.json
+```
+
+### Entrypoint subcommands
+
+Available via `docker compose run --rm -it claude-wrapper <cmd>`:
+
+| Command | Purpose |
+| --- | --- |
+| `serve` (also `start`, `run`, or no argument) | Start the uvicorn API server |
+| `agent` / `shim` | Start the agent shim — used by the sandbox topology |
+| `login` / `init` | Interactive Claude Code OAuth login |
+| `setup-token` / `token` | Mint a long-lived OAuth token |
+| `shell` / `bash` | Drop into bash inside the container |
+| `claude …` | Run any other `claude` CLI command |
+| anything else | Executed verbatim |
+
+### 2. Client → wrapper
+
+If `CLAUDE_WRAPPER_API_KEYS` is set (comma-separated), every request must include
+`Authorization: Bearer <one-of-those-keys>`; a bare key without the `Bearer`
+prefix is also accepted. When unset, the server is unauthenticated — bind it to
+loopback or a private network only.
+
+Three routes deviate: `/healthz` and `GET /v1/realtime/sessions` never require
+auth, and `GET /v1/files/{id}/content` accepts a signed capability link as an
+alternative to a key. FastAPI's `/docs`, `/redoc` and `/openapi.json` are
+unauthenticated as well.
+
+---
+
+## Data and persistence
+
+`docker-compose.yml` mounts two named volumes:
+
+- `claude-data` → `/data` — uploaded and generated files, the session registry,
+  usage ledgers, batch records, per-session workspaces.
+- `claude-home` → `/home/claude/.claude` — Claude Code's own state, including the
+  OAuth credentials. The image sets `CLAUDE_CONFIG_DIR` to this path so the CLI's
+  config file lands here too; by default it would write `~/.claude.json` at HOME
+  root, outside the volume, where a `run --rm` login would discard it on exit.
+
+…plus one host bind mount: `${CLAUDE_INBOX_DIR:-./inbox}` → `/data/inbox`,
+read-only.
+
+`docker-compose.sandbox.yml` differs: **three** volumes (a separate
+`claude-workspace` shared between the API and agent containers at the same path),
+`claude-home` mounted **read-only** on the API container and writable on the
+agent, and the inbox mounted on the agent rather than the API.
+
+The containers run unprivileged as `CLAUDE_UID:CLAUDE_GID` with `cap_drop: ALL`
+and `no-new-privileges`, so everything they touch on the host must be readable by
+that uid.
+
+The image contains only `src/`, `requirements.txt` and `entrypoint.sh` — `tests/`,
+`tools/`, `deploy/` and `sandbox/` are excluded, so you cannot run the test suite
+with `docker compose exec`.
+
+---
+
+## Concurrency
+
+- FastAPI + uvicorn serve requests async. Different sessions execute fully in
+  parallel.
+- Requests addressing the **same** `session_id` (or deriving the same anchor
+  hash) are serialized by an in-process `asyncio.Lock`, because Claude Code's
+  session JSONL file is not safe to write from two processes simultaneously.
+  Budget accounting has its own separate lock, because it runs before the session
+  lock is taken.
+- **Keep `CLAUDE_WRAPPER_WORKERS=1`.** That lock is per-process, so more than one
+  uvicorn worker reintroduces exactly the concurrent-write corruption it exists
+  to prevent.
+- Scale horizontally by running multiple containers behind a sticky load balancer
+  keyed on `session_id`.
+
+---
+
+## Running the tests
+
+The suite is 14 files covering endpoints, JSON mode, the budget, downloads,
+effort, the tool bridge, the KB addendum, PDF handling, the sandbox shim, resume
+self-healing and model discovery. It stubs Claude Code, so **no Docker and no
+Anthropic credentials are required**.
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt pytest        # pytest is NOT in requirements.txt
+CLAUDE_WRAPPER_DATA=/tmp/cw-test python -m pytest tests -q
+# 171 passed
+```
+
+CI (`.github/workflows/ci.yml`) runs the same command on Python 3.11, preceded by
+an import check (`python -c "import src.main"`) that catches dangling imports in
+under a second — three separate import-level breakages reached `main` before that
+guard existed. CI does not lint, type-check, build the image, or validate the
+compose files.
+
+Seven of the test files also run standalone (`python tests/test_endpoints.py`)
+and print a `RESULT pass=N fail=M` line; the other seven are pytest-only and use
+fixtures. Prefer the pytest command — the standalone path in `test_endpoints.py`
+executes 27 of the 31 tests defined in that file, and its `check()` helper counts
+failures without asserting, so a failure there does not fail the file under
+pytest either. Treat `test_endpoints.py` as a smoke test rather than a gate.
+
+---
+
+## Troubleshooting
+
+**Read the startup log first.** The wrapper reports the resolved model list,
+whether runs execute locally or in a remote agent container, knowledge-base
+state, clarification state, and a download-link report covering the link base and
+where it came from, whether signing is active, the TTL, and the workspace hint.
+Each of the corresponding misconfigurations otherwise fails silently.
+
+| Symptom | Likely cause |
+| --- | --- |
+| `PermissionError: … '/data/assistants'` at boot | `CLAUDE_UID` disagrees with the uid baked into the image — see [below](#changing-claude_uid-after-first-run) |
+| `OAuth error: Invalid IP address: undefined` | Any OAuth flow attempted inside the sandboxed agent — `setup-token` fails the same way — see [First-time login](#first-time-login) |
+| `claude login` opens a chat session instead of authenticating | There is no `login` subcommand; the word is parsed as a prompt. Use the TUI's `/login` |
+| `claude failed: claude exited 1:` with empty stderr | Usually an expired credential. The boot log names it; `claude -p hi` inside the agent prints the real 401 — see [Keeping the credential alive](#keeping-the-credential-alive) |
+| squid `FATAL: failed to open /var/cache/squid/squid.pid` | tmpfs mode under rootless podman; check `RestartCount` — see [Rootless podman caveats](#rootless-podman-caveats) |
+| CLI turns hang or exit 1, no `TCP_DENIED` in the squid log | Squid is not actually running. `restart: unless-stopped` hides a crash loop; check `RestartCount`, not `Status` |
+| `container name … already in use` on `up` | Leftovers from a previous run, or from podman-compose's pod — see [If you are stuck with podman-compose](#if-you-are-stuck-with-podman-compose) |
+| uvicorn: `Invalid value for '--port'` | The compose frontend didn't expand `${VAR:-default}` — same section |
+| Download links 401 in the browser | `CLAUDE_WRAPPER_API_KEYS` set but no signing key resolved, or the link expired |
+| Links are plain `→ file_id=…` text | No `CLAUDE_WRAPPER_PUBLIC_BASE_URL` and `CLAUDE_WRAPPER_DERIVE_BASE_URL=off` |
+| Claude never writes files | `CLAUDE_WRAPPER_WORKSPACE_HINT` is off (the code default) |
+| Downloads stop working mid-chat | Client sent `tools`; see [the tool-bridge note](#if-your-client-sends-tools-open-webui-native-function-calling) |
+| KB queries always 401 | `OPENWEBUI_BASE_URL` set without `OPENWEBUI_API_KEY` |
+| KB queries return nothing | A collection *name* was used where the *id* is required |
+| Claude answers on assumptions instead of asking | `CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS` interpolated empty from compose |
+| Every sandbox run dies instantly | `CLAUDE_CODE_PROXY_RESOLVES_HOSTS` missing, or the target host isn't on the allowlist |
+| Inbox files unreadable under rootless podman | Host uid maps to container 0; needs `userns_mode: keep-id` |
+| Old chats fail fast, new chats work | A dead `--resume` target; the wrapper self-heals on the next turn |
+
+### Changing CLAUDE_UID after first run
+
+`CLAUDE_UID` is both a build arg and a runtime uid, so changing it touches three
+things: the image, the running container, and the ownership of any volume that
+was already populated under the old value. Doing only the first two leaves you
+with `PermissionError: [Errno 13] Permission denied: '/data/assistants'` —
+`/data` is owned by the old uid, and `assistants`, `batches` and `vector_stores`
+are created at import time directly under it.
+
+Diagnose by comparing the two:
+
+```bash
+docker inspect claude-wrapper --format '{{.Config.User}}'          # runtime uid
+docker run --rm -u 0 -v <project>_claude-data:/data \
+    claude-wrapper:latest ls -lna /data                            # owner uid
+```
+
+If they differ, fix all three in one pass:
+
+```bash
+docker-compose down                       # never -v: that destroys your login
+
+sed -i "s/^CLAUDE_UID=.*/CLAUDE_UID=$(id -u)/; s/^CLAUDE_GID=.*/CLAUDE_GID=$(id -g)/" .env
+docker-compose build                      # rebuild: the uid is a build arg
+
+docker volume ls | grep claude            # confirm the project prefix
+for v in claude-data claude-workspace claude-home; do
+  docker run --rm -u 0 -v "<project>_$v:/vol" \
+      claude-wrapper:latest chown -R "$(id -u):$(id -g)" /vol
+done
+
+docker-compose up -d
+docker exec claude-wrapper id             # matches your host uid
+```
+
+The chown step is what preserves an existing login rather than making you repeat
+it. Include `claude-workspace` even though the error names only `/data`: the
+agent shim creates each session directory under the workspace root, so it would
+fail the same way on the first real request instead of at boot.
+
+---
+
+## Repository layout
+
+| Path | What it is |
+| --- | --- |
+| `src/` | The application. `main.py` (routes + SSE), `claude_runner.py` (CLI subprocess + sessions), `converters.py` (prompt building), `tool_bridge.py` (Messages API path), `agent_shim.py` (sandbox agent service), plus per-area routers. |
+| `tests/` | 14 test files; see [Running the tests](#running-the-tests). |
+| `sandbox/` | `squid.conf` and `allowlist.txt`, bind-mounted into the squid container. Config only — there is no `sandbox` executable despite what the comments in those files suggest. |
+| `tools/` | Host-side helper scripts, not part of the service and not in the image. `split_pdf.py` slices a PDF by page range or outline chapter; `chat_with_pdfs.py` uploads PDFs as binary `file_id`s and posts a chat completion, bypassing Open WebUI's text extraction. |
+| `deploy/` | **Historical.** An archived incident runbook for a mis-mounted `claude-home` volume. Both fixes shipped; `fix-claude-home-mount.sh` fails its own preflight by design and must not be run. |
+
+---
+
+## Limitations and known gaps
+
+- **Tools or the CLI, never both in one turn.** Requests carrying `tools` go to
+  the tool bridge (Messages API, `tool_calls` returned, no CLI and therefore no
+  generated files); requests without them run the agentic CLI path, where Claude
+  manages its own tools internally and only the final assistant text is surfaced.
+- **OpenAI surface coverage is partial.** There is no list-threads, no
+  thread/message/vector-store *modify*, no message retrieve/delete, no run
+  cancel, and no `submit_tool_outputs`. Fine-tuning is stubbed (501 on writes,
+  empty lists on reads).
+- **Batches are not durable.** Execution is an in-process asyncio task; in-flight
+  batches are lost on restart.
+- **Vector-store deletes are soft.** Detaching a file leaves its vectors in the
+  matrix, so its content can still appear in search results.
+- **The realtime WebSocket is text-only**, bypasses the chat pipeline entirely,
+  and ignores the client's model. Audio goes through `/v1/audio/*`.
+- **Delegated endpoints have a slow first call** while Claude installs the tools
+  it needs; later calls reuse the cached install.
+- **`/docs`, `/redoc`, `/openapi.json` and `GET /v1/realtime/sessions` are
+  unauthenticated** even when API keys are configured.
+- **Builds are not reproducible.** The base image tag, the Claude Code CLI and
+  the squid image are all unpinned.
+- **Single-worker only** — see [Concurrency](#concurrency).

@@ -227,7 +227,7 @@ spelling changes, from `docker compose` to `docker-compose`.
 # 1. Enable podman's Docker-compatible API socket (rootless, user-level)
 systemctl --user enable --now podman.socket
 loginctl enable-linger "$USER"          # keep containers alive after logout
-systemctl --user enable --now podman-restart.service   # honour restart: policies at boot
+systemctl --user enable --now podman-restart.service   # start containers at boot
 
 # 2. Install the standalone Compose v2 binary (a single static file)
 sudo curl -fsSL -o /usr/local/bin/docker-compose \
@@ -243,6 +243,41 @@ docker-compose ps                       # smoke test: connects, lists nothing
 
 Then follow [1. Configure](#1-configure) onward, substituting `docker-compose`
 for `docker compose`. Steps 1–5 are otherwise identical.
+
+### Surviving reboots
+
+Three things must all be true, and each fails silently on its own:
+
+1. **The compose files use `restart: always` — keep it that way.**
+   `podman-restart.service` is one `podman start --all --filter
+   restart-policy=always` at boot; `unless-stopped` does not match the filter,
+   so with a daemonless runtime nothing ever starts it again. (This repo used
+   `unless-stopped` until 2026-08-11, which is exactly the "enabled the service
+   but the stack stays down" symptom.)
+2. **Linger, for the account that owns the containers.** Without it that
+   user's systemd manager — and every user-level unit, podman-restart
+   included — starts at *login*, not at boot.
+3. **The units enabled in that same account's manager.** `systemctl --user`
+   acts on whoever runs it; enabling the service as your login user does
+   nothing for a stack owned by a service account.
+
+For a dedicated service account (say `claude`, uid 1001), run all of it as
+root once:
+
+```bash
+loginctl enable-linger claude
+sudo -u claude XDG_RUNTIME_DIR=/run/user/1001 \
+    systemctl --user enable --now podman.socket podman-restart.service
+
+# verify all three legs:
+loginctl show-user claude -p Linger                 # Linger=yes
+sudo -u claude XDG_RUNTIME_DIR=/run/user/1001 \
+    systemctl --user is-enabled podman-restart.service   # enabled
+podman inspect claude-wrapper --format '{{.HostConfig.RestartPolicy.Name}}'  # always
+```
+
+The real test is a reboot: `podman ps` afterwards (as the owning user) must
+list the stack. If it is empty, walk the three legs above in order.
 
 ### Confirm you are still rootless
 

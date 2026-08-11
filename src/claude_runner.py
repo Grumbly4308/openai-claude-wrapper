@@ -12,7 +12,8 @@ from typing import AsyncIterator, Optional
 
 import aiofiles
 
-from .config import ULTRACODE_EFFORT, effort_choices_for
+from .capabilities import cli_disallowed_tools
+from .config import SETTINGS, ULTRACODE_EFFORT, effort_choices_for
 
 log = logging.getLogger("claude_wrapper.runner")
 
@@ -205,6 +206,7 @@ class ClaudeRunner:
         effort: Optional[str] = None,
         clarify: bool = False,
         workspace_hint: bool = False,
+        capability_gated: bool = True,
     ) -> list[str]:
         # Prompt is fed via stdin (not argv) to avoid E2BIG on large prompts.
         argv = [
@@ -257,8 +259,17 @@ class ClaudeRunner:
             segments.append(self.clarify_system_prompt)
         if segments:
             argv += ["--append-system-prompt", "\n\n".join(segments)]
+        # Capability gating (chat runs only — delegation passes
+        # capability_gated=False): tools the model's profile withholds, merged
+        # with the clarify set into one --disallowedTools emission. Dedup
+        # preserves first-seen order so the argv stays deterministic.
+        disallowed: list[str] = []
+        if capability_gated:
+            disallowed += cli_disallowed_tools(model or SETTINGS.default_model)
         if clarify and self.clarify_disallowed_tools:
-            argv += ["--disallowedTools", *self.clarify_disallowed_tools]
+            disallowed += self.clarify_disallowed_tools
+        if disallowed:
+            argv += ["--disallowedTools", *dict.fromkeys(disallowed)]
         argv += ["--dangerously-skip-permissions"]
         if extra_args:
             argv += list(extra_args)
@@ -274,10 +285,15 @@ class ClaudeRunner:
         effort: Optional[str] = None,
         clarify: bool = False,
         workspace_hint: bool = False,
+        capability_gated: bool = True,
     ) -> AsyncIterator[StreamEvent]:
         """Yield StreamEvents as the subprocess produces them.
 
         The final event is always either ``final`` or ``error``.
+
+        ``capability_gated`` applies the model's capability profile as
+        --disallowedTools. On by default so every chat surface is covered;
+        delegation runs pass False (they do their work through Bash).
         """
         lock = await self.registry.lock_for(session_key)
         await lock.acquire()
@@ -294,6 +310,7 @@ class ClaudeRunner:
                 effort=effort,
                 clarify=clarify,
                 workspace_hint=workspace_hint,
+                capability_gated=capability_gated,
             )
 
             env = os.environ.copy()
@@ -446,6 +463,7 @@ class ClaudeRunner:
         effort: Optional[str] = None,
         clarify: bool = False,
         workspace_hint: bool = False,
+        capability_gated: bool = True,
     ) -> ClaudeResult:
         result = ClaudeResult(session_uuid="", final_text="")
         text_parts: list[str] = []
@@ -459,6 +477,7 @@ class ClaudeRunner:
             effort=effort,
             clarify=clarify,
             workspace_hint=workspace_hint,
+            capability_gated=capability_gated,
         ):
             result.events.append(evt)
             if evt.kind == "text" and evt.text:

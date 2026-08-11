@@ -262,6 +262,29 @@ def has_capability(model: str, cap: Capability) -> bool:
     return cap in resolve_profile(model)
 
 
+# Chat-path CLI enforcement: which Claude Code tools a missing capability
+# disallows. Dict order is the emission order, so argv stays deterministic.
+_CLI_TOOLS_BY_CAPABILITY: dict[Capability, tuple[str, ...]] = {
+    Capability.TERMINAL: ("Bash",),
+    Capability.WEB_SEARCH: ("WebSearch", "WebFetch"),
+    Capability.SUB_AGENTS: ("Task",),
+}
+
+
+def cli_disallowed_tools(model: str) -> tuple[str, ...]:
+    """Claude Code tool names to pass via --disallowedTools for a chat run.
+
+    Chat runs only — the wrapper's internal delegation runs (audio, images,
+    embeddings doing their work through Bash) must never be gated.
+    """
+    caps = resolve_profile(model)
+    out: list[str] = []
+    for cap, tools in _CLI_TOOLS_BY_CAPABILITY.items():
+        if cap not in caps:
+            out.extend(tools)
+    return tuple(out)
+
+
 def reset_profile_cache() -> None:
     """Drop the memoized config and resolutions (tests / config reload)."""
     global _config_cache

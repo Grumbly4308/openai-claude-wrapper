@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -35,7 +36,8 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 import httpx
 from fastapi import HTTPException
 
-from .config import SETTINGS
+from .capabilities import Capability, resolve_profile
+from .config import SETTINGS, _bool_env
 from .json_mode import extract_raw_json, json_instruction, json_mode_error, wants_json
 from .models import (
     ChatCompletionChunk,
@@ -152,6 +154,47 @@ def resolve_auth() -> tuple[dict[str, str], bool]:
             f"or log the Claude Code CLI in so {_CREDENTIALS_FILE} exists"
         ),
     )
+
+
+# ---------- capability gating & server-side tool injection ----------
+
+# Server web search in the bridge is genuinely new behavior (direct API tool
+# billing), while the web_search *capability* defaults on for the CLI path's
+# sake — so bridge injection takes its own operator opt-in, mirroring the
+# terminal gate. Code execution needs no extra gate: its capability defaults
+# off, so a profile grant is already an explicit operator action.
+_BRIDGE_WEB_SEARCH_ENV = "CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH"
+
+_WS_MODERN = "web_search_20260209"  # Opus 4.6+/Sonnet 4.6+/Claude 5+ families
+_WS_BASIC = "web_search_20250305"  # everything older, incl. Haiku 4.5
+_CODE_EXECUTION_TYPE = "code_execution_20260521"
+
+_WS_FAMILY_RE = re.compile(r"^claude-(opus|sonnet|haiku|fable|mythos)-(\d+)(?:-(\d{1,2}))?")
+
+
+def _web_search_type(api_model: str) -> str:
+    m = _WS_FAMILY_RE.match(api_model)
+    if not m:
+        return _WS_BASIC
+    fam, major, minor = m.group(1), int(m.group(2)), m.group(3)
+    if fam in ("fable", "mythos"):
+        return _WS_MODERN
+    if fam == "haiku":
+        return _WS_BASIC
+    if major >= 5 or (major == 4 and minor is not None and int(minor) >= 6):
+        return _WS_MODERN
+    return _WS_BASIC
+
+
+def _server_tools(run_model: str, caps: frozenset[Capability]) -> list[dict[str, Any]]:
+    """Anthropic server-side tools the model's profile enables for this run."""
+    out: list[dict[str, Any]] = []
+    if Capability.WEB_SEARCH in caps and _bool_env(_BRIDGE_WEB_SEARCH_ENV, False):
+        api_model, _ = _api_model(run_model)
+        out.append({"type": _web_search_type(api_model), "name": "web_search"})
+    if Capability.CODE_INTERPRETER in caps:
+        out.append({"type": _CODE_EXECUTION_TYPE, "name": "code_execution"})
+    return out
 
 
 # ---------- OpenAI -> Anthropic translation ----------
@@ -332,10 +375,24 @@ def build_request(
         payload["temperature"] = min(max(req.temperature, 0.0), 1.0)
     if req.top_p is not None:
         payload["top_p"] = req.top_p
+    caps = resolve_profile(run_model)
     tools, tool_choice = _tools_to_anthropic(req)
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = tool_choice
+    if tools and Capability.CLIENT_TOOLS not in caps:
+        declared = ", ".join(sorted(t["name"] for t in tools))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"model '{run_model}' does not accept client-declared tools "
+                f"(capability 'client_tools' is not in its profile); declared: {declared}"
+            ),
+        )
+    # Injected server tools go after the client's, in fixed order, so the
+    # rendered tool list stays deterministic for prompt caching.
+    all_tools = (tools or []) + _server_tools(run_model, caps)
+    if all_tools:
+        payload["tools"] = all_tools
+        if tools:
+            payload["tool_choice"] = tool_choice
 
     betas = []
     if is_oauth:

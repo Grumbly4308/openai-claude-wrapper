@@ -752,3 +752,99 @@ def test_json_mode_streaming_unparseable_errors(bridge):
     errors = [c["error"]["message"] for c in chunks if "error" in c]
     assert len(errors) == 1
     assert "I need more details first." in errors[0]
+
+
+# ---------- capability profiles on the bridge (phase 3) ----------
+
+
+@pytest.fixture
+def profiles(monkeypatch):
+    """Point the profile loader at a per-test file; reset caches around it."""
+    from src.capabilities import PROFILE_FILE_ENV, reset_profile_cache
+
+    def _set(doc: dict):
+        path = Path(_TMP) / f"profiles-{len(str(doc))}.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        monkeypatch.setenv(PROFILE_FILE_ENV, str(path))
+        reset_profile_cache()
+
+    yield _set
+    reset_profile_cache()
+
+
+def test_client_tools_denied_by_profile(bridge, profiles):
+    bridge(_anthropic_tool_use_response())
+    profiles({"models": [{"match": "claude-haiku-4-5", "remove": ["client_tools"]}]})
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert "client_tools" in detail and "web_search" in detail
+
+
+def test_code_interpreter_injected_after_client_tools(bridge, profiles):
+    capture = bridge(_anthropic_tool_use_response())
+    profiles({"models": [{"match": "claude-haiku-4-5", "add": ["code_interpreter"]}]})
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 200
+    sent = capture.requests[0]["tools"]
+    assert [t.get("name") for t in sent] == ["web_search", "code_execution"]
+    assert sent[1]["type"] == "code_execution_20260521"
+    # tool_choice still governs the client tools.
+    assert capture.requests[0]["tool_choice"] == {"type": "auto"}
+
+
+def test_bridge_web_search_needs_env_opt_in(bridge, profiles, monkeypatch):
+    # Capability on (default) but no env opt-in → no injection.
+    capture = bridge(_anthropic_tool_use_response())
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 200
+    assert [t.get("name") for t in capture.requests[0]["tools"]] == ["web_search"]
+
+    # Env opt-in → injected, basic variant for Haiku. The client's own
+    # "web_search" function and the server tool share a name here; the server
+    # tool is typed, the client one isn't — assert on both fields.
+    monkeypatch.setenv("CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH", "true")
+    capture = bridge(_anthropic_tool_use_response())
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 200
+    sent = capture.requests[0]["tools"]
+    assert len(sent) == 2
+    assert sent[1] == {"type": "web_search_20250305", "name": "web_search"}
+
+
+def test_web_search_version_tracks_model_family(bridge, profiles, monkeypatch):
+    monkeypatch.setenv("CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH", "true")
+    capture = bridge(_anthropic_tool_use_response())
+    r = _post(
+        {
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 200
+    assert capture.requests[0]["tools"][1]["type"] == "web_search_20260209"

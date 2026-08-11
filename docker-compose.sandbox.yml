@@ -26,11 +26,18 @@
 #   docker compose -f docker-compose.sandbox.yml up -d
 #   podman-compose -f docker-compose.sandbox.yml up -d
 #
-# Under ROOTLESS podman three things differ from docker:
+# Under ROOTLESS podman four things differ from docker:
+#   - restart policy at boot. There is no daemon to honour `restart:` after a
+#     reboot; containers come back only if podman-restart.service starts them,
+#     and its unit filters on restart-policy=always — `unless-stopped` is
+#     invisible to it and the stack silently stays down. Every service here is
+#     therefore `restart: always`. The service must be enabled for the account
+#     that owns the containers, and that account needs linger (README
+#     "Rootless podman").
 #   - tmpfs default mode. Docker mounts a tmpfs 1777; rootless podman mounts it
 #     root-owned 0755, which an unprivileged service cannot write. Squid's is
 #     therefore pinned to mode=1777 below — without it squid cannot create its
-#     pid file, dies at startup, and `restart: unless-stopped` hides that as a
+#     pid file, dies at startup, and the restart policy hides that as a
 #     silent loop: the stack reports "up" while the agent has no egress at all.
 #   - `user:` below is a uid INSIDE the user namespace, so it does not name the
 #     host account. If the inbox bind mount reads as owned by a stranger, run
@@ -64,7 +71,7 @@ services:
         CLAUDE_GID: "${CLAUDE_GID:-1000}"
     image: claude-wrapper:latest
     container_name: claude-wrapper
-    restart: unless-stopped
+    restart: always
     user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
     security_opt:
       - no-new-privileges:true
@@ -174,7 +181,7 @@ services:
         CLAUDE_GID: "${CLAUDE_GID:-1000}"
     image: claude-wrapper:latest
     container_name: claude-agent
-    restart: unless-stopped
+    restart: always
     user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
     security_opt:
       - no-new-privileges:true
@@ -266,7 +273,7 @@ services:
         CLAUDE_GID: "${CLAUDE_GID:-1000}"
     image: claude-wrapper:latest
     container_name: claude-refresher
-    restart: unless-stopped
+    restart: always
     user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
     security_opt:
       - no-new-privileges:true
@@ -297,7 +304,7 @@ services:
   squid:
     image: docker.io/ubuntu/squid:latest
     container_name: claude-squid
-    restart: unless-stopped
+    restart: always
     # Unprivileged from the first instruction: squid never runs as root, so it
     # cannot write /var/run/squid.pid — squid.conf points the pid file at
     # /var/cache/squid instead, and both writable paths are tmpfs.

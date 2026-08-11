@@ -10,7 +10,7 @@ services:
         CLAUDE_GID: "${CLAUDE_GID:-1000}"
     image: claude-wrapper:latest
     container_name: claude-wrapper
-    restart: unless-stopped
+    restart: always
     # Belt-and-braces: the image already ends on `USER claude`, but pinning the
     # uid here means an image built with different args (or pulled from a
     # registry) still runs unprivileged, and `docker compose run` inherits it.

@@ -122,30 +122,37 @@ questions before concluding anything.
 
 ### 4. Documentation corrections
 
-- [ ] `README.md:1237` — the read-only mount is not why login fails; the volume is writable on the agent
-- [ ] `README.md:1240` — `setup-token` fails inside the sandbox exactly as `login` does; it is not a workaround for it
-- [ ] `README.md:1268`, `.env.example:50`, `entrypoint.sh:84` — `setup-token` prints a token for the environment; it does not reliably populate the credentials volume
-- [ ] `README.md:1489` — troubleshooting row should read "any OAuth flow", not "interactive login"
-- [ ] `README.md:1249` — the throwaway-container recipe must show `-v <volume>:/home/claude/.claude`; without it the credential is discarded
-- [ ] Document that an env token suppresses file refresh — the single most
+All done in `7e57523` / `4f0bfbc`; line numbers below are from before those
+commits.
+
+- [x] `README.md:1237` — the read-only mount is not why login fails; the volume is writable on the agent
+- [x] `README.md:1240` — `setup-token` fails inside the sandbox exactly as `login` does; it is not a workaround for it
+- [x] `README.md:1268`, `.env.example:50`, `entrypoint.sh:84` — `setup-token` prints a token for the environment; it does not reliably populate the credentials volume
+- [x] `README.md:1489` — troubleshooting row should read "any OAuth flow", not "interactive login"
+- [x] `README.md:1249` — the throwaway-container recipe must show `-v <volume>:/home/claude/.claude`; without it the credential is discarded
+- [x] Document that an env token suppresses file refresh — the single most
       surprising behaviour in this system, currently written down nowhere
 
 ### 5. Code fixes
 
-- [ ] `src/config.py:605` — `read_credential_status()` returns on the env token
+- [x] `src/config.py:605` — `read_credential_status()` returns on the env token
       *before* opening the file, so it cannot warn that a volume credential is
-      decaying underneath it. Report both.
-- [ ] `src/config.py` — the file branch reads only `expiresAt`; the number that
+      decaying underneath it. Report both. — done, `log_credential_status()`
+      now warns about the shadowed login
+- [x] `src/config.py` — the file branch reads only `expiresAt`; the number that
       matters for "do I need to log in again" is `refreshTokenExpiresAt`
-- [ ] `entrypoint.sh:76-79` — **`cmd_login` is broken.** `claude login --help`
+- [x] `entrypoint.sh:76-79` — **`cmd_login` is broken.** `claude login --help`
       exits 0 even though no `login` subcommand exists, so the probe always
-      passes and `exec claude login` starts a chat session. Replace the probe
-      with a real capability check (`claude --help | grep -qw login`), or drop
-      the subcommand and document the TUI `/login` flow instead.
+      passes and `exec claude login` starts a chat session. — done, it now
+      capability-checks and otherwise opens the TUI with the `/login` hint
 - [ ] `entrypoint.sh:7` — `has_saved_login()` is a pure existence test, so an
-      expired credential counts as "logged in" and the warning never fires
+      expired credential counts as "logged in" and the warning never fires.
+      Still open. Low value now that the boot report reads the expiry properly,
+      and it only gates a startup hint — but it is the same class of bug the
+      whole exercise was about: a file's presence taken for a working credential.
 - [ ] `docker-compose.sandbox.yml:204` — `NO_PROXY` has a trailing empty element
       when `SANDBOX_EXTRA_NO_PROXY` is unset. Hygiene only; not a cause of anything.
+      Still open.
 
 ## Outcome (2026-08-11)
 

@@ -28,7 +28,13 @@ git fetch origin
 git checkout feat/sandbox-tool-profiles
 git pull --ff-only origin feat/sandbox-tool-profiles
 
-$DC up -d --build
+# Build with podman itself — NOT docker/buildx. A buildx build lands in the
+# wrong image store and podman keeps serving the stale localhost/
+# claude-wrapper:latest (symptom: rebuilds "succeed" but /v1/models never
+# changes). Same fix as the historical stale-image loop.
+podman build -t claude-wrapper:latest \
+  --build-arg CLAUDE_UID=$(id -u) --build-arg CLAUDE_GID=$(id -g) .
+$DC up -d
 
 curl -fsS $WRAPPER/healthz            # {"status":"ok"}
 $DC logs claude-wrapper | grep "capabilities\["    # per-model boot log
@@ -57,7 +63,17 @@ Rollback at any point: `git checkout <previous branch> && $DC up -d --build`.
 ## A. Baseline — absent config must be a no-op (plus the one intended change)
 
 Run group A with `sandbox/profiles.json` still `{}` and none of the new env
-vars set.
+vars set — and with the model's **Function Calling = *Default*** in OpenWebUI
+for the whole group. In Native mode OpenWebUI attaches its tool roster to
+every message and the request routes to the tool bridge, which never has a
+Bash tool regardless of the gate — the test proves nothing there. Verify the
+path per turn in the logs: `$DC logs claude-wrapper | grep chat/completions |
+tail -1` — a CLI-path turn has **no** `[tool-bridge]` tag and `tools=0`.
+(Native mode is exercised deliberately in groups C–E.)
+
+Config note: if `.env` sets `CLAUDE_WRAPPER_DEFAULT_MODEL=auto`, an `auto`
+row appears in `/v1/models` — the wrapper always advertises its configured
+default. Set a real model id there.
 
 - [ ] **RT-1 — model list carries capabilities**
   ```bash
@@ -81,8 +97,16 @@ vars set.
   `--disallowedTools Bash` crossed the shim into the agent's CLI.
 
 - [ ] **RT-5 — delegation exempt from the gate** — with terminal still off,
-  generate an image from OpenWebUI (or any audio/TTS request). Still works —
-  internal delegation runs are never gated.
+  hit the wrapper's image endpoint (do NOT ask the chat model to draw — chat
+  has no image tool on any path; the endpoint does its work via a delegation
+  session that needs Bash):
+  ```bash
+  curl -s -X POST $WRAPPER/v1/images/generations \
+    -H 'content-type: application/json' \
+    -d '{"prompt":"a red circle on a white background","n":1,"size":"256x256","response_format":"url"}'
+  ```
+  JSON with `data[0].url` after ~30–90s. Passing while RT-4 shows chat-Bash
+  gated proves delegation is exempt.
 
 - [ ] **RT-6 — generated-file downloads intact** (Function Calling = *Default*)
   > "Write a 3-line CSV of fruit prices and give it to me as a file."

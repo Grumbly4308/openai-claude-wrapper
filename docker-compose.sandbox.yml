@@ -45,10 +45,11 @@
 #     and inbox need a `:z` suffix, or the container is denied access to them.
 #     Left off here because relabeling touches files in your checkout.
 #
-# One-time CLI auth CANNOT happen in the agent container — no OAuth flow
-# completes through the allowlist proxy (README "First-time login"). Bootstrap
-# the login once from a container with ordinary networking and the volume
-# mounted; the claude-refresher service keeps it renewed from there:
+# One-time CLI auth cannot happen in the agent container — the interactive
+# login needs a browser, which it will never have (README "First-time login").
+# Bootstrap the login once from a container with ordinary networking and the
+# volume mounted; after that the agent renews the token itself, and the
+# claude-refresher service covers idle stretches:
 #   docker compose -f docker-compose.sandbox.yml run --rm -it claude-refresher claude
 #   # type /login at the prompt, complete the flow, /exit
 # The alternative is a ~1-year token from `setup-token` in .env — static, and
@@ -219,13 +220,21 @@ services:
       https_proxy: "http://squid:3128"
       NO_PROXY: "claude-wrapper,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
       no_proxy: "claude-wrapper,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
-      # The backend network is internal, so Docker's embedded DNS refuses
-      # external lookups (rcode NOTIMP). The CLI resolves target hosts locally
-      # by default even when tunnelling through a proxy — this flag makes it
-      # hand the bare hostname to Squid instead, which resolves it on the
-      # egress network. Without it every run dies with ENOTIMP before the
-      # CONNECT is even attempted.
-      CLAUDE_CODE_PROXY_RESOLVES_HOSTS: "1"
+      # OFF by default, and deliberately so — this flag was the root cause of
+      # every OAuth failure in this topology (CREDENTIALS-FIX.md, Round 4).
+      # Its DNS shim defers all resolution to the proxy, including the proxy's
+      # OWN hostname: the API client special-cases that, the CLI's OAuth
+      # client does not, so with the flag on, logins die with `Invalid IP
+      # address: undefined` and token refresh silently never fires — the
+      # credential then lapses ~8h after its last renewal. Measured A/B on
+      # 2.1.227: flag on + hostname proxy = no refresh attempt; flag off =
+      # refresh completes through Squid. The CLI hands target hostnames to
+      # the proxy in the CONNECT line anyway, so the local-DNS failure the
+      # flag was added for (embedded DNS answers NOTIMP on an internal
+      # network) does not occur on current CLIs. If an older CLI ever brings
+      # it back (every run dying before any CONNECT), set it in .env — and
+      # know that doing so trades away in-agent login and refresh.
+      CLAUDE_CODE_PROXY_RESOLVES_HOSTS: "${CLAUDE_CODE_PROXY_RESOLVES_HOSTS:-}"
 
       # The KB curl calls execute here.
       OPENWEBUI_BASE_URL: "${OPENWEBUI_BASE_URL:-}"

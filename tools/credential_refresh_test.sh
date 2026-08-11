@@ -107,13 +107,16 @@ if echo "$resp" | grep -q '"choices"'; then
         echo "  answering (the tool-bridge path does not spawn the CLI)."
     fi
 else
-    echo "  NO REFRESH — the turn failed, so the CLI could not renew the token"
-    echo "  from inside this deployment. The refresh client itself is proven"
-    echo "  proxy-capable (CREDENTIALS-FIX.md, Round 3), so check Squid's log"
-    echo "  for CONNECT platform.claude.com — TUNNEL/200 means the server"
-    echo "  rejected this refresh token (re-login and rerun); TCP_DENIED means"
-    echo "  the running squid is stale; no line means the CONNECT never left"
-    echo "  the agent. The claude-refresher service renews from outside the"
+    echo "  NO REFRESH — the turn failed and the CLI did not renew the token."
+    echo "  First suspect (CREDENTIALS-FIX.md, Round 4): the agent has"
+    echo "  CLAUDE_CODE_PROXY_RESOLVES_HOSTS set — its DNS shim stops the"
+    echo "  OAuth client resolving the proxy's own hostname, so no refresh is"
+    echo "  ever attempted. Check with:"
+    echo "    $RUNTIME exec $CONTAINER sh -c 'echo [\$CLAUDE_CODE_PROXY_RESOLVES_HOSTS]'"
+    echo "  Otherwise read Squid's log for CONNECT platform.claude.com:"
+    echo "  TUNNEL/200 = the server rejected this refresh token (re-login);"
+    echo "  TCP_DENIED = stale squid; no line = the CONNECT never left the"
+    echo "  agent. The claude-refresher service renews from outside the"
     echo "  sandbox either way; CLAUDE_CODE_OAUTH_TOKEN is the static fallback."
 fi
 

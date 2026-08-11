@@ -412,11 +412,14 @@ docker compose -f docker-compose.sandbox.yml exec claude-agent \
 - The agent's proxy env (`HTTP_PROXY`/`HTTPS_PROXY`) is inherited by the CLI and
   every Bash subshell it runs — curl, pip and git all flow through the allowlist
   with no code changes.
-- `CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` is set on the agent and is **mandatory**.
-  The backend network is internal, so the embedded DNS refuses external lookups
-  (rcode NOTIMP); this flag makes the CLI hand the bare hostname to Squid, which
-  resolves it on the egress network. Without it every run dies before the CONNECT
-  is attempted.
+- `CLAUDE_CODE_PROXY_RESOLVES_HOSTS` is **off by default, on purpose**. It was
+  set for the internal network's dead DNS, but its shim also swallows
+  resolution of the proxy's own hostname for the CLI's OAuth client — with it
+  on, logins fail with `Invalid IP address: undefined` and token refresh never
+  fires (measured A/B; CREDENTIALS-FIX.md Round 4). Current CLIs hand target
+  hostnames to Squid in the CONNECT line anyway, so runs work without it. If
+  an older CLI dies before any CONNECT, the `.env` knob turns it back on — at
+  the cost of in-agent OAuth.
 
 ### The shipped allowlist
 
@@ -1595,7 +1598,8 @@ Each of the corresponding misconfigurations otherwise fails silently.
 | KB queries always 401 | `OPENWEBUI_BASE_URL` set without `OPENWEBUI_API_KEY` |
 | KB queries return nothing | A collection *name* was used where the *id* is required |
 | Claude answers on assumptions instead of asking | `CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS` interpolated empty from compose |
-| Every sandbox run dies instantly | `CLAUDE_CODE_PROXY_RESOLVES_HOSTS` missing, or the target host isn't on the allowlist |
+| Every sandbox run dies instantly | The target host isn't on the allowlist; on older CLIs possibly DNS (see the `CLAUDE_CODE_PROXY_RESOLVES_HOSTS` note — do not set it casually, it disables in-agent OAuth) |
+| Login/refresh fails with `Invalid IP address: undefined` | `CLAUDE_CODE_PROXY_RESOLVES_HOSTS` is set — unset it and recreate; see CREDENTIALS-FIX.md Round 4 |
 | Inbox files unreadable under rootless podman | Host uid maps to container 0; needs `userns_mode: keep-id` |
 | Old chats fail fast, new chats work | A dead `--resume` target; the wrapper self-heals on the next turn |
 

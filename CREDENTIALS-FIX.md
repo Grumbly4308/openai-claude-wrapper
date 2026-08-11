@@ -290,9 +290,52 @@ running image is current: `podman exec claude-agent grep -c refresher
 - no line at all → the CONNECT never left the agent; compare the agent's env
   against the replica conditions above.
 
+## Round 4 (2026-08-11): root cause found, fixed, and verified live
+
+`CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` **plus a hostname-addressed proxy** kills
+the CLI's OAuth client. The flag's DNS shim defers all resolution to the
+proxy — including the proxy's *own* hostname (`squid`). The API client
+special-cases that; the OAuth client does not, gets `undefined` for the proxy
+address, and dies before any connection: `Invalid IP address: undefined` in
+the login flows, and a silent no-attempt on token refresh.
+
+Why three rounds missed it: every replica experiment used
+`HTTPS_PROXY=http://127.0.0.1:<port>` — an IP needs no resolution, so the shim
+never engaged for the proxy hop and refresh worked under every other variable
+(version, argv, env, NO_PROXY, CI, credential schema). The trigger was in the
+one value nobody varied.
+
+The A/B that found it (2.1.227, hostname-addressed proxy, expired credential):
+
+| flag | refresh CONNECT at the proxy |
+| --- | --- |
+| `CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` | never attempted — the deployment's exact signature |
+| unset | fires, completes |
+
+Verified on the live stack: with the flag blanked for one run
+(`podman exec -e CLAUDE_CODE_PROXY_RESOLVES_HOSTS= claude-agent claude -p hi`),
+the agent renewed its own deliberately-corrupted credential through Squid —
+access went from expired to 7.97h and the turn answered normally.
+
+The flag is now **off by default** in `docker-compose.sandbox.yml`, with an
+`.env` knob for older CLIs that genuinely need it (current CLIs hand target
+hostnames to Squid in the CONNECT line, so the NOTIMP failure the flag was
+added for no longer occurs). Every credential problem this file documents is
+now closed:
+
+- **Login** — needs a browser; bootstrap from outside, once. (`claude-refresher`
+  is a convenient place: `run --rm -it claude-refresher claude`.)
+- **Refresh** — works in-agent with the flag off, and the `claude-refresher`
+  service covers idle stretches, when no turn runs to trigger renewal.
+- **Break-glass** — long-lived token off-stack, mint date tracked, boot report
+  warns before every expiry that used to be silent.
+
 ## Open questions
 
-**Refuted for the refresh path — the DNS-shim hypothesis is dead.** A sub-agent
+**[Superseded by Round 4: the hypothesis was RIGHT — the refutation below
+missed that the bug needs a hostname-addressed proxy to trigger, and the
+replica's proxy was an IP. Kept as a record of how a correct mechanism got
+dismissed on an incomplete reproduction.]** A sub-agent
 had proposed that `CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` installs a DNS shim that
 breaks the OAuth HTTP client before any CONNECT. Measured directly (2026-08-11,
 see "Round 3") in a replica of the sandbox's network conditions — external DNS

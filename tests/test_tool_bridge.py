@@ -848,3 +848,220 @@ def test_web_search_version_tracks_model_family(bridge, profiles, monkeypatch):
     )
     assert r.status_code == 200
     assert capture.requests[0]["tools"][1]["type"] == "web_search_20260209"
+
+
+# ---------- wrapper-owned tools & the hybrid loop (phase 4) ----------
+
+
+def _anthropic_text_response(text: str = "The answer is 4.") -> dict:
+    return {
+        "id": "msg_02",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-4-5",
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 40, "output_tokens": 10},
+    }
+
+
+def _wrapper_call_response(name: str, tool_input: dict, tool_id: str = "toolu_w1") -> dict:
+    return {
+        "id": "msg_01",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-4-5",
+        "content": [
+            {"type": "tool_use", "id": tool_id, "name": name, "input": tool_input}
+        ],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 30, "output_tokens": 5},
+    }
+
+
+def test_hybrid_loop_executes_wrapper_tool(bridge, profiles):
+    capture = bridge(
+        _wrapper_call_response("calculate", {"expression": "2+2"}),
+        _anthropic_text_response(),
+    )
+    profiles({"models": [{"match": "claude-haiku-4-5", "add": ["time_calc"]}]})
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "what is 2+2?"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 200
+    msg = r.json()["choices"][0]["message"]
+    assert msg["content"] == "The answer is 4."
+    assert not msg.get("tool_calls")
+    # Two upstream rounds; the second carries the echoed assistant turn and
+    # the wrapper's tool_result.
+    assert len(capture.requests) == 2
+    second = capture.requests[1]["messages"]
+    assert second[-2]["role"] == "assistant"
+    assert second[-2]["content"][0]["name"] == "calculate"
+    assert second[-1]["role"] == "user"
+    assert second[-1]["content"][0]["tool_use_id"] == "toolu_w1"
+    assert "= 4" in second[-1]["content"][0]["content"]
+    # Wrapper tool definitions were injected after the client's.
+    names = [t.get("name") for t in capture.requests[0]["tools"]]
+    assert names == ["web_search", "get_current_time", "calculate"]
+    # Usage accumulates across rounds.
+    assert r.json()["usage"]["prompt_tokens"] == 70
+
+
+def test_mixed_turn_returns_client_calls_and_drops_wrapper_calls(bridge, profiles):
+    mixed = _wrapper_call_response("calculate", {"expression": "1+1"})
+    mixed["content"].append(
+        {"type": "tool_use", "id": "toolu_c1", "name": "web_search", "input": {"query": "x"}}
+    )
+    capture = bridge(mixed)
+    profiles({"models": [{"match": "claude-haiku-4-5", "add": ["time_calc"]}]})
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 200
+    msg = r.json()["choices"][0]["message"]
+    calls = msg["tool_calls"]
+    assert [c["function"]["name"] for c in calls] == ["web_search"]
+    # One round only: the client loop takes over; the wrapper call was
+    # neither executed nor surfaced.
+    assert len(capture.requests) == 1
+
+
+def test_wrapper_tool_name_collision_is_rejected(bridge, profiles):
+    bridge()
+    profiles({"models": [{"match": "claude-haiku-4-5", "add": ["time_calc"]}]})
+    calc_tool = {
+        "type": "function",
+        "function": {"name": "calculate", "parameters": {"type": "object", "properties": {}}},
+    }
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [calc_tool],
+        }
+    )
+    assert r.status_code == 400
+    assert "calculate" in r.json()["detail"]
+
+
+def test_hybrid_loop_round_cap(bridge, profiles):
+    responses = [
+        _wrapper_call_response("calculate", {"expression": "1+1"}, tool_id=f"toolu_{i}")
+        for i in range(8)
+    ]
+    capture = bridge(*responses)
+    profiles({"models": [{"match": "claude-haiku-4-5", "add": ["time_calc"]}]})
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "loop forever"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 502
+    assert "rounds" in r.json()["detail"]
+    assert len(capture.requests) == 8
+
+
+def test_memory_persists_under_the_data_dir(bridge, profiles):
+    capture = bridge(
+        _wrapper_call_response(
+            "memory",
+            {"command": "create", "path": "/memories/prefs.md", "file_text": "likes tabs"},
+        ),
+        _anthropic_text_response("Noted."),
+    )
+    profiles({"models": [{"match": "claude-haiku-4-5", "add": ["memory"]}]})
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "remember I like tabs"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 200
+    assert len(capture.requests) == 2
+    # Glob the live settings' data dir — under pytest, whichever test module
+    # imported first owns CLAUDE_WRAPPER_DATA, so _TMP may not be it.
+    from src.config import SETTINGS
+
+    stored = list((SETTINGS.data_dir / "memory").rglob("prefs.md"))
+    assert stored and stored[0].read_text() == "likes tabs"
+
+
+def test_streaming_hybrid_loop_suppresses_wrapper_calls(bridge, profiles):
+    round1 = [
+        {"type": "message_start",
+         "message": {"id": "msg_01", "usage": {"input_tokens": 30, "output_tokens": 1}}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "tool_use", "id": "toolu_w1", "name": "calculate", "input": {}}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "input_json_delta", "partial_json": "{\"expression\": \"2+2\"}"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+         "usage": {"output_tokens": 5}},
+        {"type": "message_stop"},
+    ]
+    round2 = [
+        {"type": "message_start",
+         "message": {"id": "msg_02", "usage": {"input_tokens": 40, "output_tokens": 1}}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "It is 4."}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"output_tokens": 6}},
+        {"type": "message_stop"},
+    ]
+    capture = bridge(_sse(round1), _sse(round2))
+    profiles({"models": [{"match": "claude-haiku-4-5", "add": ["time_calc"]}]})
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "claude-haiku-4-5",
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "messages": [{"role": "user", "content": "2+2?"}],
+            "tools": [WEB_SEARCH_TOOL],
+        },
+    ) as r:
+        assert r.status_code == 200
+        lines = [l for l in r.iter_lines() if l.startswith("data:")]
+    chunks = [json.loads(p) for p in (l[5:].strip() for l in lines) if p != "[DONE]"]
+
+    # The wrapper's calculate call never surfaced as an OpenAI tool_call.
+    assert not any(
+        c["choices"][0]["delta"].get("tool_calls") for c in chunks if c.get("choices")
+    )
+    content = "".join(
+        c["choices"][0]["delta"].get("content", "") for c in chunks if c.get("choices")
+    )
+    assert content == "It is 4."
+    finish = [
+        c["choices"][0]["finish_reason"]
+        for c in chunks
+        if c.get("choices") and c["choices"][0].get("finish_reason")
+    ]
+    assert finish == ["stop"]
+    # Round 2 carried the echoed assistant turn and the tool_result.
+    assert len(capture.requests) == 2
+    echoed = capture.requests[1]["messages"]
+    assert echoed[-2]["content"][0] == {
+        "type": "tool_use", "id": "toolu_w1", "name": "calculate",
+        "input": {"expression": "2+2"},
+    }
+    assert "= 4" in echoed[-1]["content"][0]["content"]
+    # Usage sums both rounds.
+    usage = [c for c in chunks if not c.get("choices")][0]["usage"]
+    assert usage["prompt_tokens"] == 70 and usage["completion_tokens"] == 11

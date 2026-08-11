@@ -1,10 +1,15 @@
 """OpenAI function calling served by calling the Anthropic Messages API directly.
 
-When a chat request declares ``tools``, the CLIENT owns the agent loop: the
-wrapper must not execute anything, must not use its own built-in tools, and
-must not try to answer the question. It returns the model's tool call(s) and
-stops; the client executes the tool and sends the result back as a
-``role: "tool"`` message on the next request.
+When a chat request declares ``tools``, the CLIENT owns the agent loop for
+its own tools: the wrapper returns the model's tool call(s) and stops; the
+client executes the tool and sends the result back as a ``role: "tool"``
+message on the next request. Two capability-gated exceptions ride the same
+request (see the hybrid-loop notes on complete()/stream()): Anthropic
+server-side tools (web search, code execution) execute upstream, and
+wrapper-owned tools (memory, time/calc — wrapper_tools.py) execute here,
+invisible to the caller. Wrapper tools are therefore only active on
+tools-carrying requests; tool-less chats run on the CLI path, which has its
+own built-ins.
 
 That is the opposite of the wrapper's normal path (the Claude Code CLI running
 its own agentic loop with built-in tools), so requests with tools bypass the
@@ -36,8 +41,10 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 import httpx
 from fastapi import HTTPException
 
+from . import wrapper_tools
 from .capabilities import Capability, resolve_profile
 from .config import SETTINGS, _bool_env
+from .wrapper_tools import wrapper_tool_names
 from .json_mode import extract_raw_json, json_instruction, json_mode_error, wants_json
 from .models import (
     ChatCompletionChunk,
@@ -164,6 +171,10 @@ def resolve_auth() -> tuple[dict[str, str], bool]:
 # terminal gate. Code execution needs no extra gate: its capability defaults
 # off, so a profile grant is already an explicit operator action.
 _BRIDGE_WEB_SEARCH_ENV = "CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH"
+
+# Ceiling on hybrid-loop rounds per turn (wrapper tool executions and
+# pause_turn continuations) — a runaway-loop backstop, not a tuning knob.
+_MAX_TOOL_ROUNDS = int(os.environ.get("CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS", "8"))
 
 _WS_MODERN = "web_search_20260209"  # Opus 4.6+/Sonnet 4.6+/Claude 5+ families
 _WS_BASIC = "web_search_20250305"  # everything older, incl. Haiku 4.5
@@ -386,9 +397,24 @@ def build_request(
                 f"(capability 'client_tools' is not in its profile); declared: {declared}"
             ),
         )
-    # Injected server tools go after the client's, in fixed order, so the
-    # rendered tool list stays deterministic for prompt caching.
-    all_tools = (tools or []) + _server_tools(run_model, caps)
+    # Injected tools go after the client's, in fixed order, so the rendered
+    # tool list stays deterministic for prompt caching. Wrapper-owned tools
+    # (memory, time/calc) are executed by the bridge's hybrid loop, never
+    # surfaced to the caller.
+    wrapper_defs = wrapper_tools.tool_definitions(caps)
+    shadowed = {t["name"] for t in tools or []} & {
+        d.get("name") for d in wrapper_defs
+    }
+    if shadowed:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"client tool name(s) {sorted(shadowed)} collide with wrapper-owned "
+                f"tools enabled for model '{run_model}'; rename the client tool or "
+                "remove the capability from the model's profile"
+            ),
+        )
+    all_tools = (tools or []) + _server_tools(run_model, caps) + wrapper_defs
     if all_tools:
         payload["tools"] = all_tools
         if tools:
@@ -418,22 +444,81 @@ def _finish_reason(stop_reason: Optional[str], has_tool_calls: bool) -> str:
     return _STOP_REASON_MAP.get(stop_reason or "", "stop")
 
 
-async def complete(req: ChatCompletionRequest, run_model: str) -> BridgeResult:
-    """Non-streaming tools request: one Messages API call, no loop."""
+async def complete(
+    req: ChatCompletionRequest, run_model: str, session_key: str = ""
+) -> BridgeResult:
+    """Non-streaming tools request, with the wrapper's hybrid tool loop.
+
+    Client-declared tools stay client-looped: their calls are returned and
+    the turn ends. Wrapper-owned tools (memory, time/calc — see
+    wrapper_tools.py) are executed here and fed back, looping until the model
+    answers or wants a client tool. Turn-taking rules:
+
+    - only wrapper tool calls  -> execute all, append results, loop;
+    - any client tool call     -> return it; wrapper calls in the same turn
+      are dropped unexecuted (the model re-issues them next turn — returning
+      them to a client that can't run them, or faking their results, would
+      corrupt the protocol);
+    - ``pause_turn``           -> re-send to let a server-side tool continue;
+    - anything else            -> final answer.
+
+    Assistant content is echoed back verbatim between rounds — thinking and
+    server-tool blocks included, which the API requires for a tool loop.
+    """
     payload, headers = build_request(req, run_model, stream=False)
+    wrapper_names = wrapper_tool_names(resolve_profile(run_model))
     client = _get_client()
-    try:
-        resp = await client.post(
-            f"{ANTHROPIC_BASE_URL}/v1/messages", json=payload, headers=headers
-        )
-    except httpx.HTTPError as e:
-        raise HTTPException(status_code=502, detail=f"anthropic api unreachable: {e}")
-    if resp.status_code != 200:
+    input_tokens = output_tokens = 0
+    data: dict[str, Any] = {}
+
+    for _round in range(_MAX_TOOL_ROUNDS):
+        try:
+            resp = await client.post(
+                f"{ANTHROPIC_BASE_URL}/v1/messages", json=payload, headers=headers
+            )
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=f"anthropic api unreachable: {e}")
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"anthropic api error {resp.status_code}: {resp.text[:500]}",
+            )
+        data = resp.json()
+        usage = data.get("usage") or {}
+        input_tokens += int(usage.get("input_tokens") or 0)
+        output_tokens += int(usage.get("output_tokens") or 0)
+
+        blocks = data.get("content") or []
+        wrapper_calls = [
+            b for b in blocks if b.get("type") == "tool_use" and b.get("name") in wrapper_names
+        ]
+        client_calls = [
+            b for b in blocks if b.get("type") == "tool_use" and b.get("name") not in wrapper_names
+        ]
+        paused = data.get("stop_reason") == "pause_turn"
+        if client_calls or (not wrapper_calls and not paused):
+            break
+        payload["messages"].append({"role": "assistant", "content": blocks})
+        if wrapper_calls:
+            results = []
+            for call in wrapper_calls:
+                content_text, is_error = wrapper_tools.execute(
+                    call.get("name") or "", call.get("input") or {}, session_key
+                )
+                result: dict[str, Any] = {
+                    "type": "tool_result",
+                    "tool_use_id": call.get("id") or "",
+                    "content": content_text,
+                }
+                if is_error:
+                    result["is_error"] = True
+                results.append(result)
+            payload["messages"].append({"role": "user", "content": results})
+    else:
         raise HTTPException(
             status_code=502,
-            detail=f"anthropic api error {resp.status_code}: {resp.text[:500]}",
+            detail=f"wrapper tool loop exceeded {_MAX_TOOL_ROUNDS} rounds without an answer",
         )
-    data = resp.json()
 
     text_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
@@ -441,7 +526,7 @@ async def complete(req: ChatCompletionRequest, run_model: str) -> BridgeResult:
         btype = block.get("type")
         if btype == "text" and block.get("text"):
             text_parts.append(block["text"])
-        elif btype == "tool_use":
+        elif btype == "tool_use" and block.get("name") not in wrapper_names:
             tool_calls.append(
                 {
                     "id": block.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
@@ -454,7 +539,6 @@ async def complete(req: ChatCompletionRequest, run_model: str) -> BridgeResult:
                 }
             )
 
-    usage = data.get("usage") or {}
     content = "".join(text_parts)
     # JSON mode: the client JSON.parses the content verbatim. Reduce it to the
     # raw JSON value. Skipped when the turn produced tool calls — there the
@@ -470,9 +554,37 @@ async def complete(req: ChatCompletionRequest, run_model: str) -> BridgeResult:
         content=content if content else None,
         tool_calls=tool_calls or None,
         finish_reason=_finish_reason(data.get("stop_reason"), bool(tool_calls)),
-        input_tokens=int(usage.get("input_tokens") or 0),
-        output_tokens=int(usage.get("output_tokens") or 0),
+        # Accumulated across all wrapper-loop rounds, not just the last call.
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
     )
+
+
+def _materialize_block(acc: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild a complete content block from its start event + deltas.
+
+    Needed to echo the assistant turn back verbatim when the streaming hybrid
+    loop continues a turn. Result blocks that arrive whole (server tool
+    results, redacted_thinking) pass through as their start event.
+    """
+    block = dict(acc.get("start") or {})
+    btype = block.get("type")
+    if btype == "text":
+        block["text"] = acc.get("text", "")
+    elif btype in ("tool_use", "server_tool_use", "mcp_tool_use"):
+        partial = acc.get("partial", "")
+        if partial:
+            try:
+                block["input"] = json.loads(partial)
+            except json.JSONDecodeError:
+                block["input"] = {}
+        else:
+            block["input"] = block.get("input") or {}
+    elif btype == "thinking":
+        block["thinking"] = acc.get("thinking", "")
+        if acc.get("signature"):
+            block["signature"] = acc["signature"]
+    return block
 
 
 async def stream(
@@ -509,8 +621,12 @@ async def stream(
         effort=effort_info,
     )
 
-    # Anthropic content-block index -> position in the OpenAI tool_calls array.
+    # Anthropic content-block index -> position in the OpenAI tool_calls array
+    # (client tools only; reset per loop round). `next_tc_index` and
+    # `any_client_calls` are cumulative across rounds.
     tc_index_of: dict[int, int] = {}
+    next_tc_index = 0
+    any_client_calls = False
     # JSON mode: the client parses the concatenated content as JSON, so answer
     # deltas are buffered (a ```json fence can span chunk boundaries) and
     # emitted as one cleaned chunk right before the terminator. Tool-call
@@ -523,74 +639,133 @@ async def stream(
 
     try:
         payload, headers = build_request(req, run_model, stream=True)
+        wrapper_names = wrapper_tool_names(resolve_profile(run_model))
         client = _get_client()
-        async with client.stream(
-            "POST", f"{ANTHROPIC_BASE_URL}/v1/messages", json=payload, headers=headers
-        ) as resp:
-            if resp.status_code != 200:
-                body = (await resp.aread()).decode("utf-8", errors="replace")
-                errored = f"anthropic api error {resp.status_code}: {body[:500]}"
-            else:
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    try:
-                        evt = json.loads(line[5:].strip())
-                    except json.JSONDecodeError:
-                        continue
-                    etype = evt.get("type")
+        # Hybrid loop, same turn-taking rules as complete(): wrapper-owned
+        # tool calls are executed here and the upstream call repeated on the
+        # same client stream; client tool calls end the loop (the caller owns
+        # that loop). Every round reassembles the assistant blocks verbatim —
+        # thinking, signatures, and server-tool blocks included — because a
+        # continued turn must echo them back exactly.
+        for _round in range(_MAX_TOOL_ROUNDS):
+            tc_index_of = {}
+            round_blocks: dict[int, dict[str, Any]] = {}
+            stop_reason = None
+            async with client.stream(
+                "POST", f"{ANTHROPIC_BASE_URL}/v1/messages", json=payload, headers=headers
+            ) as resp:
+                if resp.status_code != 200:
+                    body = (await resp.aread()).decode("utf-8", errors="replace")
+                    errored = f"anthropic api error {resp.status_code}: {body[:500]}"
+                else:
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        try:
+                            evt = json.loads(line[5:].strip())
+                        except json.JSONDecodeError:
+                            continue
+                        etype = evt.get("type")
 
-                    if etype == "message_start":
-                        usage = (evt.get("message") or {}).get("usage") or {}
-                        input_tokens = int(usage.get("input_tokens") or 0)
-                    elif etype == "content_block_start":
-                        block = evt.get("content_block") or {}
-                        if block.get("type") == "tool_use":
-                            idx = len(tc_index_of)
-                            tc_index_of[int(evt.get("index") or 0)] = idx
-                            yield chunk(
-                                DeltaMessage(
-                                    tool_calls=[
-                                        {
-                                            "index": idx,
-                                            "id": block.get("id")
-                                            or f"toolu_{uuid.uuid4().hex[:24]}",
-                                            "type": "function",
-                                            "function": {
-                                                "name": block.get("name") or "",
-                                                "arguments": "",
-                                            },
-                                        }
-                                    ]
-                                )
-                            )
-                    elif etype == "content_block_delta":
-                        delta = evt.get("delta") or {}
-                        dtype = delta.get("type")
-                        if dtype == "text_delta" and delta.get("text"):
-                            if json_mode:
-                                json_parts.append(delta["text"])
-                            else:
-                                yield chunk(DeltaMessage(content=delta["text"]))
-                        elif dtype == "input_json_delta":
-                            fragment = delta.get("partial_json") or ""
-                            idx = tc_index_of.get(int(evt.get("index") or 0))
-                            if fragment and idx is not None:
+                        if etype == "message_start":
+                            usage = (evt.get("message") or {}).get("usage") or {}
+                            input_tokens += int(usage.get("input_tokens") or 0)
+                        elif etype == "content_block_start":
+                            block = evt.get("content_block") or {}
+                            a_idx = int(evt.get("index") or 0)
+                            round_blocks[a_idx] = {"start": block, "text": "", "partial": ""}
+                            if (
+                                block.get("type") == "tool_use"
+                                and block.get("name") not in wrapper_names
+                            ):
+                                tc_index_of[a_idx] = next_tc_index
+                                any_client_calls = True
                                 yield chunk(
                                     DeltaMessage(
                                         tool_calls=[
-                                            {"index": idx, "function": {"arguments": fragment}}
+                                            {
+                                                "index": next_tc_index,
+                                                "id": block.get("id")
+                                                or f"toolu_{uuid.uuid4().hex[:24]}",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": block.get("name") or "",
+                                                    "arguments": "",
+                                                },
+                                            }
                                         ]
                                     )
                                 )
-                    elif etype == "message_delta":
-                        stop_reason = (evt.get("delta") or {}).get("stop_reason") or stop_reason
-                        usage = evt.get("usage") or {}
-                        output_tokens = int(usage.get("output_tokens") or output_tokens)
-                    elif etype == "error":
-                        errored = str((evt.get("error") or {}).get("message") or "upstream error")
-                    elif etype == "message_stop":
-                        break
+                                next_tc_index += 1
+                        elif etype == "content_block_delta":
+                            delta = evt.get("delta") or {}
+                            dtype = delta.get("type")
+                            acc = round_blocks.setdefault(
+                                int(evt.get("index") or 0), {"start": {}, "text": "", "partial": ""}
+                            )
+                            if dtype == "text_delta" and delta.get("text"):
+                                acc["text"] += delta["text"]
+                                if json_mode:
+                                    json_parts.append(delta["text"])
+                                else:
+                                    yield chunk(DeltaMessage(content=delta["text"]))
+                            elif dtype == "input_json_delta":
+                                fragment = delta.get("partial_json") or ""
+                                acc["partial"] += fragment
+                                idx = tc_index_of.get(int(evt.get("index") or 0))
+                                if fragment and idx is not None:
+                                    yield chunk(
+                                        DeltaMessage(
+                                            tool_calls=[
+                                                {"index": idx, "function": {"arguments": fragment}}
+                                            ]
+                                        )
+                                    )
+                            elif dtype == "thinking_delta" and delta.get("thinking"):
+                                acc["thinking"] = acc.get("thinking", "") + delta["thinking"]
+                            elif dtype == "signature_delta" and delta.get("signature"):
+                                acc["signature"] = delta["signature"]
+                        elif etype == "message_delta":
+                            stop_reason = (evt.get("delta") or {}).get("stop_reason") or stop_reason
+                            usage = evt.get("usage") or {}
+                            output_tokens += int(usage.get("output_tokens") or 0)
+                        elif etype == "error":
+                            errored = str(
+                                (evt.get("error") or {}).get("message") or "upstream error"
+                            )
+                        elif etype == "message_stop":
+                            break
+            if errored:
+                break
+            assistant_blocks = [
+                _materialize_block(round_blocks[i]) for i in sorted(round_blocks)
+            ]
+            wrapper_calls = [
+                b
+                for b in assistant_blocks
+                if b.get("type") == "tool_use" and b.get("name") in wrapper_names
+            ]
+            paused = stop_reason == "pause_turn"
+            if any_client_calls or (not wrapper_calls and not paused):
+                break
+            payload["messages"].append({"role": "assistant", "content": assistant_blocks})
+            if wrapper_calls:
+                results: list[dict[str, Any]] = []
+                for call in wrapper_calls:
+                    content_text, is_error = wrapper_tools.execute(
+                        call.get("name") or "", call.get("input") or {}, session_key
+                    )
+                    result: dict[str, Any] = {
+                        "type": "tool_result",
+                        "tool_use_id": call.get("id") or "",
+                        "content": content_text,
+                    }
+                    if is_error:
+                        result["is_error"] = True
+                    results.append(result)
+                payload["messages"].append({"role": "user", "content": results})
+        else:
+            errored = f"wrapper tool loop exceeded {_MAX_TOOL_ROUNDS} rounds without an answer"
     except HTTPException as e:
         errored = str(e.detail)
     except httpx.HTTPError as e:
@@ -612,7 +787,7 @@ async def stream(
     # reply goes out on the stream's error channel instead of as content.
     if json_parts:
         body = "".join(json_parts)
-        if tc_index_of:
+        if any_client_calls:
             yield chunk(DeltaMessage(content=body))
         else:
             cleaned = extract_raw_json(body)
@@ -621,7 +796,7 @@ async def stream(
             else:
                 yield chunk(DeltaMessage(content=cleaned))
 
-    yield chunk(DeltaMessage(), finish=_finish_reason(stop_reason, bool(tc_index_of)))
+    yield chunk(DeltaMessage(), finish=_finish_reason(stop_reason, any_client_calls))
     if (req.stream_options or {}).get("include_usage"):
         usage_chunk = ChatCompletionChunk(
             id=chunk_id,

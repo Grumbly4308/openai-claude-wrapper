@@ -77,6 +77,10 @@ class Capability(str, Enum):
     IMAGE_GENERATION = "image_generation"
     SUB_AGENTS = "sub_agents"
     CLIENT_TOOLS = "client_tools"
+    # Wrapper-owned time/arithmetic tools (no OpenWebUI toggle; wrapper-side
+    # only). Cheap and side-effect-free — the proving ground for the bridge's
+    # hybrid loop.
+    TIME_CALC = "time_calc"
 
 
 _BY_VALUE = {c.value: c for c in Capability}

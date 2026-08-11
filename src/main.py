@@ -611,7 +611,7 @@ async def _tool_bridge_completion(req: ChatCompletionRequest):
             headers=_SSE_HEADERS,
         )
 
-    result = await tool_bridge.complete(req, run_model)
+    result = await tool_bridge.complete(req, run_model, session_key)
     if USAGE_LEDGER.enabled:
         await USAGE_LEDGER.record(session_key, result.input_tokens + result.output_tokens)
 

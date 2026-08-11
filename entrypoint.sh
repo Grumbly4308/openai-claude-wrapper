@@ -67,21 +67,25 @@ cmd_login() {
     echo "launching interactive Claude Code login..." >&2
     echo "credentials will be written to ${CLAUDE_HOME} (persisted on the claude-home volume)." >&2
     echo >&2
-    # Try the dedicated subcommand first; fall back to TUI /login.
-    if claude login --help >/dev/null 2>&1; then
+    # Do NOT probe with `claude login --help`. On a CLI with no `login`
+    # subcommand — 2.1.226 has none — the word is taken as a prompt, --help
+    # still exits 0, and the probe passes; `exec claude login` then opens a
+    # chat session that writes history and sessions but never a credential,
+    # so the command silently "logs in" by starting a conversation. Ask the
+    # help output whether the subcommand exists instead.
+    if claude --help 2>/dev/null | grep -qE '^[[:space:]]*login([[:space:]]|$)'; then
         exec claude login
     fi
-    if claude /login --help >/dev/null 2>&1; then
-        exec claude /login
-    fi
-    echo "no 'claude login' subcommand detected — opening the interactive TUI." >&2
+    echo "this CLI has no 'login' subcommand — opening the interactive TUI." >&2
     echo "type /login at the prompt, complete the OAuth flow, then /exit." >&2
     exec claude
 }
 
 cmd_setup_token() {
     echo "launching 'claude setup-token' — follow the prompts to generate" >&2
-    echo "a long-lived OAuth token. It will be saved to ${CLAUDE_HOME}." >&2
+    echo "a long-lived OAuth token. It is PRINTED, not saved: set it as" >&2
+    echo "CLAUDE_CODE_OAUTH_TOKEN. Note that doing so stops the CLI from" >&2
+    echo "refreshing any login in ${CLAUDE_HOME}, which then decays." >&2
     echo >&2
     exec claude setup-token "$@"
 }

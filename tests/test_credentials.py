@@ -146,6 +146,61 @@ def test_log_level_escalates_with_severity(status, level, tmp_path, caplog, monk
     assert [r.levelno for r in caplog.records] == [level]
 
 
+# ---------- the refresh window ----------
+
+
+def test_refresh_window_is_read_and_described(tmp_path):
+    status = read_credential_status(
+        _write(tmp_path, {"accessToken": "t", "expiresAt": _in(8 * 3600), "refreshTokenExpiresAt": _in(29 * 86400)})
+    )
+    assert status.refresh_in is not None
+    assert "re-login needed in" in status.describe()
+
+
+def test_healthy_login_is_not_short_lived(tmp_path):
+    """An 8h access token renewed by a 29d refresh token must not warn.
+
+    This warned on every boot before the predicate keyed off the refresh window,
+    which is exactly how a log line gets ignored.
+    """
+    status = read_credential_status(
+        _write(tmp_path, {"accessToken": "t", "expiresAt": _in(8 * 3600), "refreshTokenExpiresAt": _in(29 * 86400)})
+    )
+    assert not status.short_lived
+
+
+def test_expiring_refresh_window_is_short_lived(tmp_path):
+    status = read_credential_status(
+        _write(tmp_path, {"accessToken": "t", "expiresAt": _in(8 * 3600), "refreshTokenExpiresAt": _in(2 * 86400)})
+    )
+    assert status.short_lived
+
+
+def test_without_refresh_token_the_access_expiry_is_the_deadline(tmp_path):
+    status = read_credential_status(_write(tmp_path, {"accessToken": "t", "expiresAt": _in(8 * 3600)}))
+    assert status.refresh_in is None and status.short_lived
+
+
+# ---------- shadowing ----------
+
+
+def test_env_token_shadowing_a_login_is_warned_about(tmp_path, caplog, monkeypatch):
+    """The env credential wins but never renews the file, which then decays."""
+    path = _write(tmp_path, {"accessToken": "t", "expiresAt": _in(8 * 3600), "refreshTokenExpiresAt": _in(29 * 86400)})
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oat-test")
+    with caplog.at_level(logging.INFO, logger="claude_wrapper.config"):
+        log_credential_status("Claude", path)
+    assert "SHADOWED" in caplog.text
+    assert [r.levelno for r in caplog.records] == [logging.INFO, logging.WARNING]
+
+
+def test_no_shadow_warning_when_there_is_no_login_to_shadow(tmp_path, caplog, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oat-test")
+    with caplog.at_level(logging.INFO, logger="claude_wrapper.config"):
+        log_credential_status("Claude", tmp_path / "absent.json")
+    assert "SHADOWED" not in caplog.text
+
+
 def test_expired_log_names_the_remedy(tmp_path, caplog):
     path = _write(tmp_path, {"accessToken": "t", "expiresAt": _in(-60)})
     with caplog.at_level(logging.INFO, logger="claude_wrapper.config"):

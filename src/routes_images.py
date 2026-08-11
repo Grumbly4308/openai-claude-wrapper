@@ -20,10 +20,13 @@ import asyncio
 import base64
 import io
 import logging
+import os
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
+
+import httpx
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
@@ -84,10 +87,59 @@ def _to_b64(path: Path) -> str:
     return base64.b64encode(path.read_bytes()).decode("ascii")
 
 
+# Optional external image backend: any OpenAI-compatible /v1/images/generations
+# endpoint (a diffusion server, an upstream API, a shim). Configured →
+# generations proxy there; unset → the SVG delegation path below. Edits and
+# variations always stay on delegation.
+_IMAGE_BACKEND_URL = os.environ.get("CLAUDE_WRAPPER_IMAGE_BACKEND_URL", "").rstrip("/")
+_IMAGE_BACKEND_KEY = os.environ.get("CLAUDE_WRAPPER_IMAGE_BACKEND_KEY", "")
+_IMAGE_BACKEND_MODEL = os.environ.get("CLAUDE_WRAPPER_IMAGE_BACKEND_MODEL", "")
+
+# Shared client; tests replace it with one built on httpx.MockTransport
+# (same pattern as tool_bridge._client).
+_backend_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_backend_client() -> httpx.AsyncClient:
+    global _backend_client
+    if _backend_client is None:
+        _backend_client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=300.0))
+    return _backend_client
+
+
+async def _backend_generations(req: ImageGenRequest) -> JSONResponse:
+    body: dict = {"prompt": req.prompt, "n": req.n}
+    if req.size:
+        body["size"] = req.size
+    if req.response_format:
+        body["response_format"] = req.response_format
+    if _IMAGE_BACKEND_MODEL:
+        body["model"] = _IMAGE_BACKEND_MODEL
+    elif req.model:
+        body["model"] = req.model
+    headers = {"content-type": "application/json"}
+    if _IMAGE_BACKEND_KEY:
+        headers["authorization"] = f"Bearer {_IMAGE_BACKEND_KEY}"
+    try:
+        resp = await _get_backend_client().post(
+            f"{_IMAGE_BACKEND_URL}/v1/images/generations", json=body, headers=headers
+        )
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"image backend unreachable: {e}")
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"image backend error {resp.status_code}: {resp.text[:400]}",
+        )
+    return JSONResponse(content=resp.json())
+
+
 @router.post("/v1/images/generations", dependencies=[Depends(auth_dependency)])
 async def image_generations(req: ImageGenRequest):
     if req.n < 1:
         raise HTTPException(status_code=400, detail="n must be >= 1")
+    if _IMAGE_BACKEND_URL:
+        return await _backend_generations(req)
     w, h = _parse_size(req.size)
     workspace, session_key = DELEGATE.new_workspace("imggen")
     prompt = _gen_prompt(req.prompt, w, h, req.n, req.style)

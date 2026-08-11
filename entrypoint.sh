@@ -24,14 +24,15 @@ warn_if_no_auth() {
   claude-wrapper: no saved Claude Code login found and no
   ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN env var set.
 
-  Run the interactive login once to persist credentials to the
-  mounted volume:
-
-      docker compose run --rm -it claude-wrapper login
-
-  …or for a long-lived headless token:
+  Mint a long-lived token once — it persists to the mounted
+  volume and does not depend on the CLI refreshing it:
 
       docker compose run --rm -it claude-wrapper setup-token
+
+  …or, for a desktop-style interactive login (shorter-lived, and
+  its OAuth callback cannot complete inside the sandbox topology):
+
+      docker compose run --rm -it claude-wrapper login
 
   Then `docker compose up -d` as normal.
 

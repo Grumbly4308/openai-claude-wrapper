@@ -266,9 +266,15 @@ experiments — or something stack-local answering the CONNECT. One rerun
 separates them; watch Squid while the test forces a refresh:
 
 ```bash
-podman logs -f claude-squid 2>/dev/null | grep -i "platform.claude.com" &
 tools/credential_refresh_test.sh
+podman logs claude-squid 2>/dev/null | grep -iE "platform.claude.com|DENIED" | tail -5
 ```
+
+(Read the log *after* the test rather than tailing it through a pipe — squid
+writes the access line when the tunnel closes, and a piped `grep` may buffer
+past the moment you are watching for. Before trusting any verdict, confirm the
+running image is current: `podman exec claude-agent grep -c refresher
+/app/entrypoint.sh` must be non-zero — a stale image invalidates the run.)
 
 - `CONNECT platform.claude.com ... TCP_TUNNEL/200` and still no renewal →
   the server rejected that refresh token; re-login (fresh token) and rerun —

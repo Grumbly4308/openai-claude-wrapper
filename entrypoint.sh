@@ -232,7 +232,17 @@ case "${1:-serve}" in
         ;;
     *)
         # Unknown command — treat as a raw exec so advanced users can run
-        # arbitrary binaries inside the container.
+        # arbitrary binaries inside the container. Checked first so a role
+        # name this image doesn't know yet fails with a diagnosis instead of
+        # a bare `exec: not found` crash-loop: that is what a stale image
+        # looks like when compose comes from a newer checkout.
+        if ! command -v "$1" >/dev/null 2>&1; then
+            echo "entrypoint: '$1' is neither a role this image knows nor an" >&2
+            echo "executable on PATH. If it is a role from a newer checkout," >&2
+            echo "this IMAGE is stale — rebuild it:" >&2
+            echo "    docker compose -f <compose file> build --no-cache && docker compose -f <compose file> up -d --force-recreate" >&2
+            exit 127
+        fi
         exec "$@"
         ;;
 esac

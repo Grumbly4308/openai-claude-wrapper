@@ -1225,58 +1225,78 @@ There are two independent auth layers.
 
 ### First-time login
 
-For the **single-container** layout this is one command and it just works:
+**`claude login` is not an authentication command.** CLI 2.1.226 has no `login`
+subcommand — the word is parsed as a prompt, so the CLI opens a chat session,
+writes `history.jsonl` and `sessions/`, and never touches `.credentials.json`.
+The only interactive auth path is the TUI's `/login` slash command. (The
+`login` entrypoint subcommand detects this and drops you into the TUI.)
+
+For the **single-container** layout:
 
 ```bash
-docker compose run --rm -it claude-wrapper login
+docker compose run --rm -it claude-wrapper login   # opens the TUI; type /login
 ```
 
-For the **sandboxed** layout there are two traps, both consequences of the
-isolation working as designed:
+For the **sandboxed** layout there is one trap:
 
-1. The CLI runs in `claude-agent`, and `claude-home` is mounted **read-only** on
-   `claude-wrapper` — so a login aimed at the API container cannot write
-   credentials and fails confusingly. Target the agent.
-2. That agent has no direct route out and defers DNS to Squid, which the
-   interactive OAuth **callback** cannot complete through. The typical failure is
-   `OAuth error: Invalid IP address: undefined`.
+- The agent has no direct route out and defers DNS to Squid, and OAuth fails
+  there with `OAuth error: Invalid IP address: undefined`. This affects **any**
+  OAuth flow in that container, not just the interactive one — `setup-token`
+  fails identically, which rules out the callback as the cause.
+
+Note what is *not* the problem: `claude-home` is mounted **writable** on
+`claude-agent` (it is read-only only on `claude-wrapper`), so the volume is not
+what blocks a login aimed at the agent.
 
 The reliable approach is to do the one-time login in a throwaway container with
 ordinary networking, writing into the same volume the agent reads. This is a
 legitimate bootstrap, not a workaround: the sandbox exists to constrain
 model-driven tool use, not the operator's initial setup.
 
+Get the volume name from the running container rather than guessing it — a
+`-v` naming a volume that does not exist **creates an empty one**, so the login
+succeeds into a volume nothing reads:
+
 ```bash
-docker volume ls | grep claude-home        # note the project-prefixed name
+podman inspect claude-agent \
+    --format '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{"\n"}}{{end}}'
 
-docker run --rm -it \
-    -v <project>_claude-home:/home/claude/.claude \
-    claude-wrapper:latest login
+podman run --rm -it -v <that-name>:/home/claude/.claude claude-wrapper:latest claude
+# type /login at the prompt, complete the flow, then /exit
 
-docker-compose -f docker-compose.sandbox.yml up -d
-docker exec claude-agent ls -l /home/claude/.claude/.credentials.json
+podman exec claude-agent stat -c '%y' /home/claude/.claude/.credentials.json
 ```
 
-Alternatives, in order of preference: `setup-token` instead of `login` (a
-code-paste flow with no callback, so it often succeeds inside the agent
-directly), or skip interactive auth entirely by setting `ANTHROPIC_API_KEY` /
-`CLAUDE_CODE_OAUTH_TOKEN` in `.env`. On an API-key-only deployment you can then
-delete the eight `claude.ai` / `claude.com` entries from `sandbox/allowlist.txt`,
-which that file's own comments recommend.
+That last line is the check that matters: the mtime must be from just now. If it
+has not moved, the credential did not land, whatever the CLI printed.
+
+`setup-token` is **not** an alternative route into the volume. It prints a token
+and nothing else — verified with `claude-home` mounted writable, where it left
+`.credentials.json` untouched. Its output is for `CLAUDE_CODE_OAUTH_TOKEN`, and
+setting that suppresses file refresh entirely (see
+[Keeping the credential alive](#keeping-the-credential-alive)). On an
+API-key-only deployment you can delete the eight `claude.ai` / `claude.com`
+entries from `sandbox/allowlist.txt`, which that file's own comments recommend.
 
 ### 1. Claude Code → Anthropic
 
-- **Long-lived OAuth token (recommended).** `docker compose run --rm -it
-  claude-wrapper setup-token` runs `claude setup-token`, which prints a URL and
-  a code, accepts the resulting token and stores it in `/home/claude/.claude/`,
-  backed by the `claude-home` volume so it survives `down`/`up`, rebuilds and
-  reboots. Prefer this for anything headless — see
-  [Keeping the credential alive](#keeping-the-credential-alive) for why. Under
-  the sandbox topology, target `claude-agent` instead.
-- **Interactive OAuth.** `docker compose run --rm -it claude-wrapper login`
-  executes `claude login` in the container, writing to the same volume. It is
-  the desktop flow: the token is short-lived and depends on the CLI refreshing
-  it, and the OAuth callback cannot complete from inside the sandboxed agent.
+The two mechanisms are genuinely different, and they cannot both be active —
+an environment credential wins and then nothing renews the file underneath it.
+
+- **Interactive login (renews itself).** Run the TUI and use `/login`. Writes
+  `.credentials.json` to `/home/claude/.claude/`, backed by the `claude-home`
+  volume so it survives `down`/`up`, rebuilds and reboots. The access token
+  lasts hours and the CLI renews it from a refresh token — good for ~30 days —
+  every time it runs with working egress. This is the only credential that
+  sustains itself, and the only one that lives in the volume. Under the sandbox
+  topology, bootstrap it from a throwaway container: see
+  [First-time login](#first-time-login).
+- **Long-lived token (static).** `claude setup-token` prints a token valid for
+  about a year. It is **not** written to the volume — the output is meant for
+  `CLAUDE_CODE_OAUTH_TOKEN`. Nothing renews it and nothing can read its expiry,
+  so it is best kept as a break-glass credential rather than the primary. Note
+  that setting it stops the CLI refreshing any login in the volume, which then
+  decays silently; the boot report warns when it detects this.
 - **Env vars.** Set `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` in `.env`.
   The wrapper does not arbitrate between these and a persisted login — it only
   reports what it found. Precedence is decided by the Claude Code CLI (and,
@@ -1486,7 +1506,8 @@ Each of the corresponding misconfigurations otherwise fails silently.
 | Symptom | Likely cause |
 | --- | --- |
 | `PermissionError: … '/data/assistants'` at boot | `CLAUDE_UID` disagrees with the uid baked into the image — see [below](#changing-claude_uid-after-first-run) |
-| `OAuth error: Invalid IP address: undefined` | Interactive login attempted inside the sandboxed agent — see [First-time login](#first-time-login) |
+| `OAuth error: Invalid IP address: undefined` | Any OAuth flow attempted inside the sandboxed agent — `setup-token` fails the same way — see [First-time login](#first-time-login) |
+| `claude login` opens a chat session instead of authenticating | There is no `login` subcommand; the word is parsed as a prompt. Use the TUI's `/login` |
 | `claude failed: claude exited 1:` with empty stderr | Usually an expired credential. The boot log names it; `claude -p hi` inside the agent prints the real 401 — see [Keeping the credential alive](#keeping-the-credential-alive) |
 | squid `FATAL: failed to open /var/cache/squid/squid.pid` | tmpfs mode under rootless podman; check `RestartCount` — see [Rootless podman caveats](#rootless-podman-caveats) |
 | CLI turns hang or exit 1, no `TCP_DENIED` in the squid log | Squid is not actually running. `restart: unless-stopped` hides a crash loop; check `RestartCount`, not `Status` |

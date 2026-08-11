@@ -146,6 +146,31 @@ services:
       OPENWEBUI_BASE_URL: "${OPENWEBUI_BASE_URL:-}"
       OPENWEBUI_API_KEY: "${OPENWEBUI_API_KEY:-}"
       OPENWEBUI_DEFAULT_COLLECTION: "${OPENWEBUI_DEFAULT_COLLECTION:-}"
+
+      # ---- Per-model capability profiles (README "Per-model capability
+      # profiles"; TOOL-PROFILES-ROADMAP.md) ----
+      # Profiles are resolved in THIS container; the agent only receives the
+      # resulting --disallowedTools argv through the shim. The profile file
+      # follows the same operator-edited-config pattern as squid.conf and
+      # allowlist.txt: edit sandbox/profiles.json in the checkout (mounted
+      # read-only below; ships as a no-op {}), restart the wrapper.
+      CLAUDE_WRAPPER_MODEL_PROFILES: "${CLAUDE_WRAPPER_MODEL_PROFILES:-/etc/claude-wrapper/profiles.json}"
+      CLAUDE_WRAPPER_MODEL_PROFILE_OVERRIDES: "${CLAUDE_WRAPPER_MODEL_PROFILE_OVERRIDES:-}"
+      # Terminal hard gate (default off). In this topology Bash executes in
+      # the network-isolated agent container, so enabling it here is far
+      # lower-risk than in the sunset single-container layout.
+      CLAUDE_WRAPPER_EXPOSE_TERMINAL: "${CLAUDE_WRAPPER_EXPOSE_TERMINAL:-}"
+      # Bridge server-side web search injection (default off). Executes on
+      # Anthropic's infrastructure via api.anthropic.com — already on the
+      # allowlist; no extra egress needed.
+      CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH: "${CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH:-}"
+      CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS: "${CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS:-8}"
+      # Optional OpenAI-compatible image backend. Its host must be reachable
+      # from THIS container: add it to sandbox/allowlist.txt (external) or
+      # SANDBOX_EXTRA_NO_PROXY (internal network) — otherwise squid blocks it.
+      CLAUDE_WRAPPER_IMAGE_BACKEND_URL: "${CLAUDE_WRAPPER_IMAGE_BACKEND_URL:-}"
+      CLAUDE_WRAPPER_IMAGE_BACKEND_KEY: "${CLAUDE_WRAPPER_IMAGE_BACKEND_KEY:-}"
+      CLAUDE_WRAPPER_IMAGE_BACKEND_MODEL: "${CLAUDE_WRAPPER_IMAGE_BACKEND_MODEL:-}"
     volumes:
       # File store, session registry, usage ledgers, batches — API-only state.
       - claude-data:/data
@@ -156,6 +181,10 @@ services:
       # Read-only: the tool bridge needs the CLI's refreshed OAuth token for
       # direct Messages API calls. The agent owns the writable mount.
       - claude-home:/home/claude/.claude:ro
+      # Per-model capability profiles — operator-edited config, same pattern
+      # as squid.conf / allowlist.txt. Ships as a no-op {}; edit + restart.
+      # On an SELinux host add :z, same caveat as the squid mounts.
+      - ./sandbox/profiles.json:/etc/claude-wrapper/profiles.json:ro
     networks:
       - frontend
       - backend

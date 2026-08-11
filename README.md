@@ -8,8 +8,10 @@ OpenAI-compatible HTTP API in front of [Claude Code](https://docs.claude.com/en/
 - Serves many concurrent clients in parallel; requests that target the
   same conversation are serialized automatically to keep Claude Code's
   session log consistent.
-- Runs as a single container, or as a three-container sandbox where the
-  agent has no route to the internet except a domain allowlist.
+- Runs as a multi-container sandbox where the agent has no route to the
+  internet except a domain allowlist — the supported deployment. (A
+  single-container layout exists but is **sunset**: kept for local
+  development and rollback only; see the note under Quick start.)
 
 ---
 
@@ -57,6 +59,13 @@ declare a `version:` key, so any Compose v2-compatible frontend works.
 ---
 
 ## Quick start (Docker Compose)
+
+> **SUNSET — this single-container quick start is no longer the supported
+> deployment.** Production and regression testing run the sandboxed topology:
+> see [Sandboxed deployment](#sandboxed-deployment-network-isolated-agent)
+> and `TOOL-PROFILES-REGRESSION.md`. The steps below still work and remain
+> useful for local development, but new deployment features land in the
+> sandbox stack first.
 
 ### 1. Configure
 
@@ -1279,6 +1288,14 @@ Capabilities: `vision`, `file_upload`, `web_search`, `code_interpreter`,
 | `CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS` | Hybrid-loop round cap per turn (default 8). |
 | `CLAUDE_WRAPPER_IMAGE_BACKEND_URL` / `_KEY` / `_MODEL` | Optional OpenAI-compatible image backend; configured, `/v1/images/generations` proxies there instead of the SVG delegation path. |
 
+**Where the profile file lives:** in the sandbox stack (the supported
+deployment) it is `sandbox/profiles.json` — bind-mounted read-only into the
+wrapper at `/etc/claude-wrapper/profiles.json`, which is the compose default
+for `CLAUDE_WRAPPER_MODEL_PROFILES`. It ships as a no-op `{}`; edit it in the
+checkout and restart the wrapper, the same workflow as `sandbox/allowlist.txt`.
+(Sunset single-container layout: drop the file in the inbox and point the env
+var at `/data/inbox/profiles.json`.)
+
 Profile schema — `default` replaces the built-in set; `models` entries apply
 in order (literal match first, then glob), each either replacing
 (`capabilities`) or delta-ing (`add`/`remove`); effort and `[1m]` variants
@@ -1297,8 +1314,9 @@ Enforcement is layered per path:
 
 - **CLI (chat) runs** translate the profile into `--disallowedTools`
   (`terminal`→Bash, `web_search`→WebSearch/WebFetch, `sub_agents`→Task).
-  Internal delegation runs (audio/images/embeddings do their work through
-  Bash) are never gated.
+  In the sandbox topology that argv crosses the agent shim to the agent
+  container unchanged, so gating is identical there. Internal delegation
+  runs (audio/images/embeddings do their work through Bash) are never gated.
 - **Tool bridge**: a model without `client_tools` answers a tools request
   with a 400 naming the denied tools. Profiled server-side tools (web
   search, code execution) are injected after the client's. Wrapper-owned

@@ -1,53 +1,63 @@
-# Per-model tool profiles — manual regression pass
+# Per-model tool profiles — manual regression pass (sandboxed wrapper)
 
-Manual acceptance run for the `feat/per-model-tool-profiles` branch against a
-live OpenWebUI. Work top to bottom — groups build on each other. Prompts in
-quotes go into OpenWebUI chat; commands run where indicated. Record failures
-inline; RT-8's raw output is needed verbatim to close the open checklist items
-in [TOOL-PROFILES-TASKS.md](TOOL-PROFILES-TASKS.md).
+Manual acceptance run for the `feat/sandbox-tool-profiles` branch against a
+live OpenWebUI. **The sandboxed topology (`docker-compose.sandbox.yml`) is the
+deployment of record** — the single-container layout is sunset and no longer
+regression-tested. Work top to bottom; prompts in quotes go into OpenWebUI
+chat; commands run where indicated. RT-8's raw output is needed verbatim to
+close the open checklist items in [TOOL-PROFILES-TASKS.md](TOOL-PROFILES-TASKS.md).
 
-Throughout: `WRAPPER=http://<dev-server>:8000` (adjust host/port).
+Throughout: `WRAPPER=http://<dev-server>:8000` and
+`DC="docker compose -f docker-compose.sandbox.yml"` (rootless podman:
+`DC="podman-compose -f docker-compose.sandbox.yml"` — see the README's
+podman caveats).
 
 ---
 
 ## Setup — deploy the branch on the dev server
 
-Credentials live in the `claude-home` Docker volume (or your
-`docker-compose.host-credentials.yml` overlay / `.env` auth vars). None of
-that is touched by a branch switch or rebuild — **no re-login needed**. Your
-existing `.env` is untracked and survives too.
+Credentials live in the shared `claude-home` volume, owned by the agent
+container and kept fresh by the `claude-refresher` service. A branch switch or
+rebuild touches none of that — **no re-login needed**. Your untracked `.env`
+survives too.
 
 ```bash
-cd /path/to/claude-wrapper          # the existing dev checkout
-docker compose ps                    # note current state
+cd /path/to/claude-wrapper           # the existing dev checkout
+$DC ps                                # note current state
 git fetch origin
-git checkout feat/per-model-tool-profiles
-git pull --ff-only origin feat/per-model-tool-profiles
+git checkout feat/sandbox-tool-profiles
+git pull --ff-only origin feat/sandbox-tool-profiles
 
-# Rebuild + restart. Add `-f docker-compose.host-credentials.yml` after
-# `-f docker-compose.yml` if the dev server uses the host-credentials overlay.
-docker compose up -d --build
+$DC up -d --build
 
-curl -fsS $WRAPPER/healthz           # {"status":"ok"}
-docker compose logs claude-wrapper | grep "capabilities\["   # per-model boot log
+curl -fsS $WRAPPER/healthz            # {"status":"ok"}
+$DC logs claude-wrapper | grep "capabilities\["    # per-model boot log
+$DC logs claude-wrapper | grep "agent execution"   # REMOTE via http://claude-agent:8791
 ```
 
-Between test groups, env changes go in `.env`; apply with
-`docker compose up -d` (recreate, no rebuild needed). The profile file must be
-visible **inside** the container — the inbox mount is the easy path:
+Only a **fresh** deployment (empty `claude-home` volume) needs the one-time
+login bootstrap — see README "Sandboxed deployment"; an existing dev volume
+does not.
 
-```bash
-cp deploy/model-profiles.example.json ./inbox/profiles.json   # or your CLAUDE_INBOX_DIR
-# .env: CLAUDE_WRAPPER_MODEL_PROFILES=/data/inbox/profiles.json
-```
+Two knobs you'll flip during the run:
 
-Rollback at any point: `git checkout main && docker compose up -d --build`.
+- **Env changes** go in `.env`, applied with `$DC up -d` (recreate, no
+  rebuild).
+- **The profile file is `sandbox/profiles.json`** in the checkout — mounted
+  read-only into the wrapper at `/etc/claude-wrapper/profiles.json` (the
+  compose default). It ships as a no-op `{}`. Edit it, then
+  `$DC restart claude-wrapper`. Same workflow as `sandbox/allowlist.txt`.
+  (There is **no** inbox path for profiles in this topology — the inbox
+  mounts on the agent, not the wrapper.)
+
+Rollback at any point: `git checkout <previous branch> && $DC up -d --build`.
 
 ---
 
 ## A. Baseline — absent config must be a no-op (plus the one intended change)
 
-Run group A with **no profile file and none of the new env vars set**.
+Run group A with `sandbox/profiles.json` still `{}` and none of the new env
+vars set.
 
 - [ ] **RT-1 — model list carries capabilities**
   ```bash
@@ -59,14 +69,16 @@ Run group A with **no profile file and none of the new env vars set**.
 - [ ] **RT-2 — plain chat unchanged** (Function Calling = *Default*)
   > "Summarize what a reverse proxy does."
 
-  Streams normally, usage populated.
+  Streams normally, usage populated. Runs remotely in the agent container as
+  before.
 
 - [ ] **RT-3 — effort variant unchanged** — pick a `… (high)` model, any prompt.
 
 - [ ] **RT-4 — terminal off by default** (the one intended behavior change)
   > "Use your bash tool to run `uname -a` and show me the output."
 
-  Model states it cannot run shell commands.
+  Model states it cannot run shell commands — the profile's
+  `--disallowedTools Bash` crossed the shim into the agent's CLI.
 
 - [ ] **RT-5 — delegation exempt from the gate** — with terminal still off,
   generate an image from OpenWebUI (or any audio/TTS request). Still works —
@@ -75,11 +87,19 @@ Run group A with **no profile file and none of the new env vars set**.
 - [ ] **RT-6 — generated-file downloads intact** (Function Calling = *Default*)
   > "Write a 3-line CSV of fruit prices and give it to me as a file."
 
-  Clickable download link appears.
+  Clickable download link appears (shared workspace volume unaffected).
 
 - [ ] **RT-7 — gate opt-in restores classic behavior** — set
-  `CLAUDE_WRAPPER_EXPOSE_TERMINAL=true`, `docker compose up -d`, repeat RT-4
+  `CLAUDE_WRAPPER_EXPOSE_TERMINAL=true` in `.env`, `$DC up -d`, repeat RT-4
   (now returns `uname -a` output) and RT-1 (`terminal` now advertised).
+
+- [ ] **RT-8s — terminal exposure stays inside the sandbox** *(sandbox
+  marquee test — with the gate from RT-7 still open)*
+  > "Use bash to run: curl -sS --max-time 10 https://example.com and show me what you get."
+
+  The request **fails** (squid denies CONNECT — example.com is not on
+  `sandbox/allowlist.txt`). An exposed terminal still has no egress beyond
+  the allowlist; that's the point of running profiles inside the sandbox.
 
 ## B. Puller / OpenWebUI toggles (run on the OpenWebUI host)
 
@@ -96,10 +116,9 @@ Run group A with **no profile file and none of the new env vars set**.
   RT-1 (Vision/File Upload on, Terminal per your RT-7 state, Code Interpreter
   off).
 
-## C. Profiles
+## C. Profiles (edit `sandbox/profiles.json`, `$DC restart claude-wrapper`)
 
-Install this as `./inbox/profiles.json`, set
-`CLAUDE_WRAPPER_MODEL_PROFILES=/data/inbox/profiles.json`, restart:
+Use this test profile:
 
 ```json
 {"models": [
@@ -108,14 +127,17 @@ Install this as `./inbox/profiles.json`, set
 ]}
 ```
 
-- [ ] **RT-10 — boot validation fails loudly** — boot logs show per-model
-  `capabilities[...]` lines. Then temporarily add `"warp_drive"` to an entry:
-  startup **fails naming the entry**. Restore the file.
+- [ ] **RT-10 — boot validation fails loudly** — after the restart, wrapper
+  logs show per-model `capabilities[...]` lines reflecting the profile. Then
+  temporarily add `"warp_drive"` to an entry and restart: the wrapper
+  **fails to start, naming the entry** (`$DC logs claude-wrapper`). Restore
+  the file.
 
 - [ ] **RT-11 — CLI web-search gating** — Haiku, Function Calling = *Default*:
   > "Search the web for today's top tech headline."
 
-  Haiku says it can't browse; the same prompt on Sonnet searches.
+  Haiku says it can't browse; the same prompt on Sonnet searches (via squid —
+  no allowlist change involved).
 
 - [ ] **RT-12 — bridge denial is a hard 400** — Haiku, Function Calling =
   *Native*, send any message. OpenWebUI surfaces an error naming
@@ -135,8 +157,9 @@ Install this as `./inbox/profiles.json`, set
   …then a few turns later:
   > "What's my favorite deployment target?"
 
-  Recalled. On the wrapper host, `docker compose exec claude-wrapper ls
-  /data/memory/` shows the conversation dir. A **new** conversation asking
+  Recalled. On the dev server: `$DC exec claude-wrapper ls /data/memory/`
+  shows the conversation dir (memory lives in the wrapper's `claude-data`
+  volume — the agent container never sees it). A **new** conversation asking
   the same question does *not* recall it (memory is per-conversation).
 
 - [ ] **RT-15 — collision guard** — enable an OpenWebUI tool literally named
@@ -148,17 +171,24 @@ Install this as `./inbox/profiles.json`, set
   `CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH=true`, Sonnet, *Native*:
   > "What was yesterday's closing price of the S&P 500? Search for it."
 
-  Answer reflects a live search (bills per-search on the Anthropic account).
+  Answer reflects a live search. Executes on Anthropic's side through
+  `api.anthropic.com` (already allowlisted — no squid change), and bills
+  per-search on the Anthropic account.
 
 - [ ] **RT-17 — code interpreter** — add `"add": ["code_interpreter"]` for one
   model, *Native*:
   > "Compute the 50th Fibonacci number by running code."
 
-  Returns 12586269025 via Anthropic's sandbox.
+  Returns 12586269025 via Anthropic's sandbox (server-side; no egress change).
 
 - [ ] **RT-18 — image backend** *(only once a backend is chosen)* — set
-  `CLAUDE_WRAPPER_IMAGE_BACKEND_URL/_KEY`, generate an image from OpenWebUI;
-  the image comes from the backend, not the SVG path.
+  `CLAUDE_WRAPPER_IMAGE_BACKEND_URL/_KEY`, **and allowlist the backend
+  host**: external backends go in `sandbox/allowlist.txt` (edit + reload, or
+  `./sandbox allow <domain>` if you use the helper); an internal backend goes
+  in `SANDBOX_EXTRA_NO_PROXY` instead. Then generate an image from OpenWebUI;
+  it comes from the backend, not the SVG path. Without the allowlist step the
+  expected failure is a 502 "image backend unreachable" — that's squid doing
+  its job, not a wrapper bug.
 
 ## E. Loop safety
 

@@ -1,3 +1,10 @@
+# SUNSET — the single-container layout is no longer the supported deployment.
+# The sandboxed topology (docker-compose.sandbox.yml: wrapper + isolated agent
+# container + squid egress allowlist) is what we run and regression-test; see
+# README "Sandboxed deployment" and TOOL-PROFILES-REGRESSION.md. This file is
+# retained for local development and as a rollback path only — new deployment
+# features land in the sandbox stack first and are not guaranteed to be wired
+# here.
 services:
   claude-wrapper:
     build:

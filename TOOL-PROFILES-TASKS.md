@@ -3,6 +3,13 @@
 Working checklist for [TOOL-PROFILES-ROADMAP.md](TOOL-PROFILES-ROADMAP.md).
 Check items off as they land; keep one PR per phase where practical.
 
+> **Deployment of record: the sandboxed topology** (`docker-compose.sandbox.yml`
+> — wrapper + isolated agent container + squid egress allowlist), integrated in
+> Phase 7 on `feat/sandbox-tool-profiles`. The single-container layout is
+> **sunset**: kept for local dev and rollback, no longer regression-tested;
+> phases 0–6 were built and unit-tested against code shared by both layouts,
+> so they carry over — Phase 7 holds the sandbox-specific wiring.
+
 ## Phase 0 — Groundwork
 
 - [x] Define the capability enum (vision, file_upload, web_search,
@@ -93,3 +100,31 @@ Check items off as they land; keep one PR per phase where practical.
 - [ ] End-to-end pass against a live OpenWebUI (toggles, tool calls, denials)
 - [x] Migration note: absent profile file == today's behavior
 - [x] Run full test suite + `qa` if available; fix fallout
+
+## Phase 7 — Sandbox integration (deployment of record)
+
+- [x] Merge the sandbox stack (`agent/podman`) with the profiles work into
+      `feat/sandbox-tool-profiles`; full suite green on the merged tree
+      (pre-existing baseline failures only)
+- [x] Wire the profile env passthroughs into `docker-compose.sandbox.yml`
+      (wrapper service only — profiles resolve wrapper-side; the agent just
+      executes the argv it's handed)
+- [x] Ship `sandbox/profiles.json` (no-op `{}`), bind-mounted read-only at
+      `/etc/claude-wrapper/profiles.json` and made the compose default for
+      `CLAUDE_WRAPPER_MODEL_PROFILES` — same operator-edited-config pattern
+      as `squid.conf` / `allowlist.txt` (the inbox path doesn't exist here:
+      the inbox mounts on the agent, not the wrapper)
+- [x] Prove capability gating crosses the agent shim: end-to-end test where
+      the fake agent binary refuses to answer unless `--disallowedTools Bash`
+      actually arrived (`test_sandbox_shim.py`)
+- [x] Document the sandbox egress interplay: bridge server tools ride
+      `api.anthropic.com` (already allowlisted, no squid change); an external
+      image backend must be added to `sandbox/allowlist.txt`, an internal one
+      to `SANDBOX_EXTRA_NO_PROXY`
+- [x] Sunset the single-container layout: notes in `docker-compose.yml`,
+      README intro + quick start, and this file's header
+- [x] Rewrite `TOOL-PROFILES-REGRESSION.md` against the sandbox stack,
+      including the new RT-8s marquee test (terminal exposed **and** squid
+      still denying non-allowlisted egress)
+- [ ] Run the reworked regression pass on the dev server (RT-1 … RT-19;
+      RT-8's dry-run output needed verbatim)

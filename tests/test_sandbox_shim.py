@@ -201,3 +201,50 @@ def test_shim_unreachable_is_an_error_not_a_crash():
     result = asyncio.run(scenario())
     assert result.error is not None
     assert "agent shim unreachable" in result.error
+
+
+def test_capability_gating_argv_crosses_the_shim(monkeypatch, tmp_path):
+    """The profile's --disallowedTools is built in the API container; the agent
+    executes it only because the shim forwards args verbatim. Pin that chain:
+    with the terminal gate closed (its default), the fake binary refuses to
+    answer unless the gating flags actually arrived."""
+    from src.capabilities import TERMINAL_TOGGLE_ENV, reset_profile_cache
+
+    monkeypatch.delenv(TERMINAL_TOGGLE_ENV, raising=False)
+    reset_profile_cache()
+    script = tmp_path / "fake-claude-gated"
+    script.write_text(
+        "#!/bin/sh\n"
+        "cat > /dev/null\n"
+        'case "$*" in *"--disallowedTools Bash"*) ;; *) echo "gating argv missing" >&2; exit 3;; esac\n'
+        f"printf '%s\\n' '{_ASSISTANT}'\n"
+        f"printf '%s\\n' '{_RESULT}'\n"
+    )
+    script.chmod(0o755)
+    _shim_settings(monkeypatch, claude_bin=str(script))
+    executor = claude_runner.RemoteAgentExecutor("http://agent")
+    executor._client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=agent_shim.app), base_url="http://agent"
+    )
+    runner = claude_runner.ClaudeRunner(
+        registry=claude_runner.SessionRegistry(Path(_TMP) / "sessions-gated"),
+        workspace_root=WS,
+        claude_bin="unused-locally",
+        stream_partial_messages=False,
+        executor=executor,
+    )
+
+    async def scenario():
+        try:
+            return await runner.run_collect(
+                prompt="hi", session_key="remote-gated", model="claude-opus-4-8"
+            )
+        finally:
+            await executor.aclose()
+
+    try:
+        result = asyncio.run(scenario())
+    finally:
+        reset_profile_cache()
+    assert result.error is None
+    assert result.final_text == "hi from fake"

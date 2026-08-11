@@ -121,6 +121,16 @@ migration note for existing deployments (default profile = today's behavior).
 
 ## Decisions (settled)
 
+- **Deployment of record: the sandboxed topology.** The single-container
+  layout is sunset (kept for local dev and rollback). Profiles resolve in the
+  wrapper container; enforcement crosses the agent shim as ordinary argv, so
+  the whole design carries over — the sandbox-specific wiring (env
+  passthroughs, the `sandbox/profiles.json` mount, egress notes) lives in
+  Phase 7 of the checklist. Terminal exposure is also *safest* here: Bash
+  executes inside the network-isolated agent container behind the squid
+  allowlist, which is precisely where an operator might reasonably flip
+  `CLAUDE_WRAPPER_EXPOSE_TERMINAL` on.
+
 - **Profile file format: JSON.** No new dependency.
 - **Deny behavior in the bridge: hard 400** naming the denied tool. Silent
   stripping hides misconfiguration.

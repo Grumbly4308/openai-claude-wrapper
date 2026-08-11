@@ -248,6 +248,8 @@ whole path works without minting anything.
 | turn + refresh, flag on | **2.1.226** | same CONNECTs; chained: real round trip, server rejects the fake token — `Failed to authenticate: OAuth session expired and could not be refreshed` |
 | `setup-token`, flag on | both | stalls at "Opening browser to sign in…" — the interactive flow needs a browser before any OAuth traffic; bootstrap outside the sandbox remains correct |
 | telemetry (datadog) blocked | 2.1.226 | CLI carries on; blocking it is harmless |
+| the shim's exact argv (`-p --output-format stream-json --verbose --session-id …`) | 2.1.226 | refresh CONNECT fires all the same — the invocation is not the variable |
+| `NO_PROXY` with the stack's trailing empty element | 2.1.226 | refresh CONNECT fires all the same — the hygiene item is confirmed cosmetic |
 
 **Requirements for in-sandbox token refresh, all of which this stack already
 meets:**
@@ -260,10 +262,13 @@ meets:**
 
 So the measured in-stack refresh failure (Outcome, above) is *not explained by
 the network path*: the same binary completes refresh under stricter conditions
-than the sandbox imposes. The remaining suspects are (4) — refresh tokens
-commonly rotate on use, and that credential had been through several login
-experiments — or something stack-local answering the CONNECT. One rerun
-separates them; watch Squid while the test forces a refresh:
+than the sandbox imposes. Requirement (4) has since been eliminated too — the
+refresher renewed the live credential with that same refresh token, so the
+server accepts it. Every in-container variable is now cleared by replica
+measurement (version, flag, argv, NO_PROXY); the one component the replica
+cannot stand in for is the deployment's own Squid answering the CONNECT.
+`access_log` is unbuffered as of 2026-08-11 precisely so that question stops
+being unanswerable; rerun with the log actually flowing:
 
 ```bash
 tools/credential_refresh_test.sh

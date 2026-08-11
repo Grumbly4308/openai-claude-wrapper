@@ -21,7 +21,12 @@
 #   docker compose -f docker-compose.sandbox.yml up -d
 #   podman-compose -f docker-compose.sandbox.yml up -d
 #
-# Under ROOTLESS podman two things differ from docker, both host-side:
+# Under ROOTLESS podman three things differ from docker:
+#   - tmpfs default mode. Docker mounts a tmpfs 1777; rootless podman mounts it
+#     root-owned 0755, which an unprivileged service cannot write. Squid's is
+#     therefore pinned to mode=1777 below — without it squid cannot create its
+#     pid file, dies at startup, and `restart: unless-stopped` hides that as a
+#     silent loop: the stack reports "up" while the agent has no egress at all.
 #   - `user:` below is a uid INSIDE the user namespace, so it does not name the
 #     host account. If the inbox bind mount reads as owned by a stranger, run
 #     with `--userns=keep-id` (or run podman as root).
@@ -29,8 +34,11 @@
 #     and inbox need a `:z` suffix, or the container is denied access to them.
 #     Left off here because relabeling touches files in your checkout.
 #
-# One-time CLI login happens in the AGENT container (the CLI runs there):
-#   docker compose -f docker-compose.sandbox.yml run --rm -it claude-agent login
+# One-time CLI auth happens in the AGENT container (the CLI runs there). Prefer
+# the long-lived token: the interactive login's OAuth callback cannot complete
+# through the allowlist proxy, and its shorter-lived token only stays valid
+# while the CLI runs often enough to refresh it.
+#   docker compose -f docker-compose.sandbox.yml run --rm -it claude-agent setup-token
 #
 # Feature caveats vs the single-container layout (see README "Sandboxed
 # deployment"): first-use model downloads for /v1/audio and /v1/embeddings
@@ -240,9 +248,13 @@ services:
     volumes:
       - ./sandbox/squid.conf:/etc/squid/squid.conf:ro
       - ./sandbox/allowlist.txt:/etc/squid/allowlist.txt:ro
+    # mode is explicit because the runtimes disagree on the default: docker
+    # gives a tmpfs 1777, rootless podman gives it root-owned 0755. Squid runs
+    # as `proxy` and writes its pid file to /var/cache/squid, so under podman
+    # the default is a FATAL at startup and an endless restart loop.
     tmpfs:
-      - /var/cache/squid
-      - /var/log/squid
+      - /var/cache/squid:mode=1777
+      - /var/log/squid:mode=1777
     networks:
       - backend
       - egress

@@ -35,7 +35,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 import httpx
 from fastapi import HTTPException
 
-from .config import SETTINGS
+from .config import CREDENTIALS_FILE, SETTINGS
 from .json_mode import extract_raw_json, json_instruction, json_mode_error, wants_json
 from .models import (
     ChatCompletionChunk,
@@ -63,12 +63,7 @@ _CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claud
 # The Messages API requires max_tokens; used when the client doesn't send one.
 _DEFAULT_MAX_TOKENS = int(os.environ.get("CLAUDE_WRAPPER_TOOLS_MAX_TOKENS", "8192"))
 
-_CREDENTIALS_FILE = Path(
-    os.environ.get(
-        "CLAUDE_WRAPPER_CREDENTIALS_FILE",
-        str(Path.home() / ".claude" / ".credentials.json"),
-    )
-)
+_CREDENTIALS_FILE = CREDENTIALS_FILE
 
 # Same proxy-buffer-flushing preamble the main chat stream uses (see main.py).
 _STREAM_PREAMBLE_BYTES = int(os.environ.get("CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES", "2048"))
@@ -126,11 +121,13 @@ def _oauth_access_token() -> str:
     token = str(oauth.get("accessToken") or "")
     expires_ms = oauth.get("expiresAt")
     if token and isinstance(expires_ms, (int, float)) and expires_ms / 1000 < time.time():
-        # The CLI refreshes this file whenever it runs; we don't hold the
-        # refresh-token flow ourselves. Use the token anyway (clock skew is
-        # common) but leave a trail if the API then 401s.
+        # Use it anyway: clock skew is common, and the CLI rewrites this file
+        # when it runs. But that refresh only happens if the CLI actually runs
+        # AND can reach the network — when egress is broken the token stays
+        # expired and every turn 401s, so don't imply the fix is automatic.
         log.warning(
-            "OAuth access token in %s looks expired; any `claude` invocation refreshes it",
+            "OAuth access token in %s is past its expiry. It refreshes when the CLI "
+            "next runs with working egress; if this repeats, re-mint with `setup-token`.",
             _CREDENTIALS_FILE,
         )
     return token

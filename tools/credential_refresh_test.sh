@@ -107,9 +107,10 @@ if echo "$resp" | grep -q '"choices"'; then
         echo "  answering (the tool-bridge path does not spawn the CLI)."
     fi
 else
-    echo "  NO REFRESH — the turn failed, so the CLI could not renew the token."
-    echo "  A login cannot sustain itself in this deployment; use a long-lived"
-    echo "  token (claude setup-token) via CLAUDE_CODE_OAUTH_TOKEN instead."
+    echo "  NO REFRESH — the turn failed, so the CLI could not renew the token"
+    echo "  from inside this deployment. Run the claude-refresher service to"
+    echo "  renew it from outside the sandbox, or fall back to a long-lived"
+    echo "  token (claude setup-token) via CLAUDE_CODE_OAUTH_TOKEN."
 fi
 
 echo

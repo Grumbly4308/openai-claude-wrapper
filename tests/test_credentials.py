@@ -38,6 +38,7 @@ def _clear_env(monkeypatch):
     """Both env credentials outrank the file, so clear them for every test."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN_MINTED", raising=False)
 
 
 def _write(tmp_path: Path, oauth: dict) -> Path:
@@ -124,6 +125,66 @@ def test_long_lived_token(tmp_path):
     status = read_credential_status(_write(tmp_path, {"accessToken": "t", "expiresAt": _in(expires)}))
     assert not status.short_lived and not status.expired
     assert "valid for" in status.describe()
+
+
+# ---------- the minted token's estimated expiry ----------
+#
+# setup-token prints an opaque credential nothing can introspect, so the boot
+# report's only handle on its ~1-year death is the recorded mint date. The
+# failure this guards against is the same silent one as the file's: a working
+# deployment that dies in a year with empty stderr and no warning anywhere.
+
+
+def _minted(days_ago: int) -> str:
+    import datetime
+    import time
+
+    return (datetime.date.fromtimestamp(time.time()) - datetime.timedelta(days=days_ago)).isoformat()
+
+
+def test_minted_date_gives_the_env_token_an_expiry_estimate(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oat-test")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN_MINTED", _minted(10))
+    status = read_credential_status()
+    assert status.kind == "env-token"
+    assert status.expires_in is not None and status.expires_in > 300 * 86400
+    assert not status.expired and not status.short_lived
+    assert "~1y" in status.describe()
+
+
+def test_minted_token_warns_inside_the_last_month(monkeypatch, caplog):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oat-test")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN_MINTED", _minted(350))
+    status = read_credential_status()
+    assert status.short_lived and not status.expired
+    with caplog.at_level(logging.INFO, logger="claude_wrapper.config"):
+        log_credential_status("Claude", Path("/nonexistent/creds.json"))
+    # The remedy is a new mint, not a re-login — the generic short-lived text
+    # would send the operator to /login, which renews nothing here.
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+    assert "setup-token" in caplog.text
+
+
+def test_minted_token_past_a_year_is_presumed_expired(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oat-test")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN_MINTED", _minted(400))
+    status = read_credential_status()
+    assert status.expired
+    assert "EXPIRED" in status.describe()
+
+
+def test_unparseable_minted_date_falls_back_to_unknown_expiry(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oat-test")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN_MINTED", "sometime last spring")
+    status = read_credential_status()
+    assert status.expires_in is None
+    # Unknown is not the same as expiring: neither flag may fire.
+    assert not status.expired and not status.short_lived
+
+
+def test_without_a_minted_date_the_describe_says_how_to_get_one(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oat-test")
+    assert "CLAUDE_CODE_OAUTH_TOKEN_MINTED" in read_credential_status().describe()
 
 
 # ---------- escalation ----------

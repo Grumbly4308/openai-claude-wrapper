@@ -145,11 +145,10 @@ commits.
       exits 0 even though no `login` subcommand exists, so the probe always
       passes and `exec claude login` starts a chat session. — done, it now
       capability-checks and otherwise opens the TUI with the `/login` hint
-- [ ] `entrypoint.sh:7` — `has_saved_login()` is a pure existence test, so an
+- [x] `entrypoint.sh:7` — `has_saved_login()` is a pure existence test, so an
       expired credential counts as "logged in" and the warning never fires.
-      Still open. Low value now that the boot report reads the expiry properly,
-      and it only gates a startup hint — but it is the same class of bug the
-      whole exercise was about: a file's presence taken for a working credential.
+      — done in round 2: it now reads the refresh window and treats a dead
+      file as no login.
 - [ ] `docker-compose.sandbox.yml:204` — `NO_PROXY` has a trailing empty element
       when `SANDBOX_EXTRA_NO_PROXY` is unset. Hygiene only; not a cause of anything.
       Still open.
@@ -186,13 +185,53 @@ token sat there unused. The control is in the record above: the same request
 path succeeded from this same volume credential while its access token was
 fresh, so the difference between working and failing is expiry alone.
 
-**Consequence: a login cannot sustain itself under the sandbox topology.** The
-long-lived `setup-token` credential in `CLAUDE_CODE_OAUTH_TOKEN` is the primary
-credential here, not break-glass, and the tradeoff in "The fix" is settled in its
-favour — it suppresses a file refresh that was never going to fire. Step 2 above
-should be read in reverse: put the token back in `.env`. The remaining question
-is not whether to use it but why renewal is blocked, which the
-`CLAUDE_CODE_PROXY_RESOLVES_HOSTS` experiment below would answer.
+**Consequence: a login cannot sustain itself under the sandbox topology** — on
+its own. The conclusion this section first drew (long-lived token as primary,
+step 2 in reverse) held for a few hours; "The fix, round 2" below supersedes
+it by renewing the login from outside the sandbox, which restores the login as
+primary and the token as break-glass. The remaining question about *why*
+in-agent renewal is blocked is still the `CLAUDE_CODE_PROXY_RESOLVES_HOSTS`
+experiment below.
+
+## The fix, round 2 (2026-08-11): log in once, run forever
+
+The measurement above proved renewal fails *from the agent's network
+position* — but the bootstrap `/login` proved the same CLI renews the same
+volume fine *from ordinary networking*. Those two facts compose: refresh does
+not have to happen where the agent is, only into the volume the agent reads.
+
+**`claude-refresher`** is that composition as a service: same image, same
+`claude-home` volume mounted writable, sitting on the egress network with env
+credentials pinned empty, watching `expiresAt` and spending one minimal CLI
+turn whenever the access token drops below ~4h. The static token goes back to
+break-glass — now with `CLAUDE_CODE_OAUTH_TOKEN_MINTED` so its own ~1-year
+death gets a boot warning instead of a silent outage. `console.anthropic.com`
+is also on the allowlist now, so in-agent renewal gets a fair retest, but
+nothing depends on it working.
+
+### Rollout checklist (live stack)
+
+- [ ] Take the env token back out of `.env` (keep it in
+      `~/.claude-backup-token`) — while it is set, every CLI ignores the file
+      and the refresher refuses to start
+- [ ] Add `CLAUDE_CODE_OAUTH_TOKEN_MINTED=<the day you minted it>` while
+      you're in there, for the day you break the glass
+- [ ] `docker-compose -f docker-compose.sandbox.yml up -d --build --force-recreate`
+      (`--build`: the entrypoint gained the refresher role)
+- [ ] Watch the first renewal: `podman logs -f claude-refresher`. The current
+      volume credential — access expired, refresh good to Sep 9 — is the
+      perfect test case: the first pass should revive it with **no re-login**
+- [ ] `~/credcheck.sh` → `in force : volume credential`, access climbing back
+      toward 8h
+- [ ] One real turn through `localhost:8000/v1/chat/completions`
+- [ ] Optional: `tools/credential_refresh_test.sh` to see whether the
+      allowlist entry made in-agent refresh work too — interesting, not
+      required
+- [ ] Over the next weeks, check the refresher's log for whether
+      `refreshTokenExpiresAt` rolls forward. If it does, the login is
+      indefinite and this file is finished. If it is a hard 30-day wall, the
+      refresher's log and the boot report both warn a week out, and a monthly
+      `/login` via `run --rm -it claude-refresher claude` is the whole ritual
 
 ## Open questions
 

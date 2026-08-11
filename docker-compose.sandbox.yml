@@ -1,4 +1,4 @@
-# Sandboxed topology — three containers, one inbound door:
+# Sandboxed topology — four containers, one inbound door:
 #
 #   [clients] ──> claude-wrapper (FastAPI — the ONLY published port)
 #                     │
@@ -7,6 +7,11 @@
 #                     │        │
 #                     │        │  proxied egress only (HTTP(S)_PROXY)
 #                     └───────>└──> squid ──> egress network ──> allowlist hosts
+#
+#   claude-refresher (egress network, no inbound surface) ──> claude-home volume
+#                     keeps the shared login's OAuth token renewed — the agent
+#                     cannot do this through the proxy (measured; see the
+#                     service's own comment)
 #
 # The agent container — where model-driven tool use actually executes — sits on
 # an internal network with no external route. Its only way out is Squid, which
@@ -34,11 +39,14 @@
 #     and inbox need a `:z` suffix, or the container is denied access to them.
 #     Left off here because relabeling touches files in your checkout.
 #
-# One-time CLI auth happens in the AGENT container (the CLI runs there). Prefer
-# the long-lived token: the interactive login's OAuth callback cannot complete
-# through the allowlist proxy, and its shorter-lived token only stays valid
-# while the CLI runs often enough to refresh it.
-#   docker compose -f docker-compose.sandbox.yml run --rm -it claude-agent setup-token
+# One-time CLI auth CANNOT happen in the agent container — no OAuth flow
+# completes through the allowlist proxy (README "First-time login"). Bootstrap
+# the login once from a container with ordinary networking and the volume
+# mounted; the claude-refresher service keeps it renewed from there:
+#   docker compose -f docker-compose.sandbox.yml run --rm -it claude-refresher claude
+#   # type /login at the prompt, complete the flow, /exit
+# The alternative is a ~1-year token from `setup-token` in .env — static, and
+# it stops the CLI (and the refresher) renewing any login in the volume.
 #
 # Feature caveats vs the single-container layout (see README "Sandboxed
 # deployment"): first-use model downloads for /v1/audio and /v1/embeddings
@@ -92,6 +100,7 @@ services:
       # and its features are unchanged by the sandbox.
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:-}"
+      CLAUDE_CODE_OAUTH_TOKEN_MINTED: "${CLAUDE_CODE_OAUTH_TOKEN_MINTED:-}"
       CLAUDE_WRAPPER_API_KEYS: "${CLAUDE_WRAPPER_API_KEYS:-}"
       CLAUDE_WRAPPER_PUBLIC_BASE_URL: "${CLAUDE_WRAPPER_PUBLIC_BASE_URL:-}"
       CLAUDE_WRAPPER_DERIVE_BASE_URL: "${CLAUDE_WRAPPER_DERIVE_BASE_URL:-on}"
@@ -190,6 +199,7 @@ services:
       # CLI credentials (only needed if you skip the interactive login).
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:-}"
+      CLAUDE_CODE_OAUTH_TOKEN_MINTED: "${CLAUDE_CODE_OAUTH_TOKEN_MINTED:-}"
 
       # THE sandbox integration: this container sits on an internal network,
       # so these proxy vars are the only route out. The runner copies its
@@ -217,8 +227,10 @@ services:
       OPENWEBUI_DEFAULT_COLLECTION: "${OPENWEBUI_DEFAULT_COLLECTION:-}"
     volumes:
       - claude-workspace:/data/workspace
-      # The CLI's own state and credentials live HERE (writable); log in with:
-      #   docker compose -f docker-compose.sandbox.yml run --rm -it claude-agent login
+      # The CLI's own state and credentials live HERE (writable). Do NOT try
+      # to log in via this service — no OAuth flow completes behind the proxy.
+      # Bootstrap via the refresher (which has ordinary networking):
+      #   docker compose -f docker-compose.sandbox.yml run --rm -it claude-refresher claude
       - claude-home:/home/claude/.claude
       # Host drop folder: files are read by the CLI, which runs in this
       # container — so the inbox mounts here, not on the API.
@@ -231,6 +243,56 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  claude-refresher:
+    # Keeps the volume login alive so the agent never has to. Measured fact
+    # (tools/credential_refresh_test.sh, 2026-08-11): the CLI cannot renew its
+    # OAuth token through the allowlist proxy, so a login exercised only
+    # in-sandbox dies ~8h after its last renewal — every turn then fails with
+    # `claude exited 1:` and empty stderr. This service runs the same CLI
+    # against the same claude-home volume from ordinary networking (the
+    # position the first-time /login already works from) and spends one
+    # minimal turn whenever the access token nears expiry.
+    #
+    # Security posture: it runs no agent code, executes no model-driven tool
+    # use, and accepts no inbound connections — trusted plumbing, which is why
+    # direct egress is acceptable here and never on claude-agent. Idle it is a
+    # sleep loop; its only cost is a few one-word turns a day.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CLAUDE_UID: "${CLAUDE_UID:-1000}"
+        CLAUDE_GID: "${CLAUDE_GID:-1000}"
+    image: claude-wrapper:latest
+    container_name: claude-refresher
+    restart: unless-stopped
+    user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["refresher"]
+    environment:
+      # Pinned empty ON PURPOSE — not wired to .env. An environment credential
+      # makes the CLI ignore the volume login, and this service exists only to
+      # renew that login; with either set it would burn turns renewing
+      # nothing. The entrypoint refuses to start if they leak in anyway.
+      ANTHROPIC_API_KEY: ""
+      CLAUDE_CODE_OAUTH_TOKEN: ""
+      # How often to look at the credential file, the remaining-validity floor
+      # that triggers a renewal turn, and the back-off after a turn that did
+      # not move the expiry (the CLI may decline to refresh a still-valid
+      # token — without the back-off that is a turn burned every check).
+      CLAUDE_REFRESH_CHECK_SECONDS: "${CLAUDE_REFRESH_CHECK_SECONDS:-900}"
+      CLAUDE_REFRESH_BELOW_SECONDS: "${CLAUDE_REFRESH_BELOW_SECONDS:-14400}"
+      CLAUDE_REFRESH_RETRY_SECONDS: "${CLAUDE_REFRESH_RETRY_SECONDS:-3600}"
+    volumes:
+      # Writable on purpose: renewing the token means rewriting
+      # .credentials.json for every reader of this volume.
+      - claude-home:/home/claude/.claude
+    networks:
+      - egress
 
   squid:
     image: docker.io/ubuntu/squid:latest

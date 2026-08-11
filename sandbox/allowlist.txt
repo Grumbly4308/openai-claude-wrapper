@@ -16,6 +16,12 @@ claude.ai
 claude.com
 code.claude.com
 platform.claude.com
+# OAuth token renewal talks to the console. Absent from this list a login can
+# bootstrap (that flow runs outside the sandbox) but never renew from inside
+# it. Whether renewal works through the proxy even WITH this entry is open —
+# tools/credential_refresh_test.sh settles it for your stack; the
+# claude-refresher service does not depend on the answer.
+console.anthropic.com
 downloads.claude.ai
 bridge.claudeusercontent.com
 mcp-proxy.anthropic.com

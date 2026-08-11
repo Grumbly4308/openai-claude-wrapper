@@ -1248,14 +1248,26 @@ Note what is *not* the problem: `claude-home` is mounted **writable** on
 `claude-agent` (it is read-only only on `claude-wrapper`), so the volume is not
 what blocks a login aimed at the agent.
 
-The reliable approach is to do the one-time login in a throwaway container with
-ordinary networking, writing into the same volume the agent reads. This is a
-legitimate bootstrap, not a workaround: the sandbox exists to constrain
-model-driven tool use, not the operator's initial setup.
+The reliable approach is to do the one-time login in a container with ordinary
+networking, writing into the same volume the agent reads. This is a legitimate
+bootstrap, not a workaround: the sandbox exists to constrain model-driven tool
+use, not the operator's initial setup. The `claude-refresher` service is
+already in exactly that position — ordinary networking, the volume mounted
+writable, env credentials pinned empty — so borrow it and compose resolves the
+volume for you:
 
-Get the volume name from the running container rather than guessing it — a
-`-v` naming a volume that does not exist **creates an empty one**, so the login
-succeeds into a volume nothing reads:
+```bash
+docker compose -f docker-compose.sandbox.yml run --rm -it claude-refresher claude
+# type /login at the prompt, complete the flow, then /exit
+```
+
+After that, the running `claude-refresher` keeps the login renewed
+indefinitely — see [Keeping the credential alive](#keeping-the-credential-alive).
+You log in once.
+
+If you'd rather use a raw container, get the volume name from the running
+agent rather than guessing it — a `-v` naming a volume that does not exist
+**creates an empty one**, so the login succeeds into a volume nothing reads:
 
 ```bash
 podman inspect claude-agent \
@@ -1288,21 +1300,24 @@ an environment credential wins and then nothing renews the file underneath it.
   volume so it survives `down`/`up`, rebuilds and reboots. The access token
   lasts hours and the CLI renews it from a refresh token — good for ~30 days —
   every time it runs with working egress. This is the only credential that
-  sustains itself, and the only one that lives in the volume. **It does not
-  sustain itself under the sandbox topology**, where the agent's only egress is
-  the allowlisting proxy: renewal has been measured there and does not happen,
-  so a login lapses after a few hours and every turn then fails. Prefer a
-  long-lived token for that deployment; `tools/credential_refresh_test.sh`
-  re-checks the finding against your own stack in about a minute.
+  sustains itself, and the only one that lives in the volume. The agent
+  itself **cannot renew it under the sandbox topology** — renewal through the
+  allowlist proxy has been measured and does not happen
+  (`tools/credential_refresh_test.sh` re-checks that against your own stack in
+  about a minute) — which is why the sandbox compose file runs a
+  `claude-refresher` service: same CLI, same volume, ordinary networking,
+  renewing the token whenever it nears expiry. With that service up, log in
+  once and the login sustains itself.
 - **Long-lived token (static).** `claude setup-token` prints a token valid for
   about a year. It is **not** written to the volume — the output is meant for
-  `CLAUDE_CODE_OAUTH_TOKEN`. Nothing renews it and nothing can read its expiry,
-  so on a deployment where a login renews itself this is best kept as a
-  break-glass credential rather than the primary. Under the sandbox topology,
-  where nothing renews a login either, it is the primary. Note that setting it
-  stops the CLI refreshing any login in the volume, which then decays silently;
-  the boot report warns when it detects this. That warning is the right default
-  but is misleading in the sandbox, where the refresh it protects never fires.
+  `CLAUDE_CODE_OAUTH_TOKEN`. Nothing renews it and nothing can read its
+  expiry, so keep it as the break-glass credential rather than the primary,
+  and record its mint date as `CLAUDE_CODE_OAUTH_TOKEN_MINTED=YYYY-MM-DD` in
+  `.env` — that date is the boot report's only way to warn you in the last
+  month of the token's ~1 year instead of letting the deployment die silently.
+  Note that setting the token stops the CLI (and the refresher) renewing any
+  login in the volume, which then decays; the boot report warns when it
+  detects this.
 - **Env vars.** Set `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` in `.env`.
   The wrapper does not arbitrate between these and a persisted login — it only
   reports what it found. Precedence is decided by the Claude Code CLI (and,
@@ -1342,14 +1357,29 @@ Failed to authenticate. API Error: 401 OAuth access token has expired.
 ```
 
 which the wrapper surfaces as `claude failed: claude exited 1:` — empty stderr,
-no mention of credentials. Three things keep that from happening:
+no mention of credentials. Four things keep that from happening:
 
-1. **Mint a long-lived token** with `setup-token` rather than using the desktop
-   `login` flow. It does not depend on the refresh cycle at all.
-2. **Exercise the CLI on a timer** if you are on a short-lived login. A daily
-   throwaway invocation is enough to keep the refresh current — but only where
-   renewal works at all, which under the sandbox topology it does not, so there
-   the timer keeps nothing alive and option 1 is the answer:
+1. **The `claude-refresher` service** (sandbox topology — on by default, no
+   setup). The agent cannot renew the login through the allowlist proxy
+   (measured; `tools/credential_refresh_test.sh`), so this sidecar renews it
+   from ordinary networking into the shared volume: it watches
+   `.credentials.json` and spends one minimal CLI turn whenever the access
+   token drops below ~4h. It logs both expiries on every pass —
+   `podman logs claude-refresher` is the place to see renewal actually happen,
+   and to learn whether `refreshTokenExpiresAt` rolls forward (if it does, one
+   login lasts forever; if not, expect a re-login every ~30 days and the boot
+   report will say so a week out). It only helps when the file credential is
+   in force: an env token in `.env` makes the CLI ignore the volume entirely.
+2. **Mint a long-lived token** with `setup-token` rather than using the desktop
+   `login` flow. It does not depend on the refresh cycle at all. Record
+   `CLAUDE_CODE_OAUTH_TOKEN_MINTED` alongside it so its own ~1-year death gets
+   a warning instead of a silent outage.
+3. **Exercise the CLI on a timer** if you are on a short-lived login in the
+   **single-container** layout, where the CLI has ordinary egress. A daily
+   throwaway invocation is enough to keep the refresh current. (Under the
+   sandbox topology this is exactly what the refresher service does, from a
+   container that can actually reach the OAuth endpoint — a timer aimed at
+   `claude-agent` keeps nothing alive there.)
 
    ```bash
    cat > ~/.config/systemd/user/claude-token-refresh.service <<'EOF'
@@ -1358,7 +1388,7 @@ no mention of credentials. Three things keep that from happening:
 
    [Service]
    Type=oneshot
-   ExecStart=/usr/bin/podman exec claude-agent claude -p hi --output-format json
+   ExecStart=/usr/bin/podman exec claude-wrapper claude -p hi --output-format json
    EOF
 
    cat > ~/.config/systemd/user/claude-token-refresh.timer <<'EOF'
@@ -1379,7 +1409,7 @@ no mention of credentials. Three things keep that from happening:
 
    `loginctl enable-linger "$USER"` must be on or the timer stops when you log
    out — the same prerequisite the podman socket has.
-3. **Read the boot log.** Every role reports the credential it will actually
+4. **Read the boot log.** Every role reports the credential it will actually
    authenticate with, at a severity that matches how much trouble you are in:
 
    ```

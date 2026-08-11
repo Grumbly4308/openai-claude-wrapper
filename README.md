@@ -1300,14 +1300,15 @@ an environment credential wins and then nothing renews the file underneath it.
   volume so it survives `down`/`up`, rebuilds and reboots. The access token
   lasts hours and the CLI renews it from a refresh token — good for ~30 days —
   every time it runs with working egress. This is the only credential that
-  sustains itself, and the only one that lives in the volume. The agent
-  itself **cannot renew it under the sandbox topology** — renewal through the
-  allowlist proxy has been measured and does not happen
-  (`tools/credential_refresh_test.sh` re-checks that against your own stack in
-  about a minute) — which is why the sandbox compose file runs a
-  `claude-refresher` service: same CLI, same volume, ordinary networking,
-  renewing the token whenever it nears expiry. With that service up, log in
-  once and the login sustains itself.
+  sustains itself, and the only one that lives in the volume. Renewal is a
+  POST to `platform.claude.com` (allowlisted), and the CLI's refresh client is
+  measured to work through the CONNECT proxy — but renewal only happens when
+  the CLI *runs*, so an idle deployment still drifts past expiry with nothing
+  to renew it. That is why the sandbox compose file runs a `claude-refresher`
+  service: same CLI, same volume, renewing the token whenever it nears expiry
+  whether or not anyone is sending turns. With that service up, log in once
+  and the login sustains itself. (`tools/credential_refresh_test.sh` checks
+  in-agent renewal against your own stack in about a minute.)
 - **Long-lived token (static).** `claude setup-token` prints a token valid for
   about a year. It is **not** written to the volume — the output is meant for
   `CLAUDE_CODE_OAUTH_TOKEN`. Nothing renews it and nothing can read its
@@ -1360,11 +1361,12 @@ which the wrapper surfaces as `claude failed: claude exited 1:` — empty stderr
 no mention of credentials. Four things keep that from happening:
 
 1. **The `claude-refresher` service** (sandbox topology — on by default, no
-   setup). The agent cannot renew the login through the allowlist proxy
-   (measured; `tools/credential_refresh_test.sh`), so this sidecar renews it
-   from ordinary networking into the shared volume: it watches
-   `.credentials.json` and spends one minimal CLI turn whenever the access
-   token drops below ~4h. It logs both expiries on every pass —
+   setup). Renewal happens only when the CLI runs, so an idle deployment
+   expires on schedule no matter how healthy its network path is; this
+   sidecar renews from ordinary networking into the shared volume regardless
+   of traffic and independent of the proxy: it watches `.credentials.json`
+   and spends one minimal CLI turn whenever the access token drops below ~4h.
+   It logs both expiries on every pass —
    `podman logs claude-refresher` is the place to see renewal actually happen,
    and to learn whether `refreshTokenExpiresAt` rolls forward (if it does, one
    login lasts forever; if not, expect a re-login every ~30 days and the boot

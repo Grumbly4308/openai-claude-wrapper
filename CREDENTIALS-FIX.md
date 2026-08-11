@@ -47,8 +47,8 @@ refresh even in principle. Resolved, but it masked problems 1 and 2 throughout.
 
 | Artefact | Where it lives | Lifetime | What renews it |
 | --- | --- | --- | --- |
-| Access token | `.credentials.json` → `expiresAt` | ~8 hours | CLI, from the refresh token, when it runs |
-| Refresh token | `.credentials.json` → `refreshTokenExpiresAt` | ~30 days (yours: Sep 9) | Unknown — see Open questions |
+| Access token | `.credentials.json` → `expiresAt` | ~8 hours | CLI, from the refresh token, when it runs — **but not inside the sandbox; measured, see Outcome** |
+| Refresh token | `.credentials.json` → `refreshTokenExpiresAt` | ~30 days (yours: Sep 9) | Nothing, since the renewal it would drive never fires here |
 | Setup token | printed to stdout; now in `.env` | ~1 year | Nothing; static until it expires |
 
 There is no contradiction. The 8h and 30d numbers describe the **old
@@ -114,40 +114,44 @@ questions before concluding anything.
 
 ### 3. Prove the refresh cycle works
 
-- [ ] Record the current `expiresAt`
-- [ ] Send a real CLI turn (not a `tools` request — those bypass the CLI):
-      `curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}'`
-- [ ] Re-read `expiresAt`. **Moved forward → the cycle works and you are done.**
-- [ ] Also check whether `refreshTokenExpiresAt` moved — that determines whether
-      you ever need to log in again (see Open questions)
-- [ ] If `expiresAt` did not move, run the experiment in Open questions
+- [x] Run `tools/credential_refresh_test.sh`, which forces the question in one
+      go rather than waiting ~8h for a natural expiry
+- [x] **Result: it does not work here.** See Outcome. Steps 1 and 2 therefore do
+      not give you a self-sustaining deployment, and the long-lived token is the
+      primary credential under the sandbox topology, not the break-glass one.
 
 ### 4. Documentation corrections
 
-- [ ] `README.md:1237` — the read-only mount is not why login fails; the volume is writable on the agent
-- [ ] `README.md:1240` — `setup-token` fails inside the sandbox exactly as `login` does; it is not a workaround for it
-- [ ] `README.md:1268`, `.env.example:50`, `entrypoint.sh:84` — `setup-token` prints a token for the environment; it does not reliably populate the credentials volume
-- [ ] `README.md:1489` — troubleshooting row should read "any OAuth flow", not "interactive login"
-- [ ] `README.md:1249` — the throwaway-container recipe must show `-v <volume>:/home/claude/.claude`; without it the credential is discarded
-- [ ] Document that an env token suppresses file refresh — the single most
+All done in `7e57523` / `4f0bfbc`; line numbers below are from before those
+commits.
+
+- [x] `README.md:1237` — the read-only mount is not why login fails; the volume is writable on the agent
+- [x] `README.md:1240` — `setup-token` fails inside the sandbox exactly as `login` does; it is not a workaround for it
+- [x] `README.md:1268`, `.env.example:50`, `entrypoint.sh:84` — `setup-token` prints a token for the environment; it does not reliably populate the credentials volume
+- [x] `README.md:1489` — troubleshooting row should read "any OAuth flow", not "interactive login"
+- [x] `README.md:1249` — the throwaway-container recipe must show `-v <volume>:/home/claude/.claude`; without it the credential is discarded
+- [x] Document that an env token suppresses file refresh — the single most
       surprising behaviour in this system, currently written down nowhere
 
 ### 5. Code fixes
 
-- [ ] `src/config.py:605` — `read_credential_status()` returns on the env token
+- [x] `src/config.py:605` — `read_credential_status()` returns on the env token
       *before* opening the file, so it cannot warn that a volume credential is
-      decaying underneath it. Report both.
-- [ ] `src/config.py` — the file branch reads only `expiresAt`; the number that
+      decaying underneath it. Report both. — done, `log_credential_status()`
+      now warns about the shadowed login
+- [x] `src/config.py` — the file branch reads only `expiresAt`; the number that
       matters for "do I need to log in again" is `refreshTokenExpiresAt`
-- [ ] `entrypoint.sh:76-79` — **`cmd_login` is broken.** `claude login --help`
+- [x] `entrypoint.sh:76-79` — **`cmd_login` is broken.** `claude login --help`
       exits 0 even though no `login` subcommand exists, so the probe always
-      passes and `exec claude login` starts a chat session. Replace the probe
-      with a real capability check (`claude --help | grep -qw login`), or drop
-      the subcommand and document the TUI `/login` flow instead.
-- [ ] `entrypoint.sh:7` — `has_saved_login()` is a pure existence test, so an
-      expired credential counts as "logged in" and the warning never fires
+      passes and `exec claude login` starts a chat session. — done, it now
+      capability-checks and otherwise opens the TUI with the `/login` hint
+- [x] `entrypoint.sh:7` — `has_saved_login()` is a pure existence test, so an
+      expired credential counts as "logged in" and the warning never fires.
+      — done in round 2: it now reads the refresh window and treats a dead
+      file as no login.
 - [ ] `docker-compose.sandbox.yml:204` — `NO_PROXY` has a trailing empty element
       when `SANDBOX_EXTRA_NO_PROXY` is unset. Hygiene only; not a cause of anything.
+      Still open.
 
 ## Outcome (2026-08-11)
 
@@ -161,48 +165,135 @@ Steps 1 and 2 are done and verified on the live stack:
   proves the file login works end to end inside the sandbox.
 - Refresh did not fire — expected, with ~8h still on the access token.
 
-**The one open item is the refresh event itself.** Run `~/credcheck.sh` after
-the access token has aged past ~8h of use:
+**The refresh event has now been measured, and it does not happen.** The volume
+login was left to age; by 03:42 its access token had lapsed on its own — the
+first sign, since a working refresh would have renewed it during ordinary use.
+`tools/credential_refresh_test.sh` then forced the question with a valid refresh
+token 29.1 days from expiry:
 
-- `mtime` moves and `access` resets toward 8h → refresh works in-sandbox; this
-  whole problem is closed and no long-lived token is needed.
-- `access` goes negative and turns start failing with 401 → refresh is blocked
-  inside the sandbox. Fall back to the backup token, and the
-  `CLAUDE_CODE_PROXY_RESOLVES_HOSTS` hypothesis below becomes the thing to test.
+- the turn failed with `claude failed: claude exited 1:` — the empty-stderr 401
+  signature;
+- `.credentials.json` was **not rewritten**: after the turn its mtime was still
+  the test's own edit, and `expiresAt` still the value the test wrote.
+
+The second point is the finding. A refresh either rewrites that file or did not
+occur, and nothing rewrote it. Two limits on how far that stretches: the CLI's
+exit code is opaque, so this shows the CLI did not renew rather than naming
+which hop refused; and the credential was already expired when the test began,
+so the turn was doomed either way — what the test adds is that a healthy refresh
+token sat there unused. The control is in the record above: the same request
+path succeeded from this same volume credential while its access token was
+fresh, so the difference between working and failing is expiry alone.
+
+**Consequence: a login cannot sustain itself under the sandbox topology** — on
+its own. The conclusion this section first drew (long-lived token as primary,
+step 2 in reverse) held for a few hours; "The fix, round 2" below supersedes
+it by renewing the login from outside the sandbox, which restores the login as
+primary and the token as break-glass. The remaining question about *why*
+in-agent renewal is blocked is still the `CLAUDE_CODE_PROXY_RESOLVES_HOSTS`
+experiment below.
+
+## The fix, round 2 (2026-08-11): log in once, run forever
+
+The measurement above proved renewal fails *from the agent's network
+position* — but the bootstrap `/login` proved the same CLI renews the same
+volume fine *from ordinary networking*. Those two facts compose: refresh does
+not have to happen where the agent is, only into the volume the agent reads.
+
+**`claude-refresher`** is that composition as a service: same image, same
+`claude-home` volume mounted writable, sitting on the egress network with env
+credentials pinned empty, watching `expiresAt` and spending one minimal CLI
+turn whenever the access token drops below ~4h. The static token goes back to
+break-glass — now with `CLAUDE_CODE_OAUTH_TOKEN_MINTED` so its own ~1-year
+death gets a boot warning instead of a silent outage.
+
+### Rollout checklist (live stack)
+
+- [ ] Take the env token back out of `.env` (keep it in
+      `~/.claude-backup-token`) — while it is set, every CLI ignores the file
+      and the refresher refuses to start
+- [ ] Add `CLAUDE_CODE_OAUTH_TOKEN_MINTED=<the day you minted it>` while
+      you're in there, for the day you break the glass
+- [ ] `docker-compose -f docker-compose.sandbox.yml up -d --build --force-recreate`
+      (`--build`: the entrypoint gained the refresher role)
+- [ ] Watch the first renewal: `podman logs -f claude-refresher`. The current
+      volume credential — access expired, refresh good to Sep 9 — is the
+      perfect test case: the first pass should revive it with **no re-login**
+- [ ] `~/credcheck.sh` → `in force : volume credential`, access climbing back
+      toward 8h
+- [ ] One real turn through `localhost:8000/v1/chat/completions`
+- [ ] Optional: `tools/credential_refresh_test.sh` to see whether the
+      allowlist entry made in-agent refresh work too — interesting, not
+      required
+- [ ] Over the next weeks, check the refresher's log for whether
+      `refreshTokenExpiresAt` rolls forward. If it does, the login is
+      indefinite and this file is finished. If it is a hard 30-day wall, the
+      refresher's log and the boot report both warn a week out, and a monthly
+      `/login` via `run --rm -it claude-refresher claude` is the whole ritual
+
+## Round 3 (2026-08-11): what the CLI's OAuth client actually requires
+
+Measured in a replica of the sandbox's network conditions — external DNS dead
+(`gaierror` on any lookup), egress only via a CONNECT proxy — using a logging
+proxy that records every CONNECT, first refusing them (does the client *reach*
+a proxy?), then chaining to real egress (does the flow *complete*?). Test
+credential: expired access token, deliberately-fake refresh token, so a
+completed round trip shows up as the server rejecting the refresh — proof the
+whole path works without minting anything.
+
+| Flow | CLI | Result |
+| --- | --- | --- |
+| turn + refresh, flag on | 2.1.223 | CONNECT `platform.claude.com` + `api.anthropic.com` arrive at proxy |
+| turn + refresh, flag off | 2.1.223 | same — this runtime's DNS fails in a way node tolerates |
+| turn + refresh, flag on | **2.1.226** | same CONNECTs; chained: real round trip, server rejects the fake token — `Failed to authenticate: OAuth session expired and could not be refreshed` |
+| `setup-token`, flag on | both | stalls at "Opening browser to sign in…" — the interactive flow needs a browser before any OAuth traffic; bootstrap outside the sandbox remains correct |
+| telemetry (datadog) blocked | 2.1.226 | CLI carries on; blocking it is harmless |
+
+**Requirements for in-sandbox token refresh, all of which this stack already
+meets:**
+
+1. `HTTP(S)_PROXY` set — the refresh client honors it (measured, both versions)
+2. `CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` where DNS returns NOTIMP (docker)
+3. CONNECT to `platform.claude.com:443` allowed — allowlisted since `2a5440f`
+4. A refresh token the server still accepts — **the one link the in-stack
+   failure never tested in isolation**
+
+So the measured in-stack refresh failure (Outcome, above) is *not explained by
+the network path*: the same binary completes refresh under stricter conditions
+than the sandbox imposes. The remaining suspects are (4) — refresh tokens
+commonly rotate on use, and that credential had been through several login
+experiments — or something stack-local answering the CONNECT. One rerun
+separates them; watch Squid while the test forces a refresh:
+
+```bash
+podman logs -f claude-squid 2>/dev/null | grep -i "platform.claude.com" &
+tools/credential_refresh_test.sh
+```
+
+- `CONNECT platform.claude.com ... TCP_TUNNEL/200` and still no renewal →
+  the server rejected that refresh token; re-login (fresh token) and rerun —
+  expected to pass, after which the agent renews itself and even the refresher
+  sidecar is just idle-deployment insurance.
+- `TCP_DENIED` → the running Squid is not enforcing the checked-in allowlist;
+  recreate the squid container and rerun.
+- no line at all → the CONNECT never left the agent; compare the agent's env
+  against the replica conditions above.
 
 ## Open questions
 
-**Does the refresh cycle work at all inside the sandbox?** This is the one that
-decides whether goal 1 is achievable. A sub-agent proposed that
-`CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` is itself the cause of
-`Invalid IP address: undefined` — that the flag installs a DNS shim which breaks
-the HTTP client used for OAuth *and* for token refresh, failing before any
-CONNECT. I am reporting this as a **hypothesis, not a finding**: it came from an
-agent that investigated by decompiling the CLI, which is outside what I am
-willing to rely on, and the flag is documented as mandatory for normal runs
-(`README.md:362`).
-
-Test it legitimately, without changing your running stack:
-
-```bash
-podman run --rm -it \
-  -e HTTPS_PROXY=http://squid:3128 -e HTTP_PROXY=http://squid:3128 \
-  --network <the sandbox backend network> \
-  claude-wrapper:latest claude setup-token          # expect the same error
-
-# same again, with the flag explicitly disabled
-podman run --rm -it \
-  -e HTTPS_PROXY=http://squid:3128 -e HTTP_PROXY=http://squid:3128 \
-  -e CLAUDE_CODE_PROXY_RESOLVES_HOSTS= \
-  --network <the sandbox backend network> \
-  claude-wrapper:latest claude setup-token
-```
-
-If the second reaches an OAuth server and the first does not, the hypothesis
-holds — and the consequence is significant: the flag that makes normal runs work
-is the same one that prevents refresh, so login credentials can never
-self-sustain in this topology and the long-lived token is the correct answer
-after all.
+**Refuted for the refresh path — the DNS-shim hypothesis is dead.** A sub-agent
+had proposed that `CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` installs a DNS shim that
+breaks the OAuth HTTP client before any CONNECT. Measured directly (2026-08-11,
+see "Round 3") in a replica of the sandbox's network conditions — external DNS
+dead, egress via CONNECT proxy only — using the deployment's exact CLI version:
+the refresh client honors `HTTP(S)_PROXY`, sends its CONNECT with the flag on
+or off, and completes a real token-refresh round trip against
+`platform.claude.com/v1/oauth/token`. The refresh cycle has **no** unmet
+network requirement in this topology. Whatever failed in the one in-stack
+measurement above, it was not the client and not the flag; the discriminating
+rerun is in Round 3. (`Invalid IP address: undefined` belongs to the
+*interactive* flows, which stall on "Opening browser to sign in…" headless and
+are correctly handled by the outside-the-sandbox bootstrap regardless.)
 
 **Resolved:** `setup-token` does not persist to the credentials volume even when
 one is mounted writable — tested directly. The token is environment-only, so the
@@ -214,10 +305,12 @@ one is mounted writable — tested directly. The token is environment-only, so t
 from the TUI's own auth prompt, not from the `login` subcommand — the two
 failures we treated as one were partly the entrypoint bug.
 
-**Which host does a refresh contact?** Not determinable from this repo; no
-OAuth endpoint appears anywhere in `src/` or `sandbox/`. `console.anthropic.com`
-is absent from the allowlist and is a plausible gap, but that is a suspicion.
-Squid's access log during a refresh is the way to settle it.
+**Resolved: a refresh contacts `platform.claude.com/v1/oauth/token`.** Measured
+two ways: the string sits in the shipped 2.1.223 and 2.1.226 binaries (with no
+mention of `console.anthropic.com` in either — that suspicion was wrong), and a
+live refresh attempt was observed CONNECTing to exactly that host. It has been
+on the allowlist since the sandbox landed (`2a5440f`), so the endpoint was
+never the gap.
 
 **Does `refreshTokenExpiresAt` roll forward on each refresh?** Anthropic-side.
 If it does, a used login is indefinite. If it is a hard 30-day wall, you re-login

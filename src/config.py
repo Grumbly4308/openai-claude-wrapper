@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import logging
@@ -601,7 +602,22 @@ class CredentialStatus:
         if self.kind == "api-key":
             return "ANTHROPIC_API_KEY (no expiry)"
         if self.kind == "env-token":
-            return "CLAUDE_CODE_OAUTH_TOKEN from the environment (expiry not readable here)"
+            if self.expires_in is None:
+                return (
+                    "CLAUDE_CODE_OAUTH_TOKEN from the environment (expiry not "
+                    "readable here — set CLAUDE_CODE_OAUTH_TOKEN_MINTED to track it)"
+                )
+            if self.expired:
+                return (
+                    "CLAUDE_CODE_OAUTH_TOKEN from the environment, presumed EXPIRED "
+                    f"~{_describe_duration(self.expires_in)} ago (minted "
+                    "CLAUDE_CODE_OAUTH_TOKEN_MINTED + ~1y)"
+                )
+            return (
+                "CLAUDE_CODE_OAUTH_TOKEN from the environment, "
+                f"~{_describe_duration(self.expires_in)} of its ~1y left "
+                "(estimated from CLAUDE_CODE_OAUTH_TOKEN_MINTED)"
+            )
         if self.kind == "none":
             return f"NONE — no API key, no env token, and no usable login in {where}"
         if self.expires_in is None:
@@ -651,13 +667,33 @@ def read_file_credential(path: Optional[Path] = None) -> CredentialStatus:
     )
 
 
+def _minted_token_expiry() -> Optional[float]:
+    """Estimated seconds until the env token dies, from its recorded mint date.
+
+    `setup-token` prints an opaque credential: nothing can read its expiry
+    afterwards, so the only warning anyone will ever get is arithmetic on the
+    date it was minted. The CLI describes the token as good for about a year;
+    the estimate is deliberately conservative in wording, not in math.
+    """
+    raw = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN_MINTED", "").strip()
+    if not raw:
+        return None
+    try:
+        minted = datetime.date.fromisoformat(raw)
+    except ValueError:
+        return None
+    return (
+        time.mktime(minted.timetuple()) + 365 * 86400 - time.time()
+    )
+
+
 def read_credential_status(path: Optional[Path] = None) -> CredentialStatus:
     """Inspect the credential in force, without validating it against the API."""
     where = path or CREDENTIALS_FILE
     if os.environ.get("ANTHROPIC_API_KEY", "").strip():
         return CredentialStatus("api-key", path=where)
     if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
-        return CredentialStatus("env-token", path=where)
+        return CredentialStatus("env-token", _minted_token_expiry(), path=where)
     return read_file_credential(where)
 
 
@@ -684,13 +720,24 @@ def log_credential_status(where: str, path: Optional[Path] = None) -> Credential
             status.describe(),
         )
     elif status.short_lived:
-        log.warning(
-            "%s credentials: %s. Renewal depends on the CLI running with working "
-            "egress before then; if it lapses you need a fresh interactive login "
-            "(the CLI's /login — `claude login` is not an auth command).",
-            where,
-            status.describe(),
-        )
+        if status.kind == "env-token":
+            # Nothing renews a minted token — the only remedy is a new one,
+            # and the point of warning a month out is having time to mint it.
+            log.warning(
+                "%s credentials: %s. Nothing renews this token — mint a "
+                "replacement with `setup-token` and update "
+                "CLAUDE_CODE_OAUTH_TOKEN (and its _MINTED date) before it dies.",
+                where,
+                status.describe(),
+            )
+        else:
+            log.warning(
+                "%s credentials: %s. Renewal depends on the CLI running with working "
+                "egress before then; if it lapses you need a fresh interactive login "
+                "(the CLI's /login — `claude login` is not an auth command).",
+                where,
+                status.describe(),
+            )
     else:
         log.info("%s credentials: %s", where, status.describe())
 

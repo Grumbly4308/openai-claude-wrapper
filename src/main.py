@@ -23,6 +23,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import download_tokens, tool_bridge
+from .capabilities import resolve_profile
 from .config import (
     SETTINGS,
     advertised_models,
@@ -185,6 +186,12 @@ async def _startup() -> None:
     else:
         log.info("agent execution: local subprocess (%s)", SETTINGS.claude_bin)
 
+    # Resolve every model's capability profile now so a bad profile file fails
+    # the boot loudly instead of 500ing the first /v1/models call. Logged so
+    # the effective per-model gating is visible without hitting the API.
+    for m in models:
+        log.info("capabilities[%s]: %s", m, ", ".join(sorted(c.value for c in resolve_profile(m))))
+
     # Surface KB passthrough state at boot. The OpenWebUI addendum is silently
     # skipped when OPENWEBUI_BASE_URL is unset, which makes "Claude can't see the
     # KB" hard to diagnose — so make it explicit in the logs either way.
@@ -326,10 +333,15 @@ async def healthz() -> dict:
     return {"status": "ok"}
 
 
+def _model_info(model_id: str, now: int) -> ModelInfo:
+    caps = sorted(c.value for c in resolve_profile(model_id))
+    return ModelInfo(id=model_id, created=now, capabilities=caps)
+
+
 @app.get("/v1/models", response_model=ModelList, dependencies=[Depends(auth_dependency)])
 async def list_models() -> ModelList:
     now = int(time.time())
-    return ModelList(data=[ModelInfo(id=m, created=now) for m in advertised_models()])
+    return ModelList(data=[_model_info(m, now) for m in advertised_models()])
 
 
 @app.get("/v1/models/{model_id}", dependencies=[Depends(auth_dependency)])
@@ -337,7 +349,7 @@ async def retrieve_model(model_id: str) -> ModelInfo:
     base, _effort = split_model_effort(model_id)
     if base not in supported_models():
         raise HTTPException(status_code=404, detail=f"unknown model: {model_id}")
-    return ModelInfo(id=model_id, created=int(time.time()))
+    return _model_info(model_id, int(time.time()))
 
 
 @app.get("/v1/usage/{session_id}", dependencies=[Depends(auth_dependency)])
@@ -593,7 +605,7 @@ async def _tool_bridge_completion(req: ChatCompletionRequest):
             headers=_SSE_HEADERS,
         )
 
-    result = await tool_bridge.complete(req, run_model)
+    result = await tool_bridge.complete(req, run_model, session_key)
     if USAGE_LEDGER.enabled:
         await USAGE_LEDGER.record(session_key, result.input_tokens + result.output_tokens)
 

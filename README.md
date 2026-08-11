@@ -1257,6 +1257,63 @@ can still override this; those are account-side and cannot be set by the wrapper
 
 ---
 
+## Per-model capability profiles
+
+The wrapper decides per model what is exposed and enforced, from one profile
+registry (`src/capabilities.py`). Every `/v1/models` entry carries its
+resolved profile as a `capabilities` list — the machine-readable source of
+truth for UIs and sync tooling. **Absent any configuration this whole feature
+is a no-op**: the built-in default reproduces the wrapper's classic behavior,
+with one deliberate exception (terminal, below).
+
+Capabilities: `vision`, `file_upload`, `web_search`, `code_interpreter`,
+`terminal`, `memory`, `citations`, `image_generation`, `sub_agents`,
+`client_tools`, `time_calc`.
+
+| Variable | Meaning |
+| --- | --- |
+| `CLAUDE_WRAPPER_MODEL_PROFILES` | Path to the profile JSON (see `deploy/model-profiles.example.json`). Invalid config fails startup loudly. |
+| `CLAUDE_WRAPPER_MODEL_PROFILE_OVERRIDES` | Inline JSON, same schema, applied after the file. |
+| `CLAUDE_WRAPPER_EXPOSE_TERMINAL` | **Default off.** Hard gate for `terminal`: until set, the capability is masked out of every profile — a profile file alone can never hand a chat UI a shell — and chat runs carry `--disallowedTools Bash`. Set it to restore the classic everything-on behavior. |
+| `CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH` | Default off. Lets the tool bridge inject Anthropic's server-side web search for `web_search`-profiled models (new billing surface, hence its own opt-in). |
+| `CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS` | Hybrid-loop round cap per turn (default 8). |
+| `CLAUDE_WRAPPER_IMAGE_BACKEND_URL` / `_KEY` / `_MODEL` | Optional OpenAI-compatible image backend; configured, `/v1/images/generations` proxies there instead of the SVG delegation path. |
+
+Profile schema — `default` replaces the built-in set; `models` entries apply
+in order (literal match first, then glob), each either replacing
+(`capabilities`) or delta-ing (`add`/`remove`); effort and `[1m]` variants
+inherit their base model:
+
+```json
+{
+  "models": [
+    {"match": "claude-haiku-*", "remove": ["sub_agents", "web_search"]},
+    {"match": "claude-opus-5", "add": ["memory", "time_calc"]}
+  ]
+}
+```
+
+Enforcement is layered per path:
+
+- **CLI (chat) runs** translate the profile into `--disallowedTools`
+  (`terminal`→Bash, `web_search`→WebSearch/WebFetch, `sub_agents`→Task).
+  Internal delegation runs (audio/images/embeddings do their work through
+  Bash) are never gated.
+- **Tool bridge**: a model without `client_tools` answers a tools request
+  with a 400 naming the denied tools. Profiled server-side tools (web
+  search, code execution) are injected after the client's. Wrapper-owned
+  tools — `memory` (per-conversation markdown files under
+  `<data>/memory/`, the same file-path model Claude Code itself uses) and
+  `time_calc` — execute inside the bridge's hybrid loop and are invisible
+  to the client. They activate only on tools-carrying requests; tool-less
+  chats take the CLI path, which has its own built-ins.
+
+**OpenWebUI**: OpenWebUI doesn't map pulled model metadata into its
+capability toggles, so `deploy/openwebui_capability_sync.py` — run **on the
+OpenWebUI host** (cron or startup hook) — pulls the wrapper's `/v1/models`
+and writes the toggles through OpenWebUI's local admin API. The wrapper never
+contacts OpenWebUI.
+
 ## Auth
 
 There are two independent auth layers.

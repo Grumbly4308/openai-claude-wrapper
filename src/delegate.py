@@ -72,6 +72,9 @@ class Delegator:
             prompt=prompt,
             session_key=session_key,
             model=model,
+            # Delegation does its work through Claude Code's Bash — profile
+            # gating applies to user-facing chat runs only.
+            capability_gated=False,
         )
         outputs_dir = workspace / "outputs"
         outputs = sorted(p for p in outputs_dir.rglob("*") if p.is_file()) if outputs_dir.exists() else []

@@ -126,6 +126,24 @@ services:
       OPENWEBUI_BASE_URL: "${OPENWEBUI_BASE_URL:-}"
       OPENWEBUI_API_KEY: "${OPENWEBUI_API_KEY:-}"
       OPENWEBUI_DEFAULT_COLLECTION: "${OPENWEBUI_DEFAULT_COLLECTION:-}"
+
+      # ---- Per-model capability profiles (see README + TOOL-PROFILES-ROADMAP.md) ----
+      # Container-internal path to the profile JSON. The inbox is the easiest
+      # host-visible mount: drop profiles.json in ${CLAUDE_INBOX_DIR:-./inbox}
+      # and set this to /data/inbox/profiles.json. Blank = built-in defaults.
+      CLAUDE_WRAPPER_MODEL_PROFILES: "${CLAUDE_WRAPPER_MODEL_PROFILES:-}"
+      CLAUDE_WRAPPER_MODEL_PROFILE_OVERRIDES: "${CLAUDE_WRAPPER_MODEL_PROFILE_OVERRIDES:-}"
+      # Hard gate for the terminal capability (default off): until set, chat
+      # runs carry --disallowedTools Bash and no model advertises `terminal`.
+      CLAUDE_WRAPPER_EXPOSE_TERMINAL: "${CLAUDE_WRAPPER_EXPOSE_TERMINAL:-}"
+      # Lets the tool bridge inject Anthropic server-side web search for
+      # web_search-profiled models (a new billing surface, hence its own gate).
+      CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH: "${CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH:-}"
+      CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS: "${CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS:-8}"
+      # Optional OpenAI-compatible image backend for /v1/images/generations.
+      CLAUDE_WRAPPER_IMAGE_BACKEND_URL: "${CLAUDE_WRAPPER_IMAGE_BACKEND_URL:-}"
+      CLAUDE_WRAPPER_IMAGE_BACKEND_KEY: "${CLAUDE_WRAPPER_IMAGE_BACKEND_KEY:-}"
+      CLAUDE_WRAPPER_IMAGE_BACKEND_MODEL: "${CLAUDE_WRAPPER_IMAGE_BACKEND_MODEL:-}"
     volumes:
       # Uploads, generated outputs, per-session workspaces, session id map.
       - claude-data:/data

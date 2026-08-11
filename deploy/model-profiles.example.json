@@ -1,0 +1,11 @@
+{
+  "models": [
+    {"match": "claude-haiku-*", "remove": ["sub_agents", "web_search"]},
+    {"match": "claude-sonnet-*", "add": ["memory"]},
+    {"match": "claude-opus-5", "add": ["memory", "time_calc", "code_interpreter"]},
+    {"match": "claude-fable-5", "capabilities": [
+      "vision", "file_upload", "web_search", "terminal", "sub_agents",
+      "client_tools", "memory", "time_calc"
+    ]}
+  ]
+}

@@ -235,6 +235,11 @@ class ModelInfo(BaseModel):
     object: Literal["model"] = "model"
     created: int = 0
     owned_by: str = "anthropic"
+    # Wrapper extension: the model's resolved capability profile (see
+    # src/capabilities.py). Extra fields are legal on the OpenAI schema;
+    # clients that don't know the field ignore it, pullers use it as the
+    # source of truth for per-model capability toggles.
+    capabilities: list[str] = []
 
 
 class ModelList(BaseModel):

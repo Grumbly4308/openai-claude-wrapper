@@ -49,9 +49,11 @@ already relays or can relay; nothing to execute.
 
 **Profile registry.** A JSON/YAML file (path via
 `CLAUDE_WRAPPER_MODEL_PROFILES`) mapping model-id patterns to a capability
-set. Resolution order: family-derived defaults (e.g. all ≥4.x models get
-vision) → profile file → env overrides. One `default` profile; per-model
-entries override it. Effort variants inherit their base model's profile.
+set. Resolution order: built-in default → profile file → inline env
+overrides. The built-in default reproduces today's behavior exactly (CLI
+built-in tools on, client tools allowed, vision/files on; capabilities that
+need new wrapper machinery off), so an absent profile file changes nothing.
+Effort and `[1m]` variants inherit their base model's profile.
 
 **Enforcement points.**
 
@@ -77,7 +79,8 @@ last without blocking anything earlier.
 ## Phases
 
 **Phase 0 — Groundwork.** Capability vocabulary as an enum; profile schema +
-loader with validation; family-derived defaults; resolution order; unit tests.
+loader with validation; behavior-preserving built-in default; resolution
+order; unit tests.
 Exit: `resolve_profile(model_id)` returns a stable capability set for every
 advertised model, covered by tests.
 
@@ -109,16 +112,23 @@ models. Exit: image request round-trips through a profiled model.
 example profile file; end-to-end validation against a live OpenWebUI;
 migration note for existing deployments (default profile = today's behavior).
 
-## Open decisions
+## Decisions (settled)
 
-- Profile file format: JSON (no new deps) vs YAML (needs a dep — house rule
-  says avoid; leaning JSON).
-- Deny behavior in the bridge: hard 400 vs silently stripping denied tools.
-  Leaning 400 — silent stripping hides misconfiguration.
-- Memory storage shape: flat per-conversation JSON vs the memory tool's
-  file-path model. Decide in phase 4.
-- OpenWebUI sync auth: admin API key via env; confirm the endpoint shape
-  against the deployed OpenWebUI version before phase 1 lands.
+- **Profile file format: JSON.** No new dependency.
+- **Deny behavior in the bridge: hard 400** naming the denied tool. Silent
+  stripping hides misconfiguration.
+- **Memory storage: file-path model** — a per-conversation directory of
+  markdown files under the data dir. This is what Claude Code itself uses
+  organically (memory directory + `MEMORY.md` index) and it matches the
+  `memory_20250818` tool's path-based command set exactly.
+- **Capability exposure: pull-first.** Capabilities ride as extra fields on
+  `/v1/models`, so they're visible the moment OpenWebUI (or anything else)
+  pulls the model list. Caveat: OpenWebUI does not currently map pulled
+  metadata into its own capability toggles — those live in its internal model
+  records, writable only via its admin API. So the sync script stays, but as
+  a thin consumer of the same `/v1/models` payload (admin API key via env).
+  If OpenWebUI later honors pulled metadata, the script is deleted and
+  nothing else changes.
 
 ## Non-goals
 

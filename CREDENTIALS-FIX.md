@@ -47,8 +47,8 @@ refresh even in principle. Resolved, but it masked problems 1 and 2 throughout.
 
 | Artefact | Where it lives | Lifetime | What renews it |
 | --- | --- | --- | --- |
-| Access token | `.credentials.json` → `expiresAt` | ~8 hours | CLI, from the refresh token, when it runs |
-| Refresh token | `.credentials.json` → `refreshTokenExpiresAt` | ~30 days (yours: Sep 9) | Unknown — see Open questions |
+| Access token | `.credentials.json` → `expiresAt` | ~8 hours | CLI, from the refresh token, when it runs — **but not inside the sandbox; measured, see Outcome** |
+| Refresh token | `.credentials.json` → `refreshTokenExpiresAt` | ~30 days (yours: Sep 9) | Nothing, since the renewal it would drive never fires here |
 | Setup token | printed to stdout; now in `.env` | ~1 year | Nothing; static until it expires |
 
 There is no contradiction. The 8h and 30d numbers describe the **old
@@ -114,13 +114,11 @@ questions before concluding anything.
 
 ### 3. Prove the refresh cycle works
 
-- [ ] Record the current `expiresAt`
-- [ ] Send a real CLI turn (not a `tools` request — those bypass the CLI):
-      `curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"claude-opus-4-8","messages":[{"role":"user","content":"hi"}]}'`
-- [ ] Re-read `expiresAt`. **Moved forward → the cycle works and you are done.**
-- [ ] Also check whether `refreshTokenExpiresAt` moved — that determines whether
-      you ever need to log in again (see Open questions)
-- [ ] If `expiresAt` did not move, run the experiment in Open questions
+- [x] Run `tools/credential_refresh_test.sh`, which forces the question in one
+      go rather than waiting ~8h for a natural expiry
+- [x] **Result: it does not work here.** See Outcome. Steps 1 and 2 therefore do
+      not give you a self-sustaining deployment, and the long-lived token is the
+      primary credential under the sandbox topology, not the break-glass one.
 
 ### 4. Documentation corrections
 
@@ -161,19 +159,40 @@ Steps 1 and 2 are done and verified on the live stack:
   proves the file login works end to end inside the sandbox.
 - Refresh did not fire — expected, with ~8h still on the access token.
 
-**The one open item is the refresh event itself.** Run `~/credcheck.sh` after
-the access token has aged past ~8h of use:
+**The refresh event has now been measured, and it does not happen.** The volume
+login was left to age; by 03:42 its access token had lapsed on its own — the
+first sign, since a working refresh would have renewed it during ordinary use.
+`tools/credential_refresh_test.sh` then forced the question with a valid refresh
+token 29.1 days from expiry:
 
-- `mtime` moves and `access` resets toward 8h → refresh works in-sandbox; this
-  whole problem is closed and no long-lived token is needed.
-- `access` goes negative and turns start failing with 401 → refresh is blocked
-  inside the sandbox. Fall back to the backup token, and the
-  `CLAUDE_CODE_PROXY_RESOLVES_HOSTS` hypothesis below becomes the thing to test.
+- the turn failed with `claude failed: claude exited 1:` — the empty-stderr 401
+  signature;
+- `.credentials.json` was **not rewritten**: after the turn its mtime was still
+  the test's own edit, and `expiresAt` still the value the test wrote.
+
+The second point is the finding. A refresh either rewrites that file or did not
+occur, and nothing rewrote it. Two limits on how far that stretches: the CLI's
+exit code is opaque, so this shows the CLI did not renew rather than naming
+which hop refused; and the credential was already expired when the test began,
+so the turn was doomed either way — what the test adds is that a healthy refresh
+token sat there unused. The control is in the record above: the same request
+path succeeded from this same volume credential while its access token was
+fresh, so the difference between working and failing is expiry alone.
+
+**Consequence: a login cannot sustain itself under the sandbox topology.** The
+long-lived `setup-token` credential in `CLAUDE_CODE_OAUTH_TOKEN` is the primary
+credential here, not break-glass, and the tradeoff in "The fix" is settled in its
+favour — it suppresses a file refresh that was never going to fire. Step 2 above
+should be read in reverse: put the token back in `.env`. The remaining question
+is not whether to use it but why renewal is blocked, which the
+`CLAUDE_CODE_PROXY_RESOLVES_HOSTS` experiment below would answer.
 
 ## Open questions
 
-**Does the refresh cycle work at all inside the sandbox?** This is the one that
-decides whether goal 1 is achievable. A sub-agent proposed that
+**Resolved — no, the refresh cycle does not work inside the sandbox.** Measured
+with `tools/credential_refresh_test.sh`; see Outcome. Goal 1 is therefore not
+achievable as stated, and what remains open is the cause. A sub-agent proposed
+that
 `CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` is itself the cause of
 `Invalid IP address: undefined` — that the flag installs a DNS shim which breaks
 the HTTP client used for OAuth *and* for token refresh, failing before any
@@ -199,10 +218,11 @@ podman run --rm -it \
 ```
 
 If the second reaches an OAuth server and the first does not, the hypothesis
-holds — and the consequence is significant: the flag that makes normal runs work
-is the same one that prevents refresh, so login credentials can never
-self-sustain in this topology and the long-lived token is the correct answer
-after all.
+holds, and it would explain the measured failure: the flag that makes normal runs
+work is the same one that prevents refresh. Note that the conclusion no longer
+rests on it — the long-lived token is already the right answer on the evidence
+above. This now only identifies the cause, and with it whether the topology could
+be changed to make a login viable.
 
 **Resolved:** `setup-token` does not persist to the credentials volume even when
 one is mounted writable — tested directly. The token is environment-only, so the

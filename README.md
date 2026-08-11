@@ -1288,15 +1288,21 @@ an environment credential wins and then nothing renews the file underneath it.
   volume so it survives `down`/`up`, rebuilds and reboots. The access token
   lasts hours and the CLI renews it from a refresh token — good for ~30 days —
   every time it runs with working egress. This is the only credential that
-  sustains itself, and the only one that lives in the volume. Under the sandbox
-  topology, bootstrap it from a throwaway container: see
-  [First-time login](#first-time-login).
+  sustains itself, and the only one that lives in the volume. **It does not
+  sustain itself under the sandbox topology**, where the agent's only egress is
+  the allowlisting proxy: renewal has been measured there and does not happen,
+  so a login lapses after a few hours and every turn then fails. Prefer a
+  long-lived token for that deployment; `tools/credential_refresh_test.sh`
+  re-checks the finding against your own stack in about a minute.
 - **Long-lived token (static).** `claude setup-token` prints a token valid for
   about a year. It is **not** written to the volume — the output is meant for
   `CLAUDE_CODE_OAUTH_TOKEN`. Nothing renews it and nothing can read its expiry,
-  so it is best kept as a break-glass credential rather than the primary. Note
-  that setting it stops the CLI refreshing any login in the volume, which then
-  decays silently; the boot report warns when it detects this.
+  so on a deployment where a login renews itself this is best kept as a
+  break-glass credential rather than the primary. Under the sandbox topology,
+  where nothing renews a login either, it is the primary. Note that setting it
+  stops the CLI refreshing any login in the volume, which then decays silently;
+  the boot report warns when it detects this. That warning is the right default
+  but is misleading in the sandbox, where the refresh it protects never fires.
 - **Env vars.** Set `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` in `.env`.
   The wrapper does not arbitrate between these and a persisted login — it only
   reports what it found. Precedence is decided by the Claude Code CLI (and,
@@ -1341,7 +1347,9 @@ no mention of credentials. Three things keep that from happening:
 1. **Mint a long-lived token** with `setup-token` rather than using the desktop
    `login` flow. It does not depend on the refresh cycle at all.
 2. **Exercise the CLI on a timer** if you are on a short-lived login. A daily
-   throwaway invocation is enough to keep the refresh current:
+   throwaway invocation is enough to keep the refresh current — but only where
+   renewal works at all, which under the sandbox topology it does not, so there
+   the timer keeps nothing alive and option 1 is the answer:
 
    ```bash
    cat > ~/.config/systemd/user/claude-token-refresh.service <<'EOF'

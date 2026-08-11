@@ -28,6 +28,7 @@ from src.capabilities import (  # noqa: E402
     DEFAULT_CAPABILITIES,
     PROFILE_FILE_ENV,
     PROFILE_OVERRIDES_ENV,
+    TERMINAL_TOGGLE_ENV,
     Capability,
     ProfileConfigError,
     has_capability,
@@ -40,6 +41,12 @@ def _reset() -> None:
     """Fresh state: no profile env vars, empty caches."""
     os.environ.pop(PROFILE_FILE_ENV, None)
     os.environ.pop(PROFILE_OVERRIDES_ENV, None)
+    os.environ.pop(TERMINAL_TOGGLE_ENV, None)
+    reset_profile_cache()
+
+
+def _enable_terminal() -> None:
+    os.environ[TERMINAL_TOGGLE_ENV] = "true"
     reset_profile_cache()
 
 
@@ -63,19 +70,52 @@ def _expect_error(needle: str) -> None:
 
 
 def test_builtin_default_absent_config():
+    # Terminal is masked until the operator opts in, everything else defaults.
     _reset()
-    assert resolve_profile("claude-opus-5") == DEFAULT_CAPABILITIES
+    expected = DEFAULT_CAPABILITIES - {Capability.TERMINAL}
+    assert resolve_profile("claude-opus-5") == expected
 
 
 def test_builtin_default_preserves_todays_behavior():
-    # The CLI path runs terminal/web-search/sub-agents today and any client may
-    # declare tools; capabilities needing new wrapper machinery are off.
+    # With the terminal toggle set, the default matches what the CLI path does
+    # today: terminal/web-search/sub-agents on, client tools allowed;
+    # capabilities needing new wrapper machinery are off.
     _reset()
+    _enable_terminal()
     caps = resolve_profile("claude-sonnet-5")
     assert Capability.TERMINAL in caps
     assert Capability.CLIENT_TOOLS in caps
     assert Capability.CODE_INTERPRETER not in caps
     assert Capability.MEMORY not in caps
+
+
+# --- terminal env gate --------------------------------------------------------
+
+
+def test_terminal_masked_by_default():
+    _reset()
+    assert Capability.TERMINAL not in resolve_profile("claude-opus-5")
+
+
+def test_terminal_profile_grant_masked_without_toggle():
+    # A profile file alone must not be able to expose a shell to the UI.
+    _reset()
+    _write_profile({"models": [{"match": "claude-opus-5", "add": ["terminal"]}]})
+    assert Capability.TERMINAL not in resolve_profile("claude-opus-5")
+
+
+def test_terminal_toggle_enables():
+    _reset()
+    _enable_terminal()
+    assert Capability.TERMINAL in resolve_profile("claude-opus-5")
+
+
+def test_terminal_toggle_still_respects_profile_remove():
+    _reset()
+    _write_profile({"models": [{"match": "claude-haiku-*", "remove": ["terminal"]}]})
+    _enable_terminal()
+    assert Capability.TERMINAL not in resolve_profile("claude-haiku-4-5")
+    assert Capability.TERMINAL in resolve_profile("claude-opus-5")
 
 
 def test_file_default_replaces_builtin():
@@ -89,6 +129,7 @@ def test_file_default_replaces_builtin():
 
 def test_replace_entry():
     _reset()
+    _enable_terminal()
     _write_profile(
         {"models": [{"match": "claude-haiku-4-5", "capabilities": ["vision", "client_tools"]}]}
     )
@@ -118,6 +159,7 @@ def test_glob_pattern():
 
 def test_entries_apply_in_order():
     _reset()
+    _enable_terminal()
     _write_profile(
         {
             "models": [
@@ -135,6 +177,7 @@ def test_entries_apply_in_order():
 
 def test_effort_variant_inherits_base():
     _reset()
+    _enable_terminal()
     _write_profile({"models": [{"match": "claude-opus-5", "remove": ["terminal"]}]})
     assert resolve_profile("claude-opus-5 (high)") == resolve_profile("claude-opus-5")
     assert Capability.TERMINAL not in resolve_profile("claude-opus-5 (xhigh)")
@@ -142,12 +185,14 @@ def test_effort_variant_inherits_base():
 
 def test_long_context_variant_inherits_base():
     _reset()
+    _enable_terminal()
     _write_profile({"models": [{"match": "claude-opus-5", "remove": ["terminal"]}]})
     assert Capability.TERMINAL not in resolve_profile("claude-opus-5[1m]")
 
 
 def test_exact_1m_entry_targets_only_that_id():
     _reset()
+    _enable_terminal()
     _write_profile({"models": [{"match": "claude-opus-5[1m]", "remove": ["terminal"]}]})
     assert Capability.TERMINAL not in resolve_profile("claude-opus-5[1m]")
     assert Capability.TERMINAL in resolve_profile("claude-opus-5")
@@ -158,6 +203,7 @@ def test_exact_1m_entry_targets_only_that_id():
 
 def test_overrides_apply_after_file():
     _reset()
+    _enable_terminal()
     _write_profile({"models": [{"match": "claude-opus-5", "remove": ["terminal"]}]})
     os.environ[PROFILE_OVERRIDES_ENV] = json.dumps(
         {"models": [{"match": "claude-opus-5", "add": ["terminal"]}]}

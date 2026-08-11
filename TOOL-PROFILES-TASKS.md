@@ -22,29 +22,36 @@ Check items off as they land; keep one PR per phase where practical.
       inherit the base model
 - [x] Unit tests: `tests/test_profiles.py` covering defaults, overrides,
       pattern matching, effort-variant inheritance, invalid config
+- [x] Hard-gate the terminal capability behind `CLAUDE_WRAPPER_EXPOSE_TERMINAL`
+      (default off): profile grants are masked until the operator opts in, so
+      a profile file alone can never expose a shell to the UI
 
 ## Phase 1 — Advertise
 
 - [ ] Attach resolved capabilities as extra fields on `/v1/models` entries
 - [ ] Extend `tests/test_endpoints.py` for the enriched model list
-- [ ] Write `tools/sync_openwebui_capabilities.py` — a thin consumer of the
-      wrapper's own `/v1/models` payload that pushes the toggles via the
-      OpenWebUI admin API (needed because OpenWebUI doesn't map pulled
-      metadata into its capability toggles; delete the script if it ever does)
+- [ ] Write `deploy/openwebui_capability_sync.py` — a **puller that resides
+      on the OpenWebUI host**: reads the wrapper's `/v1/models` (capabilities
+      included) and writes the toggles via OpenWebUI's local admin API. The
+      wrapper never contacts OpenWebUI. (Needed because OpenWebUI doesn't map
+      pulled metadata into its capability toggles; delete if it ever does)
 - [ ] Confirm the OpenWebUI model-update endpoint shape against the deployed
       version; pin the minimum supported OpenWebUI version in the script
-- [ ] Document sync usage (env vars: OpenWebUI URL + admin key)
+- [ ] Document puller usage (env vars: wrapper URL, OpenWebUI URL + admin
+      key; run via cron or OpenWebUI startup hook)
 
 ## Phase 2 — Enforce: CLI path
 
 - [ ] Map capabilities → Claude Code tool names (terminal→Bash,
       web_search→WebSearch/WebFetch, sub_agents→Task)
 - [ ] Build per-request `--disallowedTools` from the model's profile in
-      `claude_runner.py`
+      `claude_runner.py` — **chat runs only**; delegation runs (audio,
+      images, embeddings — they do their work through Bash) are never gated
 - [ ] Fold `clarify_disallowed_tools` into the same mechanism (keep the env
       var working; deprecation note in README)
-- [ ] Tests: terminal-off model gets Bash disallowed; default profile
-      preserves today's behavior byte-for-byte on the argv
+- [ ] Tests: terminal-off model gets Bash disallowed in chat; delegation argv
+      never gated; with `CLAUDE_WRAPPER_EXPOSE_TERMINAL` set the default
+      profile's argv is byte-for-byte today's
 
 ## Phase 3 — Enforce: tool bridge
 
@@ -80,7 +87,8 @@ Check items off as they land; keep one PR per phase where practical.
 
 ## Phase 6 — Docs & hardening
 
-- [ ] README: profiles configuration reference + example profile file
+- [ ] README: profiles configuration reference + example profile file,
+      including `CLAUDE_WRAPPER_EXPOSE_TERMINAL` and why it defaults off
 - [ ] Ship `deploy/` example profile matching current default behavior
 - [ ] End-to-end pass against a live OpenWebUI (toggles, tool calls, denials)
 - [ ] Migration note: absent profile file == today's behavior

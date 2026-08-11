@@ -32,6 +32,15 @@ never both. `match` is compared literally first, then as an fnmatch glob.
 Matching is done against the base model id — effort suffixes (``"claude-opus-5
 (high)"``) are stripped, and a ``[1m]`` id also matches its base id's entries.
 
+One capability is additionally gated by a hard env toggle: ``terminal``.
+Exposing a shell to a chat UI is consequential enough that a profile grant
+alone must not be able to switch it on — CLAUDE_WRAPPER_EXPOSE_TERMINAL
+(default off) masks ``terminal`` out of every resolved profile until an
+operator sets it. Note this gates the *UI-facing* capability only; the
+wrapper's internal delegation runs (audio/images/embeddings doing their work
+through Claude Code's Bash) are not chat-path capability enforcement and are
+unaffected.
+
 Configuration errors raise ProfileConfigError naming the offending entry.
 Resolution is memoized per base model for the process lifetime (same pattern
 as config.supported_models); tests reset via reset_profile_cache().
@@ -47,12 +56,14 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from .config import split_model_effort
+from .config import _bool_env, split_model_effort
 
 log = logging.getLogger("claude_wrapper.capabilities")
 
 PROFILE_FILE_ENV = "CLAUDE_WRAPPER_MODEL_PROFILES"
 PROFILE_OVERRIDES_ENV = "CLAUDE_WRAPPER_MODEL_PROFILE_OVERRIDES"
+# Hard gate for the terminal capability: profile grants are masked while off.
+TERMINAL_TOGGLE_ENV = "CLAUDE_WRAPPER_EXPOSE_TERMINAL"
 
 
 class Capability(str, Enum):
@@ -238,6 +249,11 @@ def resolve_profile(model: str) -> frozenset[Capability]:
     if _config_cache is None:
         _config_cache = _load_config()
     caps = _resolve(base, _config_cache)
+    if Capability.TERMINAL in caps and not _bool_env(TERMINAL_TOGGLE_ENV, False):
+        log.debug(
+            "terminal capability masked for %s (%s not enabled)", base, TERMINAL_TOGGLE_ENV
+        )
+        caps = caps - {Capability.TERMINAL}
     _resolved_cache[base] = caps
     return caps
 

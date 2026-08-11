@@ -39,7 +39,7 @@ already relays or can relay; nothing to execute.
 | Status Updates | existing reasoning/activity stream frames | CLI |
 | Web Search | server-side `web_search_20260209` (older families: `_20250305`); CLI's own WebSearch tool on the CLI path | both |
 | Code Interpreter | server-side `code_execution` tool (Anthropic sandbox) | bridge |
-| Terminal | Claude Code's bash tool, gated per profile via `--disallowedTools` | CLI |
+| Terminal | Claude Code's bash tool; profile grant **and** the `CLAUDE_WRAPPER_EXPOSE_TERMINAL` env gate both required; enforced via `--disallowedTools` on chat runs only | CLI |
 | Memory | `memory_20250818` client-side tool, wrapper-owned storage per conversation | bridge |
 | Image Generation | external backend behind `routes_images.py`, surfaced as a custom tool | bridge |
 | Sub-agents | Claude Code's Task tool, gated per profile | CLI |
@@ -66,9 +66,10 @@ Effort and `[1m]` variants inherit their base model's profile.
    the profile; inject enabled server-side tools (web search variant chosen
    per family, code execution); keep tool ordering deterministic so prompt
    caching survives.
-4. OpenWebUI sync — a script that reads the wrapper's model list + profiles
-   and pushes the capability toggles into OpenWebUI's model registry via its
-   admin API, so the UI never drifts from the wrapper.
+4. OpenWebUI sync — a puller script living on the OpenWebUI host: it reads
+   the wrapper's `/v1/models` (capabilities included) and writes the toggles
+   into OpenWebUI's model registry via the local admin API. The wrapper side
+   of this is nothing but the enriched `/v1/models`.
 
 **Loop ownership (phase 4 decision).** Today the bridge is strictly
 client-looped. Wrapper-owned tools (Memory, Image Generation) require a hybrid
@@ -84,14 +85,20 @@ order; unit tests.
 Exit: `resolve_profile(model_id)` returns a stable capability set for every
 advertised model, covered by tests.
 
-**Phase 1 — Advertise.** `/v1/models` carries capability metadata; new
-`tools/sync_openwebui_capabilities.py` pushes toggles into OpenWebUI. Exit:
-fresh OpenWebUI instance shows correct per-model toggles after one sync run.
+**Phase 1 — Advertise.** `/v1/models` carries capability metadata; a
+reference puller (`deploy/openwebui_capability_sync.py`, to be run on the
+OpenWebUI host) reads it and writes the toggles via OpenWebUI's local admin
+API. Exit: fresh OpenWebUI instance shows correct per-model toggles after
+one puller run against the wrapper.
 
 **Phase 2 — Enforce, CLI path.** Per-model `--disallowedTools` derived from
-the profile; `clarify_disallowed_tools` folded into the same mechanism. Exit:
-a terminal-off model cannot run bash; a sub-agents-off model cannot spawn
-Task agents.
+the profile, applied to **chat runs only** — delegation runs (audio, images,
+embeddings working through Bash internally) are never gated, or the wrapper
+breaks itself. `clarify_disallowed_tools` folded into the same mechanism.
+Exit: a terminal-off model cannot run bash in chat; a sub-agents-off model
+cannot spawn Task agents; with `CLAUDE_WRAPPER_EXPOSE_TERMINAL` set the
+default argv is byte-for-byte today's (without it, chat runs carry
+`--disallowedTools Bash` by design); delegation argv unchanged in all cases.
 
 **Phase 3 — Enforce, tool bridge.** Client tool filtering per profile with a
 clear error for denied tools; server-side web search + code execution
@@ -121,14 +128,24 @@ migration note for existing deployments (default profile = today's behavior).
   markdown files under the data dir. This is what Claude Code itself uses
   organically (memory directory + `MEMORY.md` index) and it matches the
   `memory_20250818` tool's path-based command set exactly.
-- **Capability exposure: pull-first.** Capabilities ride as extra fields on
-  `/v1/models`, so they're visible the moment OpenWebUI (or anything else)
-  pulls the model list. Caveat: OpenWebUI does not currently map pulled
-  metadata into its own capability toggles — those live in its internal model
-  records, writable only via its admin API. So the sync script stays, but as
-  a thin consumer of the same `/v1/models` payload (admin API key via env).
+- **Capability exposure: pull, never push.** Capabilities ride as extra
+  fields on `/v1/models`, visible the moment anything pulls the model list.
+  The wrapper never contacts OpenWebUI. Because OpenWebUI doesn't map pulled
+  metadata into its own capability toggles (those live in its internal model
+  records, writable via its local admin API), a small sync script bridges the
+  gap — but it **resides on the OpenWebUI host**, pulls the wrapper's
+  `/v1/models`, and writes the toggles locally. This repo ships it as a
+  reference artifact only (`deploy/`); it is not part of the wrapper process.
   If OpenWebUI later honors pulled metadata, the script is deleted and
   nothing else changes.
+- **Terminal is opt-in, hard-gated by env.** Exposing a shell to a chat UI
+  must be a deliberate operator action, not a profile-file side effect:
+  `CLAUDE_WRAPPER_EXPOSE_TERMINAL` (default off) masks the `terminal`
+  capability out of every resolved profile — including explicit profile
+  grants — until set. With the toggle on, profiles decide per model as
+  usual. This gates the UI-facing capability only: the wrapper's internal
+  delegation runs (audio/images/embeddings doing their work through Claude
+  Code's Bash) are not chat-path enforcement and keep working regardless.
 
 ## Non-goals
 

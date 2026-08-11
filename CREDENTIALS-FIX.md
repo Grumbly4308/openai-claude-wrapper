@@ -205,9 +205,7 @@ not have to happen where the agent is, only into the volume the agent reads.
 credentials pinned empty, watching `expiresAt` and spending one minimal CLI
 turn whenever the access token drops below ~4h. The static token goes back to
 break-glass — now with `CLAUDE_CODE_OAUTH_TOKEN_MINTED` so its own ~1-year
-death gets a boot warning instead of a silent outage. `console.anthropic.com`
-is also on the allowlist now, so in-agent renewal gets a fair retest, but
-nothing depends on it working.
+death gets a boot warning instead of a silent outage.
 
 ### Rollout checklist (live stack)
 
@@ -233,42 +231,69 @@ nothing depends on it working.
       refresher's log and the boot report both warn a week out, and a monthly
       `/login` via `run --rm -it claude-refresher claude` is the whole ritual
 
-## Open questions
+## Round 3 (2026-08-11): what the CLI's OAuth client actually requires
 
-**Resolved — no, the refresh cycle does not work inside the sandbox.** Measured
-with `tools/credential_refresh_test.sh`; see Outcome. Goal 1 is therefore not
-achievable as stated, and what remains open is the cause. A sub-agent proposed
-that
-`CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` is itself the cause of
-`Invalid IP address: undefined` — that the flag installs a DNS shim which breaks
-the HTTP client used for OAuth *and* for token refresh, failing before any
-CONNECT. I am reporting this as a **hypothesis, not a finding**: it came from an
-agent that investigated by decompiling the CLI, which is outside what I am
-willing to rely on, and the flag is documented as mandatory for normal runs
-(`README.md:362`).
+Measured in a replica of the sandbox's network conditions — external DNS dead
+(`gaierror` on any lookup), egress only via a CONNECT proxy — using a logging
+proxy that records every CONNECT, first refusing them (does the client *reach*
+a proxy?), then chaining to real egress (does the flow *complete*?). Test
+credential: expired access token, deliberately-fake refresh token, so a
+completed round trip shows up as the server rejecting the refresh — proof the
+whole path works without minting anything.
 
-Test it legitimately, without changing your running stack:
+| Flow | CLI | Result |
+| --- | --- | --- |
+| turn + refresh, flag on | 2.1.223 | CONNECT `platform.claude.com` + `api.anthropic.com` arrive at proxy |
+| turn + refresh, flag off | 2.1.223 | same — this runtime's DNS fails in a way node tolerates |
+| turn + refresh, flag on | **2.1.226** | same CONNECTs; chained: real round trip, server rejects the fake token — `Failed to authenticate: OAuth session expired and could not be refreshed` |
+| `setup-token`, flag on | both | stalls at "Opening browser to sign in…" — the interactive flow needs a browser before any OAuth traffic; bootstrap outside the sandbox remains correct |
+| telemetry (datadog) blocked | 2.1.226 | CLI carries on; blocking it is harmless |
+
+**Requirements for in-sandbox token refresh, all of which this stack already
+meets:**
+
+1. `HTTP(S)_PROXY` set — the refresh client honors it (measured, both versions)
+2. `CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` where DNS returns NOTIMP (docker)
+3. CONNECT to `platform.claude.com:443` allowed — allowlisted since `2a5440f`
+4. A refresh token the server still accepts — **the one link the in-stack
+   failure never tested in isolation**
+
+So the measured in-stack refresh failure (Outcome, above) is *not explained by
+the network path*: the same binary completes refresh under stricter conditions
+than the sandbox imposes. The remaining suspects are (4) — refresh tokens
+commonly rotate on use, and that credential had been through several login
+experiments — or something stack-local answering the CONNECT. One rerun
+separates them; watch Squid while the test forces a refresh:
 
 ```bash
-podman run --rm -it \
-  -e HTTPS_PROXY=http://squid:3128 -e HTTP_PROXY=http://squid:3128 \
-  --network <the sandbox backend network> \
-  claude-wrapper:latest claude setup-token          # expect the same error
-
-# same again, with the flag explicitly disabled
-podman run --rm -it \
-  -e HTTPS_PROXY=http://squid:3128 -e HTTP_PROXY=http://squid:3128 \
-  -e CLAUDE_CODE_PROXY_RESOLVES_HOSTS= \
-  --network <the sandbox backend network> \
-  claude-wrapper:latest claude setup-token
+podman logs -f claude-squid 2>/dev/null | grep -i "platform.claude.com" &
+tools/credential_refresh_test.sh
 ```
 
-If the second reaches an OAuth server and the first does not, the hypothesis
-holds, and it would explain the measured failure: the flag that makes normal runs
-work is the same one that prevents refresh. Note that the conclusion no longer
-rests on it — the long-lived token is already the right answer on the evidence
-above. This now only identifies the cause, and with it whether the topology could
-be changed to make a login viable.
+- `CONNECT platform.claude.com ... TCP_TUNNEL/200` and still no renewal →
+  the server rejected that refresh token; re-login (fresh token) and rerun —
+  expected to pass, after which the agent renews itself and even the refresher
+  sidecar is just idle-deployment insurance.
+- `TCP_DENIED` → the running Squid is not enforcing the checked-in allowlist;
+  recreate the squid container and rerun.
+- no line at all → the CONNECT never left the agent; compare the agent's env
+  against the replica conditions above.
+
+## Open questions
+
+**Refuted for the refresh path — the DNS-shim hypothesis is dead.** A sub-agent
+had proposed that `CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1` installs a DNS shim that
+breaks the OAuth HTTP client before any CONNECT. Measured directly (2026-08-11,
+see "Round 3") in a replica of the sandbox's network conditions — external DNS
+dead, egress via CONNECT proxy only — using the deployment's exact CLI version:
+the refresh client honors `HTTP(S)_PROXY`, sends its CONNECT with the flag on
+or off, and completes a real token-refresh round trip against
+`platform.claude.com/v1/oauth/token`. The refresh cycle has **no** unmet
+network requirement in this topology. Whatever failed in the one in-stack
+measurement above, it was not the client and not the flag; the discriminating
+rerun is in Round 3. (`Invalid IP address: undefined` belongs to the
+*interactive* flows, which stall on "Opening browser to sign in…" headless and
+are correctly handled by the outside-the-sandbox bootstrap regardless.)
 
 **Resolved:** `setup-token` does not persist to the credentials volume even when
 one is mounted writable — tested directly. The token is environment-only, so the
@@ -280,10 +305,12 @@ one is mounted writable — tested directly. The token is environment-only, so t
 from the TUI's own auth prompt, not from the `login` subcommand — the two
 failures we treated as one were partly the entrypoint bug.
 
-**Which host does a refresh contact?** Not determinable from this repo; no
-OAuth endpoint appears anywhere in `src/` or `sandbox/`. `console.anthropic.com`
-is absent from the allowlist and is a plausible gap, but that is a suspicion.
-Squid's access log during a refresh is the way to settle it.
+**Resolved: a refresh contacts `platform.claude.com/v1/oauth/token`.** Measured
+two ways: the string sits in the shipped 2.1.223 and 2.1.226 binaries (with no
+mention of `console.anthropic.com` in either — that suspicion was wrong), and a
+live refresh attempt was observed CONNECTing to exactly that host. It has been
+on the allowlist since the sandbox landed (`2a5440f`), so the endpoint was
+never the gap.
 
 **Does `refreshTokenExpiresAt` roll forward on each refresh?** Anthropic-side.
 If it does, a used login is indefinite. If it is a hard 30-day wall, you re-login

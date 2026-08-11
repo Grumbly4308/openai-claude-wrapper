@@ -23,7 +23,13 @@ from fastapi import (
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import download_tokens, tool_bridge
-from .config import SETTINGS, advertised_models, split_model_effort, supported_models
+from .config import (
+    SETTINGS,
+    advertised_models,
+    log_credential_status,
+    split_model_effort,
+    supported_models,
+)
 from .converters import derive_session_id
 from .deps import (
     FILE_STORE,
@@ -160,6 +166,14 @@ async def _startup() -> None:
     # binary (memoized thereafter). Logged so the resolved set is visible at boot.
     models = supported_models()
     log.info("model list ready: %d models — %s", len(models), ", ".join(models))
+
+    # Credential state. Every other line here reports configuration; this one
+    # reports a clock, and it is the failure this deployment actually hits — an
+    # expired login surfaces as a 401 the CLI attributes to itself, with nothing
+    # pointing at the file on disk. Under the sandboxed topology the CLI runs in
+    # the agent container, so this container's view is of a read-only mount; the
+    # agent reports the same status for the copy it owns.
+    log_credential_status("Claude")
 
     # Where turns execute: locally, or in the sandboxed agent container.
     if SETTINGS.agent_url:

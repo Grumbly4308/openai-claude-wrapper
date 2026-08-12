@@ -158,7 +158,7 @@ _SSE_HEADERS = {
 }
 
 
-app = FastAPI(title="Claude Code OpenAI Wrapper", version="1.0.0")
+app = FastAPI(title="Claude Code OpenAI Wrapper", version="1.0.1")
 
 
 @app.on_event("startup")

@@ -1,7 +1,7 @@
 # SUNSET — the single-container layout is no longer the supported deployment.
 # The sandboxed topology (docker-compose.sandbox.yml: wrapper + isolated agent
 # container + squid egress allowlist) is what we run and regression-test; see
-# README "Sandboxed deployment" and TOOL-PROFILES-REGRESSION.md. This file is
+# README "Sandboxed deployment". This file is
 # retained for local development and as a rollback path only — new deployment
 # features land in the sandbox stack first and are not guaranteed to be wired
 # here.
@@ -134,7 +134,7 @@ services:
       OPENWEBUI_API_KEY: "${OPENWEBUI_API_KEY:-}"
       OPENWEBUI_DEFAULT_COLLECTION: "${OPENWEBUI_DEFAULT_COLLECTION:-}"
 
-      # ---- Per-model capability profiles (see README + TOOL-PROFILES-ROADMAP.md) ----
+      # ---- Per-model capability profiles (README "Per-model capability profiles") ----
       # Container-internal path to the profile JSON. The inbox is the easiest
       # host-visible mount: drop profiles.json in ${CLAUDE_INBOX_DIR:-./inbox}
       # and set this to /data/inbox/profiles.json. Blank = built-in defaults.

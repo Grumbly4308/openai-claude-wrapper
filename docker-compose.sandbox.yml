@@ -148,7 +148,7 @@ services:
       OPENWEBUI_DEFAULT_COLLECTION: "${OPENWEBUI_DEFAULT_COLLECTION:-}"
 
       # ---- Per-model capability profiles (README "Per-model capability
-      # profiles"; TOOL-PROFILES-ROADMAP.md) ----
+      # profiles") ----
       # Profiles are resolved in THIS container; the agent only receives the
       # resulting --disallowedTools argv through the shim. The profile file
       # follows the same operator-edited-config pattern as squid.conf and

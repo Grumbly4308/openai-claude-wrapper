@@ -62,8 +62,8 @@ declare a `version:` key, so any Compose v2-compatible frontend works.
 
 > **SUNSET — this single-container quick start is no longer the supported
 > deployment.** Production and regression testing run the sandboxed topology:
-> see [Sandboxed deployment](#sandboxed-deployment-network-isolated-agent)
-> and `TOOL-PROFILES-REGRESSION.md`. The steps below still work and remain
+> see [Sandboxed deployment](#sandboxed-deployment-network-isolated-agent).
+> The steps below still work and remain
 > useful for local development, but new deployment features land in the
 > sandbox stack first.
 

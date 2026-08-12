@@ -1,7 +1,7 @@
 """Per-model capability profiles.
 
 The wrapper is the single source of truth for what each advertised model can
-do (see TOOL-PROFILES-ROADMAP.md). A profile is a set of capabilities,
+do (README "Per-model capability profiles"). A profile is a set of capabilities,
 resolved per model id in three layers:
 
   built-in default  →  profile file (CLAUDE_WRAPPER_MODEL_PROFILES, JSON)

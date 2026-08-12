@@ -1,0 +1,189 @@
+# SUNSET — the single-container layout is no longer the supported deployment.
+# The sandboxed topology (docker-compose.yml: wrapper + isolated agent
+# container + squid egress allowlist) is what we run and regression-test; see
+# README "Sandboxed deployment". This file is
+# retained for local development and as a rollback path only — new deployment
+# features land in the sandbox stack first and are not guaranteed to be wired
+# here.
+services:
+  claude-wrapper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Must match the HOST user that owns bind-mounted paths. Find it with
+        # `id -u` / `id -g` and set CLAUDE_UID / CLAUDE_GID in .env.
+        CLAUDE_UID: "${CLAUDE_UID:-1000}"
+        CLAUDE_GID: "${CLAUDE_GID:-1000}"
+    image: claude-wrapper:latest
+    container_name: claude-wrapper
+    restart: always
+    # Belt-and-braces: the image already ends on `USER claude`, but pinning the
+    # uid here means an image built with different args (or pulled from a
+    # registry) still runs unprivileged, and `docker compose run` inherits it.
+    user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
+    security_opt:
+      # Block setuid/setcap binaries inside the container from escalating —
+      # nothing here needs to gain privileges after startup.
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Default command: run the OpenAI-compatible API server.
+    # Run a one-time login with:
+    #   docker compose run --rm -it claude-wrapper login
+    # or a long-lived headless token with:
+    #   docker compose run --rm -it claude-wrapper setup-token
+    # Either writes credentials to the `claude-home` volume below, which
+    # persists across container rebuilds and restarts.
+    command: ["serve"]
+    # Explicitly bind on 0.0.0.0 so the server is reachable from any
+    # network interface on the host, not just the loopback-by-default
+    # that some Docker configs fall back to.
+    ports:
+      - "0.0.0.0:${CLAUDE_WRAPPER_PORT:-8000}:${CLAUDE_WRAPPER_PORT:-8000}"
+    environment:
+      # Container-internal uvicorn port. Must match the host port above
+      # so the compose mapping is a straight pass-through.
+      CLAUDE_WRAPPER_PORT: "${CLAUDE_WRAPPER_PORT:-8000}"
+      CLAUDE_WRAPPER_HOST: "0.0.0.0"
+
+      # Optional: fall back to env-based auth instead of the persisted
+      # OAuth login. Leave blank once you've run `compose run … login`.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:-}"
+      CLAUDE_CODE_OAUTH_TOKEN_MINTED: "${CLAUDE_CODE_OAUTH_TOKEN_MINTED:-}"
+
+      # Comma-separated bearer tokens clients must send as
+      # `Authorization: Bearer <key>`. Leave unset to disable wrapper auth.
+      CLAUDE_WRAPPER_API_KEYS: "${CLAUDE_WRAPPER_API_KEYS:-}"
+
+      # Base URL for the markdown download links the wrapper emits for
+      # generated files, e.g. [report.pdf](http://host:8000/v1/files/file-.../content).
+      # Point this at whatever URL clients (Open WebUI, etc.) can reach the
+      # wrapper on. Leave unset and the wrapper derives it from each request's
+      # own Host / X-Forwarded-* headers instead (see DERIVE_BASE_URL).
+      CLAUDE_WRAPPER_PUBLIC_BASE_URL: "${CLAUDE_WRAPPER_PUBLIC_BASE_URL:-}"
+      # Derive the link base from the inbound request when PUBLIC_BASE_URL is
+      # unset. Set to "off" to fall back to the plain "file_id=…" text block.
+      CLAUDE_WRAPPER_DERIVE_BASE_URL: "${CLAUDE_WRAPPER_DERIVE_BASE_URL:-on}"
+      # Download links carry a per-file HMAC capability so a browser click
+      # authenticates without an Authorization header. The key is derived from
+      # CLAUDE_WRAPPER_API_KEYS by default (stable across workers and restarts);
+      # set it explicitly to keep links alive across an API-key rotation.
+      CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY: "${CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY:-}"
+      # Link lifetime in seconds (default 30 days). 0 = never expires.
+      CLAUDE_WRAPPER_DOWNLOAD_URL_TTL: "${CLAUDE_WRAPPER_DOWNLOAD_URL_TTL:-2592000}"
+
+      # Tell Claude its working directory is a workspace whose new files are
+      # delivered to the user as download links, so it writes deliverables to
+      # files instead of pasting them inline. Set "off" to disable.
+      CLAUDE_WRAPPER_WORKSPACE_HINT: "${CLAUDE_WRAPPER_WORKSPACE_HINT:-on}"
+      CLAUDE_WRAPPER_WORKSPACE_PROMPT: "${CLAUDE_WRAPPER_WORKSPACE_PROMPT:-}"
+
+      CLAUDE_WRAPPER_DEFAULT_MODEL: "${CLAUDE_WRAPPER_DEFAULT_MODEL:-claude-opus-4-8}"
+
+      # Reasoning effort forwarded to every `claude` invocation: low | medium |
+      # high | xhigh | max are passed as `--effort <level>`. "ultracode" is also
+      # accepted — it is not a --effort value but requests xhigh effort plus
+      # ultracode's dynamic-workflow orchestration opt-in via `--settings`.
+      # Applies to Opus 4.5+ models. Leave blank to use the CLI's own default.
+      CLAUDE_WRAPPER_EFFORT: "${CLAUDE_WRAPPER_EFFORT:-medium}"
+      CLAUDE_WRAPPER_MAX_UPLOAD_BYTES: "${CLAUDE_WRAPPER_MAX_UPLOAD_BYTES:-2147483648}"
+      CLAUDE_WRAPPER_REQUEST_TIMEOUT: "${CLAUDE_WRAPPER_REQUEST_TIMEOUT:-1800}"
+      CLAUDE_WRAPPER_WORKERS: "${CLAUDE_WRAPPER_WORKERS:-1}"
+
+      # Per-conversation token cap. Each conversation may spend
+      # ALLOWANCE x PERCENT tokens before the wrapper pauses with a checkpoint
+      # message; reply with a continue keyword to grant another block, or start
+      # a new chat to reset. ON by default at the Max 5x ($100) plan. Set the
+      # allowance by plan (pro | max 5x | max 20x — an estimate scaled from
+      # PRO_SESSION_TOKENS) or directly via SESSION_TOKEN_ALLOWANCE (which wins).
+      # Set the plan to "off" to disable the cap.
+      CLAUDE_WRAPPER_SESSION_PLAN: "${CLAUDE_WRAPPER_SESSION_PLAN:-max 5x}"
+      CLAUDE_WRAPPER_PRO_SESSION_TOKENS: "${CLAUDE_WRAPPER_PRO_SESSION_TOKENS:-1500000}"
+      CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE: "${CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE:-0}"
+      CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT: "${CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT:-5}"
+      CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD: "${CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD:-continue,proceed,keep going,go on,yes}"
+
+      # Streaming shape. REASONING_CHANNEL decides where thinking, tool
+      # activity and the "still working" tick go: details (default) |
+      # reasoning_content | think_tags | none. See .env.example for the
+      # per-client tradeoffs — "none" also silences the progress ticks, so a
+      # buffering reverse proxy sees only the invisible keep-alive comments.
+      CLAUDE_WRAPPER_REASONING_CHANNEL: "${CLAUDE_WRAPPER_REASONING_CHANNEL:-details}"
+      CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY: "${CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY:-true}"
+      CLAUDE_WRAPPER_SSE_HEARTBEAT: "${CLAUDE_WRAPPER_SSE_HEARTBEAT:-15}"
+      CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES: "${CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES:-2048}"
+      CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS: "${CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS:-25}"
+      CLAUDE_WRAPPER_STREAM_PARTIAL: "${CLAUDE_WRAPPER_STREAM_PARTIAL:-true}"
+
+      # Headless Claude Code can't show its AskUserQuestion card, so the
+      # wrapper teaches it to ask in plain text and stop instead.
+      CLAUDE_WRAPPER_CLARIFY: "${CLAUDE_WRAPPER_CLARIFY:-on}"
+      CLAUDE_WRAPPER_CLARIFY_PROMPT: "${CLAUDE_WRAPPER_CLARIFY_PROMPT:-}"
+      CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS: "${CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS:-}"
+
+      # `auto` scans the installed CLI for its model list; `off` uses the
+      # static fallback.
+      CLAUDE_WRAPPER_MODEL_DISCOVERY: "${CLAUDE_WRAPPER_MODEL_DISCOVERY:-auto}"
+
+      # When set, the wrapper injects a system-prompt addendum telling
+      # Claude how to query OpenWebUI's retrieval API. The api key passes
+      # through to Claude's Bash tool via env, never into the prompt.
+      OPENWEBUI_BASE_URL: "${OPENWEBUI_BASE_URL:-}"
+      OPENWEBUI_API_KEY: "${OPENWEBUI_API_KEY:-}"
+      OPENWEBUI_DEFAULT_COLLECTION: "${OPENWEBUI_DEFAULT_COLLECTION:-}"
+
+      # ---- Per-model capability profiles (README "Per-model capability profiles") ----
+      # Container-internal path to the profile JSON. The inbox is the easiest
+      # host-visible mount: drop profiles.json in ${CLAUDE_INBOX_DIR:-./inbox}
+      # and set this to /data/inbox/profiles.json. Blank = built-in defaults.
+      CLAUDE_WRAPPER_MODEL_PROFILES: "${CLAUDE_WRAPPER_MODEL_PROFILES:-}"
+      CLAUDE_WRAPPER_MODEL_PROFILE_OVERRIDES: "${CLAUDE_WRAPPER_MODEL_PROFILE_OVERRIDES:-}"
+      # Hard gate for the terminal capability (default off): until set, chat
+      # runs carry --disallowedTools Bash and no model advertises `terminal`.
+      CLAUDE_WRAPPER_EXPOSE_TERMINAL: "${CLAUDE_WRAPPER_EXPOSE_TERMINAL:-}"
+      # Lets the tool bridge inject Anthropic server-side web search for
+      # web_search-profiled models (a new billing surface, hence its own gate).
+      CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH: "${CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH:-}"
+      CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS: "${CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS:-8}"
+      # Optional OpenAI-compatible image backend for /v1/images/generations.
+      CLAUDE_WRAPPER_IMAGE_BACKEND_URL: "${CLAUDE_WRAPPER_IMAGE_BACKEND_URL:-}"
+      CLAUDE_WRAPPER_IMAGE_BACKEND_KEY: "${CLAUDE_WRAPPER_IMAGE_BACKEND_KEY:-}"
+      CLAUDE_WRAPPER_IMAGE_BACKEND_MODEL: "${CLAUDE_WRAPPER_IMAGE_BACKEND_MODEL:-}"
+    volumes:
+      # Uploads, generated outputs, per-session workspaces, session id map.
+      - claude-data:/data
+      # Host-side drop folder. Put files here on the host; reference them
+      # in chat as /data/inbox/<file> so Claude reads the real bytes
+      # instead of OWU's text extraction. Read-only by default.
+      #
+      # This MUST be a path that already exists and is readable by
+      # CLAUDE_UID above — Docker creates a missing bind source as a
+      # ROOT-OWNED directory, which the container then can't read.
+      - ${CLAUDE_INBOX_DIR:-./inbox}:/data/inbox:ro
+      # Claude Code's own state. Sessions/projects/locks MUST stay isolated to
+      # this container: bind-mounting the host's whole ~/.claude co-mingles its
+      # live daemon, session locks and 700-mode sessions dir, which breaks
+      # `claude --resume` — the first turn of a chat succeeds (it creates a
+      # session) but every follow-up turn then fails with
+      # `error_during_execution`. So Claude state lives in a container-local
+      # volume, authenticated by its own one-time login:
+      #
+      #   docker compose run --rm -it claude-wrapper login
+      #
+      # To instead share the HOST account's login, add the optional overlay:
+      #   docker compose -f docker-compose.yml -f docker-compose.host-credentials.yml up -d
+      - claude-home:/home/claude/.claude
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CLAUDE_WRAPPER_PORT:-8000}/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  claude-data:
+  # Container-local Claude Code state (sessions/projects/locks), isolated from
+  # the host so `--resume` works on follow-up turns. Survives restarts/rebuilds.
+  claude-home:

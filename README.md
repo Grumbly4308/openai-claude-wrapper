@@ -11,7 +11,8 @@ OpenAI-compatible HTTP API in front of [Claude Code](https://docs.claude.com/en/
 - Runs as a multi-container sandbox where the agent has no route to the
   internet except a domain allowlist — the supported deployment. (A
   single-container layout exists but is **sunset**: kept for local
-  development and rollback only; see the note under Quick start.)
+  development and rollback only — see
+  [Single-container layout (sunset)](#single-container-layout-sunset).)
 
 ---
 
@@ -21,6 +22,7 @@ OpenAI-compatible HTTP API in front of [Claude Code](https://docs.claude.com/en/
 - [Quick start (Docker Compose)](#quick-start-docker-compose)
 - [Quick start (Podman)](#quick-start-podman)
 - [Sandboxed deployment](#sandboxed-deployment-network-isolated-agent)
+- [Single-container layout (sunset)](#single-container-layout-sunset)
 - [Configuration reference](#configuration-reference)
 - [Endpoints](#endpoints)
 - [Chat features](#chat-features)
@@ -60,12 +62,13 @@ declare a `version:` key, so any Compose v2-compatible frontend works.
 
 ## Quick start (Docker Compose)
 
-> **SUNSET — this single-container quick start is no longer the supported
-> deployment.** Production and regression testing run the sandboxed topology:
-> see [Sandboxed deployment](#sandboxed-deployment-network-isolated-agent).
-> The steps below still work and remain
-> useful for local development, but new deployment features land in the
-> sandbox stack first.
+This brings up the **sandboxed stack — the default and supported way the
+wrapper ships**: the FastAPI server as the only published port, the agent in a
+network-isolated container whose sole egress is a squid domain allowlist, and
+a credential-refresher sidecar. Topology details:
+[Sandboxed deployment](#sandboxed-deployment-network-isolated-agent). The
+retired single-container layout survives for local development as
+[`docker-compose.single.yml`](#single-container-layout-sunset).
 
 ### 1. Configure
 
@@ -139,16 +142,18 @@ docker images claude-wrapper:latest
 
 ### 3. Initialize Claude Code credentials (one time)
 
-Runs Claude's OAuth flow inside the container and stores the credentials in the
-`claude-home` volume, where they survive restarts, rebuilds and
-`docker compose down`.
+Stores the credentials in the shared `claude-home` volume, where they survive
+restarts, rebuilds and `docker compose down`. The interactive OAuth callback
+cannot complete from inside the isolated agent container, so the bootstrap
+runs in the refresher — it has ordinary networking and the writable mount
+(details: [First-time login](#first-time-login)):
 
 ```bash
-# Interactive — browser-based OAuth (recommended):
-docker compose run --rm -it claude-wrapper login
+# Interactive — type /login at the prompt, complete the flow, /exit:
+docker compose run --rm -it claude-refresher claude
 
 # OR headless / CI — prints a URL + code, accepts a long-lived token:
-docker compose run --rm -it claude-wrapper setup-token
+docker compose run --rm -it claude-refresher setup-token
 ```
 
 Skip this entirely if you set `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`
@@ -165,9 +170,13 @@ loopback, LAN, or any peer container. Confirm:
 
 ```bash
 curl -fsS http://localhost:8000/healthz     # {"status":"ok"}
-docker compose ps                           # claude-wrapper  Up (healthy)
+docker compose ps        # claude-wrapper, claude-agent, claude-squid,
+                         # claude-refresher — all Up
 docker compose logs -f claude-wrapper
 ```
+
+Then verify the sandbox is actually fencing egress — the two-command check in
+[Sandboxed deployment](#sandboxed-deployment-network-isolated-agent).
 
 The startup log reports the resolved model list, whether runs execute locally or
 remotely, and the state of the knowledge base, clarification and download-link
@@ -310,7 +319,7 @@ something is misconfigured, not a reason to escalate.
   `proxy` and puts its pid file on the tmpfs at `/var/cache/squid`, so under
   podman it fails at startup with
   `FATAL: failed to open /var/cache/squid/squid.pid: (13) Permission denied`.
-  `docker-compose.sandbox.yml` pins `mode=1777` on both squid tmpfs mounts to
+  `docker-compose.yml` pins `mode=1777` on both squid tmpfs mounts to
   make the two runtimes agree. Pin the mode on any tmpfs you add for the same
   reason — and note how this one presents, because it is the worst kind of
   failure: `restart: unless-stopped` turns the crash into an invisible loop, so
@@ -364,8 +373,8 @@ podman pod ls && podman pod rm -f <pod-name>
 
 ## Sandboxed deployment (network-isolated agent)
 
-`docker-compose.sandbox.yml` splits the wrapper into three containers so the
-FastAPI server is the **only** externally reachable service and the agent —
+The default stack (`docker-compose.yml`) splits the wrapper into containers so
+the FastAPI server is the **only** externally reachable service and the agent —
 where model-driven tool use actually executes — has no route to the internet
 except through a domain allowlist:
 
@@ -378,7 +387,7 @@ except through a domain allowlist:
 ```
 
 ```bash
-docker compose -f docker-compose.sandbox.yml up -d --build
+docker compose up -d --build
 ```
 
 **Do the one-time login before you rely on it, and read
@@ -391,10 +400,10 @@ Verify the allowlist end-to-end once it is up:
 
 ```bash
 # allowed host — completes
-docker compose -f docker-compose.sandbox.yml exec claude-agent \
+docker compose exec claude-agent \
     curl -sS -o /dev/null -w '%{http_code}\n' https://api.anthropic.com/
 # unlisted host — 403 from squid, in milliseconds
-docker compose -f docker-compose.sandbox.yml exec claude-agent \
+docker compose exec claude-agent \
     curl -sS -o /dev/null -w '%{http_code}\n' https://example.com/
 ```
 
@@ -474,6 +483,26 @@ endpoints — with these caveats:
   are unpinned. Pin them yourself if you need reproducibility.
 
 ---
+
+## Single-container layout (sunset)
+
+The original one-container deployment survives as `docker-compose.single.yml`
+for local development and as a rollback path. It is **no longer the supported
+way to ship**: no network isolation for tool use, no egress allowlist, and new
+deployment features land in the default sandboxed stack first.
+
+```bash
+docker compose -f docker-compose.single.yml build
+docker compose -f docker-compose.single.yml run --rm -it claude-wrapper login
+docker compose -f docker-compose.single.yml up -d
+```
+
+The [host-credentials overlay](docker-compose.host-credentials.yml) applies to
+this layout only:
+
+```bash
+docker compose -f docker-compose.single.yml -f docker-compose.host-credentials.yml up -d
+```
 
 ## Configuration reference
 
@@ -1366,7 +1395,7 @@ writable, env credentials pinned empty — so borrow it and compose resolves the
 volume for you:
 
 ```bash
-docker compose -f docker-compose.sandbox.yml run --rm -it claude-refresher claude
+docker compose run --rm -it claude-refresher claude
 # type /login at the prompt, complete the flow, then /exit
 ```
 
@@ -1437,7 +1466,7 @@ an environment credential wins and then nothing renews the file underneath it.
   host's `~/.claude/.credentials.json` and add the overlay:
 
   ```bash
-  docker compose -f docker-compose.yml -f docker-compose.host-credentials.yml up -d
+  docker compose -f docker-compose.single.yml -f docker-compose.host-credentials.yml up -d
   ```
 
   This bind-mounts that single file read-only. Because it's one file rather than
@@ -1571,7 +1600,7 @@ unauthenticated as well.
 
 ## Data and persistence
 
-`docker-compose.yml` mounts two named volumes:
+`docker-compose.single.yml` mounts two named volumes:
 
 - `claude-data` → `/data` — uploaded and generated files, the session registry,
   usage ledgers, batch records, per-session workspaces.
@@ -1583,7 +1612,7 @@ unauthenticated as well.
 …plus one host bind mount: `${CLAUDE_INBOX_DIR:-./inbox}` → `/data/inbox`,
 read-only.
 
-`docker-compose.sandbox.yml` differs: **three** volumes (a separate
+`docker-compose.yml` differs: **three** volumes (a separate
 `claude-workspace` shared between the API and agent containers at the same path),
 `claude-home` mounted **read-only** on the API container and writable on the
 agent, and the inbox mounted on the agent rather than the API.

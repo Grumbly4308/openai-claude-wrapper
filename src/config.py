@@ -351,7 +351,7 @@ class Settings:
             # whole block per step. On by default; set CLAUDE_WRAPPER_STREAM_PARTIAL
             # =off to fall back to whole-block events.
             stream_partial_messages=_bool_env("CLAUDE_WRAPPER_STREAM_PARTIAL", True),
-            # Sandboxed topology (docker-compose.sandbox.yml): when set, the CLI
+            # Sandboxed topology (docker-compose.yml): when set, the CLI
             # is not spawned in this container — every run is sent to the agent
             # shim (src.agent_shim) at this base URL, which lives on an internal
             # network whose only egress is the allowlisting proxy. Empty (the

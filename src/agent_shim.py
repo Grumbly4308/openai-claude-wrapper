@@ -1,6 +1,6 @@
 """The agent container's inbound surface: run `claude -p` on behalf of the API.
 
-In the sandboxed topology (docker-compose.sandbox.yml) the FastAPI wrapper and
+In the sandboxed topology (docker-compose.yml) the FastAPI wrapper and
 the Claude Code CLI live in different containers: the wrapper is the only
 externally reachable service, and the agent container — where model-driven
 tool use actually executes — sits on an internal network whose only egress is

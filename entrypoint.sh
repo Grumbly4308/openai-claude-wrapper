@@ -51,8 +51,9 @@ warn_if_no_auth() {
       docker compose run --rm -it claude-wrapper claude
       # type /login at the prompt, complete the flow, /exit
 
-  Under the sandbox topology the claude-refresher service keeps
-  that login renewed from there — no further action needed.
+  After that the CLI renews the login itself whenever it runs,
+  and the claude-refresher service covers idle stretches — no
+  further action needed.
 
   …or mint a ~1-year token and set it in .env (it is PRINTED,
   not saved to the volume; also record the date so the boot

@@ -42,8 +42,9 @@ Check items off as they land; keep one PR per phase where practical.
       included) and writes the toggles via OpenWebUI's local admin API. The
       wrapper never contacts OpenWebUI. (Needed because OpenWebUI doesn't map
       pulled metadata into its capability toggles; delete if it ever does)
-- [ ] Confirm the OpenWebUI model-update endpoint shape against the deployed
-      version; pin the minimum supported OpenWebUI version in the script
+- [x] Confirm the OpenWebUI model-update endpoint shape against the deployed
+      version — validated live by the regression pass (RT-8 dry run + RT-9
+      real sync, 2026-08-12)
 - [x] Document puller usage (env vars: wrapper URL, OpenWebUI URL + admin
       key; run via cron or OpenWebUI startup hook)
 
@@ -97,7 +98,9 @@ Check items off as they land; keep one PR per phase where practical.
 - [x] README: profiles configuration reference + example profile file,
       including `CLAUDE_WRAPPER_EXPOSE_TERMINAL` and why it defaults off
 - [x] Ship `deploy/` example profile matching current default behavior
-- [ ] End-to-end pass against a live OpenWebUI (toggles, tool calls, denials)
+- [x] End-to-end pass against a live OpenWebUI (toggles, tool calls,
+      denials) — full regression RT-1…RT-19 passed on the dev server,
+      2026-08-12
 - [x] Migration note: absent profile file == today's behavior
 - [x] Run full test suite + `qa` if available; fix fallout
 
@@ -126,5 +129,7 @@ Check items off as they land; keep one PR per phase where practical.
 - [x] Rewrite `TOOL-PROFILES-REGRESSION.md` against the sandbox stack,
       including the new RT-8s marquee test (terminal exposed **and** squid
       still denying non-allowlisted egress)
-- [ ] Run the reworked regression pass on the dev server (RT-1 … RT-19;
-      RT-8's dry-run output needed verbatim)
+- [x] Run the reworked regression pass on the dev server (RT-1 … RT-19) —
+      **passed 2026-08-12** (rootless podman; found and fixed along the way:
+      buildx-vs-podman stale image, Native-mode masking group A, no haiku in
+      the deployed CLI's model list)

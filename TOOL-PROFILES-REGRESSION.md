@@ -1,5 +1,9 @@
 # Per-model tool profiles — manual regression pass (sandboxed wrapper)
 
+> **Last full pass: 2026-08-12** — dev server, rootless podman, live
+> OpenWebUI. Re-run on the next branch that touches profiles, the bridge,
+> the runner argv, or the sandbox compose.
+
 Manual acceptance run for the `feat/sandbox-tool-profiles` branch against a
 live OpenWebUI. **The sandboxed topology (`docker-compose.sandbox.yml`) is the
 deployment of record** — the single-container layout is sunset and no longer

@@ -752,3 +752,316 @@ def test_json_mode_streaming_unparseable_errors(bridge):
     errors = [c["error"]["message"] for c in chunks if "error" in c]
     assert len(errors) == 1
     assert "I need more details first." in errors[0]
+
+
+# ---------- capability profiles on the bridge (phase 3) ----------
+
+
+@pytest.fixture
+def profiles(monkeypatch):
+    """Point the profile loader at a per-test file; reset caches around it."""
+    from src.capabilities import PROFILE_FILE_ENV, reset_profile_cache
+
+    def _set(doc: dict):
+        path = Path(_TMP) / f"profiles-{len(str(doc))}.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        monkeypatch.setenv(PROFILE_FILE_ENV, str(path))
+        reset_profile_cache()
+
+    yield _set
+    reset_profile_cache()
+
+
+def test_client_tools_denied_by_profile(bridge, profiles):
+    bridge(_anthropic_tool_use_response())
+    profiles({"models": [{"match": "claude-haiku-4-5", "remove": ["client_tools"]}]})
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert "client_tools" in detail and "web_search" in detail
+
+
+def test_code_interpreter_injected_after_client_tools(bridge, profiles):
+    capture = bridge(_anthropic_tool_use_response())
+    profiles({"models": [{"match": "claude-haiku-4-5", "add": ["code_interpreter"]}]})
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 200
+    sent = capture.requests[0]["tools"]
+    assert [t.get("name") for t in sent] == ["web_search", "code_execution"]
+    assert sent[1]["type"] == "code_execution_20260521"
+    # tool_choice still governs the client tools.
+    assert capture.requests[0]["tool_choice"] == {"type": "auto"}
+
+
+def test_bridge_web_search_needs_env_opt_in(bridge, profiles, monkeypatch):
+    # Capability on (default) but no env opt-in → no injection.
+    capture = bridge(_anthropic_tool_use_response())
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 200
+    assert [t.get("name") for t in capture.requests[0]["tools"]] == ["web_search"]
+
+    # Env opt-in → injected, basic variant for Haiku. The client's own
+    # "web_search" function and the server tool share a name here; the server
+    # tool is typed, the client one isn't — assert on both fields.
+    monkeypatch.setenv("CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH", "true")
+    capture = bridge(_anthropic_tool_use_response())
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 200
+    sent = capture.requests[0]["tools"]
+    assert len(sent) == 2
+    assert sent[1] == {"type": "web_search_20250305", "name": "web_search"}
+
+
+def test_web_search_version_tracks_model_family(bridge, profiles, monkeypatch):
+    monkeypatch.setenv("CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH", "true")
+    capture = bridge(_anthropic_tool_use_response())
+    r = _post(
+        {
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 200
+    assert capture.requests[0]["tools"][1]["type"] == "web_search_20260209"
+
+
+# ---------- wrapper-owned tools & the hybrid loop (phase 4) ----------
+
+
+def _anthropic_text_response(text: str = "The answer is 4.") -> dict:
+    return {
+        "id": "msg_02",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-4-5",
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 40, "output_tokens": 10},
+    }
+
+
+def _wrapper_call_response(name: str, tool_input: dict, tool_id: str = "toolu_w1") -> dict:
+    return {
+        "id": "msg_01",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-4-5",
+        "content": [
+            {"type": "tool_use", "id": tool_id, "name": name, "input": tool_input}
+        ],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 30, "output_tokens": 5},
+    }
+
+
+def test_hybrid_loop_executes_wrapper_tool(bridge, profiles):
+    capture = bridge(
+        _wrapper_call_response("calculate", {"expression": "2+2"}),
+        _anthropic_text_response(),
+    )
+    profiles({"models": [{"match": "claude-haiku-4-5", "add": ["time_calc"]}]})
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "what is 2+2?"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 200
+    msg = r.json()["choices"][0]["message"]
+    assert msg["content"] == "The answer is 4."
+    assert not msg.get("tool_calls")
+    # Two upstream rounds; the second carries the echoed assistant turn and
+    # the wrapper's tool_result.
+    assert len(capture.requests) == 2
+    second = capture.requests[1]["messages"]
+    assert second[-2]["role"] == "assistant"
+    assert second[-2]["content"][0]["name"] == "calculate"
+    assert second[-1]["role"] == "user"
+    assert second[-1]["content"][0]["tool_use_id"] == "toolu_w1"
+    assert "= 4" in second[-1]["content"][0]["content"]
+    # Wrapper tool definitions were injected after the client's.
+    names = [t.get("name") for t in capture.requests[0]["tools"]]
+    assert names == ["web_search", "get_current_time", "calculate"]
+    # Usage accumulates across rounds.
+    assert r.json()["usage"]["prompt_tokens"] == 70
+
+
+def test_mixed_turn_returns_client_calls_and_drops_wrapper_calls(bridge, profiles):
+    mixed = _wrapper_call_response("calculate", {"expression": "1+1"})
+    mixed["content"].append(
+        {"type": "tool_use", "id": "toolu_c1", "name": "web_search", "input": {"query": "x"}}
+    )
+    capture = bridge(mixed)
+    profiles({"models": [{"match": "claude-haiku-4-5", "add": ["time_calc"]}]})
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 200
+    msg = r.json()["choices"][0]["message"]
+    calls = msg["tool_calls"]
+    assert [c["function"]["name"] for c in calls] == ["web_search"]
+    # One round only: the client loop takes over; the wrapper call was
+    # neither executed nor surfaced.
+    assert len(capture.requests) == 1
+
+
+def test_wrapper_tool_name_collision_is_rejected(bridge, profiles):
+    bridge()
+    profiles({"models": [{"match": "claude-haiku-4-5", "add": ["time_calc"]}]})
+    calc_tool = {
+        "type": "function",
+        "function": {"name": "calculate", "parameters": {"type": "object", "properties": {}}},
+    }
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [calc_tool],
+        }
+    )
+    assert r.status_code == 400
+    assert "calculate" in r.json()["detail"]
+
+
+def test_hybrid_loop_round_cap(bridge, profiles):
+    responses = [
+        _wrapper_call_response("calculate", {"expression": "1+1"}, tool_id=f"toolu_{i}")
+        for i in range(8)
+    ]
+    capture = bridge(*responses)
+    profiles({"models": [{"match": "claude-haiku-4-5", "add": ["time_calc"]}]})
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "loop forever"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 502
+    assert "rounds" in r.json()["detail"]
+    assert len(capture.requests) == 8
+
+
+def test_memory_persists_under_the_data_dir(bridge, profiles):
+    capture = bridge(
+        _wrapper_call_response(
+            "memory",
+            {"command": "create", "path": "/memories/prefs.md", "file_text": "likes tabs"},
+        ),
+        _anthropic_text_response("Noted."),
+    )
+    profiles({"models": [{"match": "claude-haiku-4-5", "add": ["memory"]}]})
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "remember I like tabs"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 200
+    assert len(capture.requests) == 2
+    # Glob the live settings' data dir — under pytest, whichever test module
+    # imported first owns CLAUDE_WRAPPER_DATA, so _TMP may not be it.
+    from src.config import SETTINGS
+
+    stored = list((SETTINGS.data_dir / "memory").rglob("prefs.md"))
+    assert stored and stored[0].read_text() == "likes tabs"
+
+
+def test_streaming_hybrid_loop_suppresses_wrapper_calls(bridge, profiles):
+    round1 = [
+        {"type": "message_start",
+         "message": {"id": "msg_01", "usage": {"input_tokens": 30, "output_tokens": 1}}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "tool_use", "id": "toolu_w1", "name": "calculate", "input": {}}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "input_json_delta", "partial_json": "{\"expression\": \"2+2\"}"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+         "usage": {"output_tokens": 5}},
+        {"type": "message_stop"},
+    ]
+    round2 = [
+        {"type": "message_start",
+         "message": {"id": "msg_02", "usage": {"input_tokens": 40, "output_tokens": 1}}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "It is 4."}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+         "usage": {"output_tokens": 6}},
+        {"type": "message_stop"},
+    ]
+    capture = bridge(_sse(round1), _sse(round2))
+    profiles({"models": [{"match": "claude-haiku-4-5", "add": ["time_calc"]}]})
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "claude-haiku-4-5",
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "messages": [{"role": "user", "content": "2+2?"}],
+            "tools": [WEB_SEARCH_TOOL],
+        },
+    ) as r:
+        assert r.status_code == 200
+        lines = [l for l in r.iter_lines() if l.startswith("data:")]
+    chunks = [json.loads(p) for p in (l[5:].strip() for l in lines) if p != "[DONE]"]
+
+    # The wrapper's calculate call never surfaced as an OpenAI tool_call.
+    assert not any(
+        c["choices"][0]["delta"].get("tool_calls") for c in chunks if c.get("choices")
+    )
+    content = "".join(
+        c["choices"][0]["delta"].get("content", "") for c in chunks if c.get("choices")
+    )
+    assert content == "It is 4."
+    finish = [
+        c["choices"][0]["finish_reason"]
+        for c in chunks
+        if c.get("choices") and c["choices"][0].get("finish_reason")
+    ]
+    assert finish == ["stop"]
+    # Round 2 carried the echoed assistant turn and the tool_result.
+    assert len(capture.requests) == 2
+    echoed = capture.requests[1]["messages"]
+    assert echoed[-2]["content"][0] == {
+        "type": "tool_use", "id": "toolu_w1", "name": "calculate",
+        "input": {"expression": "2+2"},
+    }
+    assert "= 4" in echoed[-1]["content"][0]["content"]
+    # Usage sums both rounds.
+    usage = [c for c in chunks if not c.get("choices")][0]["usage"]
+    assert usage["prompt_tokens"] == 70 and usage["completion_tokens"] == 11

@@ -113,18 +113,6 @@ class ResponseFormat(BaseModel):
     json_schema: Optional[dict[str, Any]] = None
 
 
-class ResponseFormat(BaseModel):
-    """OpenAI structured-output request (the ``response_format`` parameter).
-
-    ``json_schema`` holds the OpenAI envelope ({"name", "schema", "strict"})
-    or, from lenient clients, the bare JSON Schema itself.
-    """
-
-    model_config = ConfigDict(extra="allow")
-    type: str = "text"  # "text" | "json_object" | "json_schema"
-    json_schema: Optional[dict[str, Any]] = None
-
-
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
     model: str
@@ -247,6 +235,11 @@ class ModelInfo(BaseModel):
     object: Literal["model"] = "model"
     created: int = 0
     owned_by: str = "anthropic"
+    # Wrapper extension: the model's resolved capability profile (see
+    # src/capabilities.py). Extra fields are legal on the OpenAI schema;
+    # clients that don't know the field ignore it, pullers use it as the
+    # source of truth for per-model capability toggles.
+    capabilities: list[str] = []
 
 
 class ModelList(BaseModel):

@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import AsyncIterator, Optional
 
 import aiofiles
+import httpx
 
-from .config import ULTRACODE_EFFORT, effort_choices_for
+from .capabilities import cli_disallowed_tools
+from .config import SETTINGS, ULTRACODE_EFFORT, effort_choices_for
 
 log = logging.getLogger("claude_wrapper.runner")
 
@@ -22,6 +24,12 @@ log = logging.getLogger("claude_wrapper.runner")
 # "Separator is found, but chunk is longer than limit". Give the reader
 # enough headroom for realistic payloads.
 _STREAM_BUFFER_LIMIT = 64 * 1024 * 1024  # 64 MiB
+
+# Sentinel key terminating the agent shim's NDJSON stream (sandboxed topology).
+# Every Claude Code stream-json event is an object keyed on "type", so a line
+# opening with this key can only be the shim's exit record.
+SHIM_EXIT_KEY = "__claude_wrapper_exit__"
+_SHIM_EXIT_PREFIX = '{"' + SHIM_EXIT_KEY + '"'
 
 
 @dataclass
@@ -46,6 +54,170 @@ class ClaudeResult:
     output_tokens: int = 0
     events: list[StreamEvent] = field(default_factory=list)
     error: Optional[str] = None
+
+
+@dataclass
+class ExecExit:
+    """Terminal status of one agent execution (local subprocess or remote shim)."""
+
+    returncode: int
+    stderr: str = ""
+    timed_out: bool = False
+
+
+class LocalAgentExecutor:
+    """Runs the CLI as a subprocess in this container — the classic layout.
+
+    The stream contract shared with RemoteAgentExecutor: yields ("line", str)
+    for each raw stdout line, then exactly one ("exit", ExecExit). A per-line
+    timeout kills the process and is reported via ExecExit.timed_out rather
+    than raised; cancellation kills the process and propagates.
+    """
+
+    async def stream(
+        self,
+        argv: list[str],
+        prompt: str,
+        cwd: Path,
+        env_extra: Optional[dict[str, str]],
+        timeout: int,
+    ):
+        env = os.environ.copy()
+        env.setdefault("CI", "1")
+        env.setdefault("CLAUDE_CODE_DISABLE_TELEMETRY", "1")
+        if env_extra:
+            env.update(env_extra)
+
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(cwd),
+            env=env,
+            limit=_STREAM_BUFFER_LIMIT,
+        )
+
+        async def _feed_stdin() -> None:
+            # Concurrent writer so a prompt larger than the pipe buffer
+            # (typically 64 KiB on Linux) doesn't deadlock against stdout.
+            try:
+                proc.stdin.write(prompt.encode("utf-8"))
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                with contextlib.suppress(Exception):
+                    proc.stdin.close()
+
+        stdin_task = asyncio.create_task(_feed_stdin())
+        stderr_task = asyncio.create_task(_drain_stderr(proc.stderr))
+        timed_out = False
+        try:
+            try:
+                async for line in _read_lines(proc.stdout, timeout):
+                    yield "line", line
+            except asyncio.TimeoutError:
+                timed_out = True
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+            except asyncio.CancelledError:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                raise
+        finally:
+            returncode = await proc.wait()
+            stderr_output = await stderr_task
+            with contextlib.suppress(Exception):
+                await stdin_task
+        yield "exit", ExecExit(returncode=returncode, stderr=stderr_output, timed_out=timed_out)
+
+
+class RemoteAgentExecutor:
+    """Runs the CLI via the agent shim (src.agent_shim) in a sandboxed container.
+
+    Same stream contract as LocalAgentExecutor; the shim forwards raw stream-json
+    stdout lines verbatim and terminates with one SHIM_EXIT_KEY sentinel line
+    carrying returncode/stderr. argv[0] (this container's claude path) is
+    dropped from the request — the shim prepends its own configured binary, so
+    nothing that reaches its port can exec an arbitrary program there.
+    """
+
+    def __init__(self, base_url: str, token: str = ""):
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self._client: Optional[httpx.AsyncClient] = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            # trust_env=False: in the sandboxed topology this container carries
+            # HTTP(S)_PROXY pointing at the egress proxy for *upstream* calls;
+            # the shim hop is internal and must never be routed through it.
+            self._client = httpx.AsyncClient(base_url=self.base_url, trust_env=False)
+        return self._client
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def stream(
+        self,
+        argv: list[str],
+        prompt: str,
+        cwd: Path,
+        env_extra: Optional[dict[str, str]],
+        timeout: int,
+    ):
+        payload = {
+            "args": list(argv[1:]),
+            "prompt": prompt,
+            "cwd": str(cwd),
+            "env": dict(env_extra or {}),
+        }
+        headers = {"authorization": f"Bearer {self.token}"} if self.token else {}
+        exit_info: Optional[ExecExit] = None
+        try:
+            client = self._get_client()
+            # read=timeout maps the local per-line timeout onto the HTTP read;
+            # closing the stream (context exit) is what tells the shim to kill
+            # the subprocess, mirroring the local kill-on-timeout/cancel.
+            async with client.stream(
+                "POST",
+                "/run",
+                json=payload,
+                headers=headers,
+                timeout=httpx.Timeout(30.0, read=float(timeout)),
+            ) as resp:
+                if resp.status_code != 200:
+                    body = (await resp.aread()).decode("utf-8", errors="replace")
+                    exit_info = ExecExit(
+                        returncode=-1,
+                        stderr=f"agent shim error {resp.status_code}: {body[:500]}",
+                    )
+                else:
+                    async for line in resp.aiter_lines():
+                        if not line.strip():
+                            continue
+                        if line.startswith(_SHIM_EXIT_PREFIX):
+                            try:
+                                meta = json.loads(line).get(SHIM_EXIT_KEY) or {}
+                            except json.JSONDecodeError:
+                                meta = {}
+                            exit_info = ExecExit(
+                                returncode=int(meta.get("returncode", -1)),
+                                stderr=str(meta.get("stderr") or ""),
+                                timed_out=bool(meta.get("timed_out")),
+                            )
+                            continue
+                        yield "line", line
+        except httpx.ReadTimeout:
+            exit_info = ExecExit(returncode=-1, timed_out=True)
+        except httpx.HTTPError as e:
+            exit_info = ExecExit(returncode=-1, stderr=f"agent shim unreachable: {e}")
+        yield "exit", exit_info or ExecExit(
+            returncode=-1, stderr="agent shim stream ended without an exit record"
+        )
 
 
 class SessionRegistry:
@@ -119,12 +291,16 @@ class ClaudeRunner:
         clarify_disallowed_tools: tuple[str, ...] = (),
         workspace_system_prompt: str = "",
         stream_partial_messages: bool = True,
+        executor=None,
     ):
         self.registry = registry
         self.workspace_root = workspace_root
         self.claude_bin = claude_bin
         self.request_timeout_seconds = request_timeout_seconds
         self.effort = effort
+        # How runs actually execute: a local subprocess by default, or the
+        # agent shim in the sandboxed split when deps wires a RemoteAgentExecutor.
+        self.executor = executor if executor is not None else LocalAgentExecutor()
         # Emit incremental text/thinking deltas (live streaming) via
         # `--include-partial-messages`. When on, the consolidated assistant
         # text/thinking blocks are suppressed in _normalize_stream_event to avoid
@@ -139,6 +315,12 @@ class ClaudeRunner:
         # workspace_hint=True (chat/responses) AND a prompt is configured. Empty
         # prompt ⇒ globally disabled (CLAUDE_WRAPPER_WORKSPACE_HINT=off).
         self.workspace_system_prompt = workspace_system_prompt
+
+    async def aclose(self) -> None:
+        """Release executor resources (the remote executor's HTTP client)."""
+        close = getattr(self.executor, "aclose", None)
+        if close is not None:
+            await close()
 
     def _session_cwd(self, session_key: str) -> Path:
         d = self.workspace_root / session_key
@@ -205,6 +387,7 @@ class ClaudeRunner:
         effort: Optional[str] = None,
         clarify: bool = False,
         workspace_hint: bool = False,
+        capability_gated: bool = True,
     ) -> list[str]:
         # Prompt is fed via stdin (not argv) to avoid E2BIG on large prompts.
         argv = [
@@ -257,8 +440,17 @@ class ClaudeRunner:
             segments.append(self.clarify_system_prompt)
         if segments:
             argv += ["--append-system-prompt", "\n\n".join(segments)]
+        # Capability gating (chat runs only — delegation passes
+        # capability_gated=False): tools the model's profile withholds, merged
+        # with the clarify set into one --disallowedTools emission. Dedup
+        # preserves first-seen order so the argv stays deterministic.
+        disallowed: list[str] = []
+        if capability_gated:
+            disallowed += cli_disallowed_tools(model or SETTINGS.default_model)
         if clarify and self.clarify_disallowed_tools:
-            argv += ["--disallowedTools", *self.clarify_disallowed_tools]
+            disallowed += self.clarify_disallowed_tools
+        if disallowed:
+            argv += ["--disallowedTools", *dict.fromkeys(disallowed)]
         argv += ["--dangerously-skip-permissions"]
         if extra_args:
             argv += list(extra_args)
@@ -274,10 +466,15 @@ class ClaudeRunner:
         effort: Optional[str] = None,
         clarify: bool = False,
         workspace_hint: bool = False,
+        capability_gated: bool = True,
     ) -> AsyncIterator[StreamEvent]:
         """Yield StreamEvents as the subprocess produces them.
 
         The final event is always either ``final`` or ``error``.
+
+        ``capability_gated`` applies the model's capability profile as
+        --disallowedTools. On by default so every chat surface is covered;
+        delegation runs pass False (they do their work through Bash).
         """
         lock = await self.registry.lock_for(session_key)
         await lock.acquire()
@@ -294,13 +491,8 @@ class ClaudeRunner:
                 effort=effort,
                 clarify=clarify,
                 workspace_hint=workspace_hint,
+                capability_gated=capability_gated,
             )
-
-            env = os.environ.copy()
-            env.setdefault("CI", "1")
-            env.setdefault("CLAUDE_CODE_DISABLE_TELEMETRY", "1")
-            if env_extra:
-                env.update(env_extra)
 
             eff_applied, eff_source = self._resolve_effort(model, effort)
             log.info(
@@ -313,107 +505,86 @@ class ClaudeRunner:
                 eff_source,
             )
 
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(cwd),
-                env=env,
-                limit=_STREAM_BUFFER_LIMIT,
-            )
-
-            async def _feed_stdin() -> None:
-                # Concurrent writer so a prompt larger than the pipe buffer
-                # (typically 64 KiB on Linux) doesn't deadlock against stdout.
-                try:
-                    proc.stdin.write(prompt.encode("utf-8"))
-                    await proc.stdin.drain()
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-                finally:
-                    with contextlib.suppress(Exception):
-                        proc.stdin.close()
-
-            stdin_task = asyncio.create_task(_feed_stdin())
-            stderr_task = asyncio.create_task(_drain_stderr(proc.stderr))
             final_text_parts: list[str] = []
             stop_reason = "stop"
             usage_input = 0
             usage_output = 0
             cost = 0.0
             errored: Optional[str] = None
+            exit_info: Optional[ExecExit] = None
 
-            try:
-                async for line in _read_lines(proc.stdout, self.request_timeout_seconds):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        evt = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+            # The executor owns the process (or the shim connection): it kills
+            # the subprocess on timeout/cancel and always terminates the stream
+            # with one ("exit", ExecExit) event on non-cancelled paths.
+            async for kind, payload in self.executor.stream(
+                argv=argv,
+                prompt=prompt,
+                cwd=cwd,
+                env_extra=env_extra,
+                timeout=self.request_timeout_seconds,
+            ):
+                if kind == "exit":
+                    exit_info = payload
+                    continue
+                line = payload.strip()
+                if not line:
+                    continue
+                try:
+                    evt = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-                    for normalized in _normalize_stream_event(evt, partial=self.stream_partial_messages):
-                        if normalized.kind == "text" and normalized.text:
-                            final_text_parts.append(normalized.text)
-                        yield normalized
+                for normalized in _normalize_stream_event(evt, partial=self.stream_partial_messages):
+                    if normalized.kind == "text" and normalized.text:
+                        final_text_parts.append(normalized.text)
+                    yield normalized
 
-                    if evt.get("type") == "result":
-                        stop_reason = _stop_reason_from_result(evt)
-                        cost = float(evt.get("total_cost_usd") or evt.get("cost_usd") or 0.0)
-                        usage = evt.get("usage") or {}
-                        usage_input = int(usage.get("input_tokens") or 0)
-                        usage_output = int(usage.get("output_tokens") or 0)
-                        if evt.get("subtype") and evt["subtype"] != "success":
-                            errored = evt.get("error") or evt.get("subtype")
+                if evt.get("type") == "result":
+                    stop_reason = _stop_reason_from_result(evt)
+                    cost = float(evt.get("total_cost_usd") or evt.get("cost_usd") or 0.0)
+                    usage = evt.get("usage") or {}
+                    usage_input = int(usage.get("input_tokens") or 0)
+                    usage_output = int(usage.get("output_tokens") or 0)
+                    if evt.get("subtype") and evt["subtype"] != "success":
+                        errored = evt.get("error") or evt.get("subtype")
 
-            except asyncio.TimeoutError:
+            returncode = exit_info.returncode if exit_info is not None else -1
+            stderr_output = exit_info.stderr if exit_info is not None else ""
+            if exit_info is not None and exit_info.timed_out and errored is None:
                 errored = "claude subprocess timed out"
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-            except asyncio.CancelledError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                raise
-            finally:
-                returncode = await proc.wait()
-                stderr_output = await stderr_task
-                with contextlib.suppress(Exception):
-                    await stdin_task
-                if returncode != 0 and errored is None:
-                    errored = f"claude exited {returncode}: {stderr_output[-500:] if stderr_output else ''}"
-                # Self-heal a broken resume. If a --resume turn fails — a non-zero
-                # exit, or a stream-json result with an error subtype like
-                # "error_during_execution" (which exits 0) — without producing any
-                # assistant text, the underlying Claude session is unusable. The
-                # most common cause is its transcript being gone (e.g. the session
-                # store was wiped, or never persisted) while our key->uuid mapping
-                # survived, so every retry re-resumes the same dead uuid and fails
-                # identically. Drop the mapping so the NEXT request mints a fresh
-                # uuid, switches to --session-id, and replays the full transcript
-                # (prepare_messages leaves replay-only mode once registry.has() is
-                # False). Costs one extra full-history turn but keeps the
-                # conversation alive instead of permanently bricking it.
-                #
-                # The "no assistant text this turn" guard means a session that
-                # streamed a real answer and only then hit a late error is left
-                # intact — we only reset sessions that produced nothing usable.
-                stderr_lc = (stderr_output or "").lower()
-                session_missing = "session" in stderr_lc and (
-                    "not found" in stderr_lc or "no such" in stderr_lc
+            if returncode != 0 and errored is None:
+                errored = f"claude exited {returncode}: {stderr_output[-500:] if stderr_output else ''}"
+            # Self-heal a broken resume. If a --resume turn fails — a non-zero
+            # exit, or a stream-json result with an error subtype like
+            # "error_during_execution" (which exits 0) — without producing any
+            # assistant text, the underlying Claude session is unusable. The
+            # most common cause is its transcript being gone (e.g. the session
+            # store was wiped, or never persisted) while our key->uuid mapping
+            # survived, so every retry re-resumes the same dead uuid and fails
+            # identically. Drop the mapping so the NEXT request mints a fresh
+            # uuid, switches to --session-id, and replays the full transcript
+            # (prepare_messages leaves replay-only mode once registry.has() is
+            # False). Costs one extra full-history turn but keeps the
+            # conversation alive instead of permanently bricking it.
+            #
+            # The "no assistant text this turn" guard means a session that
+            # streamed a real answer and only then hit a late error is left
+            # intact — we only reset sessions that produced nothing usable.
+            stderr_lc = (stderr_output or "").lower()
+            session_missing = "session" in stderr_lc and (
+                "not found" in stderr_lc or "no such" in stderr_lc
+            )
+            resume_unusable = bool(errored) and not final_text_parts
+            if not created and (session_missing or resume_unusable):
+                log.warning(
+                    "resume failed for session %s uuid %s (returncode=%s error=%r); "
+                    "dropping mapping so the next turn replays full history",
+                    session_key,
+                    session_uuid,
+                    returncode,
+                    errored,
                 )
-                resume_unusable = bool(errored) and not final_text_parts
-                if not created and (session_missing or resume_unusable):
-                    log.warning(
-                        "resume failed for session %s uuid %s (returncode=%s error=%r); "
-                        "dropping mapping so the next turn replays full history",
-                        session_key,
-                        session_uuid,
-                        returncode,
-                        errored,
-                    )
-                    await self.registry.forget(session_key)
+                await self.registry.forget(session_key)
 
             final_text = "".join(final_text_parts).strip()
 
@@ -446,6 +617,7 @@ class ClaudeRunner:
         effort: Optional[str] = None,
         clarify: bool = False,
         workspace_hint: bool = False,
+        capability_gated: bool = True,
     ) -> ClaudeResult:
         result = ClaudeResult(session_uuid="", final_text="")
         text_parts: list[str] = []
@@ -459,6 +631,7 @@ class ClaudeRunner:
             effort=effort,
             clarify=clarify,
             workspace_hint=workspace_hint,
+            capability_gated=capability_gated,
         ):
             result.events.append(evt)
             if evt.kind == "text" and evt.text:

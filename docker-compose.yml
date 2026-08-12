@@ -1,3 +1,10 @@
+# SUNSET — the single-container layout is no longer the supported deployment.
+# The sandboxed topology (docker-compose.sandbox.yml: wrapper + isolated agent
+# container + squid egress allowlist) is what we run and regression-test; see
+# README "Sandboxed deployment" and TOOL-PROFILES-REGRESSION.md. This file is
+# retained for local development and as a rollback path only — new deployment
+# features land in the sandbox stack first and are not guaranteed to be wired
+# here.
 services:
   claude-wrapper:
     build:
@@ -10,7 +17,7 @@ services:
         CLAUDE_GID: "${CLAUDE_GID:-1000}"
     image: claude-wrapper:latest
     container_name: claude-wrapper
-    restart: unless-stopped
+    restart: always
     # Belt-and-braces: the image already ends on `USER claude`, but pinning the
     # uid here means an image built with different args (or pulled from a
     # registry) still runs unprivileged, and `docker compose run` inherits it.
@@ -44,6 +51,7 @@ services:
       # OAuth login. Leave blank once you've run `compose run … login`.
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       CLAUDE_CODE_OAUTH_TOKEN: "${CLAUDE_CODE_OAUTH_TOKEN:-}"
+      CLAUDE_CODE_OAUTH_TOKEN_MINTED: "${CLAUDE_CODE_OAUTH_TOKEN_MINTED:-}"
 
       # Comma-separated bearer tokens clients must send as
       # `Authorization: Bearer <key>`. Leave unset to disable wrapper auth.
@@ -97,12 +105,52 @@ services:
       CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT: "${CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT:-5}"
       CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD: "${CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD:-continue,proceed,keep going,go on,yes}"
 
+      # Streaming shape. REASONING_CHANNEL decides where thinking, tool
+      # activity and the "still working" tick go: details (default) |
+      # reasoning_content | think_tags | none. See .env.example for the
+      # per-client tradeoffs — "none" also silences the progress ticks, so a
+      # buffering reverse proxy sees only the invisible keep-alive comments.
+      CLAUDE_WRAPPER_REASONING_CHANNEL: "${CLAUDE_WRAPPER_REASONING_CHANNEL:-details}"
+      CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY: "${CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY:-true}"
+      CLAUDE_WRAPPER_SSE_HEARTBEAT: "${CLAUDE_WRAPPER_SSE_HEARTBEAT:-15}"
+      CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES: "${CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES:-2048}"
+      CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS: "${CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS:-25}"
+      CLAUDE_WRAPPER_STREAM_PARTIAL: "${CLAUDE_WRAPPER_STREAM_PARTIAL:-true}"
+
+      # Headless Claude Code can't show its AskUserQuestion card, so the
+      # wrapper teaches it to ask in plain text and stop instead.
+      CLAUDE_WRAPPER_CLARIFY: "${CLAUDE_WRAPPER_CLARIFY:-on}"
+      CLAUDE_WRAPPER_CLARIFY_PROMPT: "${CLAUDE_WRAPPER_CLARIFY_PROMPT:-}"
+      CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS: "${CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS:-}"
+
+      # `auto` scans the installed CLI for its model list; `off` uses the
+      # static fallback.
+      CLAUDE_WRAPPER_MODEL_DISCOVERY: "${CLAUDE_WRAPPER_MODEL_DISCOVERY:-auto}"
+
       # When set, the wrapper injects a system-prompt addendum telling
       # Claude how to query OpenWebUI's retrieval API. The api key passes
       # through to Claude's Bash tool via env, never into the prompt.
       OPENWEBUI_BASE_URL: "${OPENWEBUI_BASE_URL:-}"
       OPENWEBUI_API_KEY: "${OPENWEBUI_API_KEY:-}"
       OPENWEBUI_DEFAULT_COLLECTION: "${OPENWEBUI_DEFAULT_COLLECTION:-}"
+
+      # ---- Per-model capability profiles (see README + TOOL-PROFILES-ROADMAP.md) ----
+      # Container-internal path to the profile JSON. The inbox is the easiest
+      # host-visible mount: drop profiles.json in ${CLAUDE_INBOX_DIR:-./inbox}
+      # and set this to /data/inbox/profiles.json. Blank = built-in defaults.
+      CLAUDE_WRAPPER_MODEL_PROFILES: "${CLAUDE_WRAPPER_MODEL_PROFILES:-}"
+      CLAUDE_WRAPPER_MODEL_PROFILE_OVERRIDES: "${CLAUDE_WRAPPER_MODEL_PROFILE_OVERRIDES:-}"
+      # Hard gate for the terminal capability (default off): until set, chat
+      # runs carry --disallowedTools Bash and no model advertises `terminal`.
+      CLAUDE_WRAPPER_EXPOSE_TERMINAL: "${CLAUDE_WRAPPER_EXPOSE_TERMINAL:-}"
+      # Lets the tool bridge inject Anthropic server-side web search for
+      # web_search-profiled models (a new billing surface, hence its own gate).
+      CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH: "${CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH:-}"
+      CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS: "${CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS:-8}"
+      # Optional OpenAI-compatible image backend for /v1/images/generations.
+      CLAUDE_WRAPPER_IMAGE_BACKEND_URL: "${CLAUDE_WRAPPER_IMAGE_BACKEND_URL:-}"
+      CLAUDE_WRAPPER_IMAGE_BACKEND_KEY: "${CLAUDE_WRAPPER_IMAGE_BACKEND_KEY:-}"
+      CLAUDE_WRAPPER_IMAGE_BACKEND_MODEL: "${CLAUDE_WRAPPER_IMAGE_BACKEND_MODEL:-}"
     volumes:
       # Uploads, generated outputs, per-session workspaces, session id map.
       - claude-data:/data

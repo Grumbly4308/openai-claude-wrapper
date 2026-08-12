@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse
 from .config import SETTINGS
 from .deps import FILE_STORE, auth_dependency
 from .models import BatchCreateRequest
+from .request_origin import current_origin
 
 
 log = logging.getLogger("claude_wrapper.batches")
@@ -89,7 +90,19 @@ async def _dispatch(endpoint: str, body: dict) -> tuple[int, Any]:
 
     from .main import app
 
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://batch") as client:
+    # The worker task copied the submitting request's context (create_task runs
+    # inside the POST handler), so current_origin() still holds the submitter's
+    # origin here. But re-entering the app runs RequestOriginMiddleware again on
+    # the inner request, which would overwrite it with whatever host this client
+    # presents — so forward the real origin as the inner request's base URL, or
+    # every generated-file link in the batch output points at a dead
+    # http://batch host. The placeholder is only used when there is no origin to
+    # forward (derive off, or no downloads configured), where no link is minted
+    # from it anyway.
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url=current_origin() or "http://batch",
+    ) as client:
         headers = {}
         if SETTINGS.require_auth and SETTINGS.api_keys:
             headers["Authorization"] = f"Bearer {next(iter(SETTINGS.api_keys))}"

@@ -11,8 +11,12 @@ what makes the trailer degrade to plain text rather than emit a broken link.
 Note that the batches worker is NOT one of them: routes_batches launches it with
 asyncio.create_task inside the POST handler, and create_task copies the current
 context, so the worker keeps the submitting request's origin for the batch's
-whole life -- long after the middleware's own reset has run. Batch outputs
-therefore do get links, addressed to whatever origin submitted the batch.
+whole life -- long after the middleware's own reset has run. That copy alone is
+not enough, though: the worker re-enters the app over ASGI per line, and this
+middleware runs again on each inner request, deriving the origin from the inner
+client's own base URL. routes_batches._dispatch therefore forwards the copied
+origin as that base URL, so batch outputs get links addressed to whatever
+origin submitted the batch.
 """
 
 from __future__ import annotations

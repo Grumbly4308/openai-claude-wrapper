@@ -12,19 +12,15 @@ with ffmpeg for format conversion.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import shutil
-import time
-import uuid
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .deps import DELEGATE, FILE_STORE, auth_dependency
+from .deps import DELEGATE, auth_dependency
 from .models import SpeechRequest
 
 

@@ -8,7 +8,7 @@ from typing import Optional
 from fastapi import Header, HTTPException, Query
 
 from . import download_tokens
-from .claude_runner import ClaudeRunner, SessionRegistry
+from .claude_runner import ClaudeRunner, RemoteAgentExecutor, SessionRegistry
 from .config import SETTINGS
 from .converters import MessagePreparer
 from .delegate import Delegator
@@ -44,6 +44,13 @@ RUNNER = ClaudeRunner(
     # workspace_hint=True a no-op.
     workspace_system_prompt=SETTINGS.workspace_system_prompt if SETTINGS.workspace_hint_enabled else "",
     stream_partial_messages=SETTINGS.stream_partial_messages,
+    # Sandboxed topology: send runs to the agent shim instead of spawning the
+    # CLI here. None keeps the classic local subprocess.
+    executor=(
+        RemoteAgentExecutor(SETTINGS.agent_url, SETTINGS.agent_token)
+        if SETTINGS.agent_url
+        else None
+    ),
 )
 PREPARER = MessagePreparer(FILE_STORE, SETTINGS.workspace_dir, registry=SESSIONS)
 DELEGATE = Delegator(RUNNER, SETTINGS.workspace_dir)

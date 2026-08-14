@@ -127,7 +127,7 @@ turns off the AskUserQuestion suppression described under
 docker compose build
 ```
 
-Builds `claude-wrapper:latest` from `node:22-bookworm-slim`. Layer caching means
+Builds `localhost/claude-wrapper:latest` from `node:22-bookworm-slim`. Layer caching means
 only the layer holding `src/` rebuilds after you edit code, but note the build
 is **not reproducible**: the base image is a mutable tag (not digest-pinned) and
 `Dockerfile:28` installs `@anthropic-ai/claude-code@latest`, so two builds a week
@@ -137,7 +137,7 @@ list.
 Verify:
 
 ```bash
-docker images claude-wrapper:latest
+docker images localhost/claude-wrapper:latest
 ```
 
 ### 3. Initialize Claude Code credentials (one time)
@@ -1411,7 +1411,7 @@ agent rather than guessing it — a `-v` naming a volume that does not exist
 podman inspect claude-agent \
     --format '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{"\n"}}{{end}}'
 
-podman run --rm -it -v <that-name>:/home/claude/.claude claude-wrapper:latest claude
+podman run --rm -it -v <that-name>:/home/claude/.claude localhost/claude-wrapper:latest claude
 # type /login at the prompt, complete the flow, then /exit
 
 podman exec claude-agent stat -c '%y' /home/claude/.claude/.credentials.json
@@ -1716,7 +1716,7 @@ Diagnose by comparing the two:
 ```bash
 docker inspect claude-wrapper --format '{{.Config.User}}'          # runtime uid
 docker run --rm -u 0 -v <project>_claude-data:/data \
-    claude-wrapper:latest ls -lna /data                            # owner uid
+    localhost/claude-wrapper:latest ls -lna /data                            # owner uid
 ```
 
 If they differ, fix all three in one pass:
@@ -1730,7 +1730,7 @@ docker-compose build                      # rebuild: the uid is a build arg
 docker volume ls | grep claude            # confirm the project prefix
 for v in claude-data claude-workspace claude-home; do
   docker run --rm -u 0 -v "<project>_$v:/vol" \
-      claude-wrapper:latest chown -R "$(id -u):$(id -g)" /vol
+      localhost/claude-wrapper:latest chown -R "$(id -u):$(id -g)" /vol
 done
 
 docker-compose up -d

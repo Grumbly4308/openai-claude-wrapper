@@ -70,7 +70,12 @@ services:
       args:
         CLAUDE_UID: "${CLAUDE_UID:-1000}"
         CLAUDE_GID: "${CLAUDE_GID:-1000}"
-    image: claude-wrapper:latest
+    # Qualified with localhost/ so build and run agree on one name. On a podman
+    # host, `up` resolves the unqualified short name to localhost/..., while a
+    # docker-CLI (buildx) build tags docker.io/library/... — that split leaves
+    # the stack recreating containers from a stale localhost-tagged image no
+    # matter how often you rebuild. The qualified name is exact on both engines.
+    image: localhost/claude-wrapper:latest
     container_name: claude-wrapper
     restart: always
     user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
@@ -201,7 +206,7 @@ services:
     # than relying on claude-wrapper having been built first: this service is
     # started BEFORE claude-wrapper (depends_on, above), and podman-compose only
     # builds services that carry a build section — without one, a first `up` on
-    # a clean machine tries to resolve claude-wrapper:latest as a registry pull.
+    # a clean machine tries to resolve localhost/claude-wrapper:latest as a registry pull.
     # Both services tag the same image, so the second build is a cache hit.
     build:
       context: .
@@ -209,7 +214,7 @@ services:
       args:
         CLAUDE_UID: "${CLAUDE_UID:-1000}"
         CLAUDE_GID: "${CLAUDE_GID:-1000}"
-    image: claude-wrapper:latest
+    image: localhost/claude-wrapper:latest
     container_name: claude-agent
     restart: always
     user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
@@ -310,7 +315,7 @@ services:
       args:
         CLAUDE_UID: "${CLAUDE_UID:-1000}"
         CLAUDE_GID: "${CLAUDE_GID:-1000}"
-    image: claude-wrapper:latest
+    image: localhost/claude-wrapper:latest
     container_name: claude-refresher
     restart: always
     user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"

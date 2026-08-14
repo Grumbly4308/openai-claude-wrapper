@@ -15,7 +15,7 @@ services:
         # `id -u` / `id -g` and set CLAUDE_UID / CLAUDE_GID in .env.
         CLAUDE_UID: "${CLAUDE_UID:-1000}"
         CLAUDE_GID: "${CLAUDE_GID:-1000}"
-    image: claude-wrapper:latest
+    image: localhost/claude-wrapper:latest
     container_name: claude-wrapper
     restart: always
     # Belt-and-braces: the image already ends on `USER claude`, but pinning the

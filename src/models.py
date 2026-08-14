@@ -121,6 +121,9 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
+    # OpenAI's successor to the (deprecated but still accepted) max_tokens;
+    # when both arrive, this one wins.
+    max_completion_tokens: Optional[int] = None
     user: Optional[str] = None
     # Non-standard helper field: pin a session id explicitly so the
     # server keeps the same Claude Code session across turns.
@@ -147,9 +150,30 @@ class ChatCompletionRequest(BaseModel):
     tools: Optional[list[ToolDef]] = None
     tool_choice: Optional[Union[str, dict[str, Any]]] = None
     parallel_tool_calls: Optional[bool] = None
+    # Legacy function calling (openai<1.0, older LangChain): normalized into
+    # tools/tool_choice below so the whole bridge sees one shape. `functions`
+    # staying set is the marker that the RESPONSE must use the legacy shape
+    # too (message.function_call, finish_reason "function_call").
+    functions: Optional[list[ToolFunctionDef]] = None
+    function_call: Optional[Union[str, dict[str, Any]]] = None
     # {"include_usage": true} => streaming responses append a usage chunk
     # before [DONE] (Vercel AI SDK sends this).
     stream_options: Optional[dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def _adopt_legacy_functions(self) -> "ChatCompletionRequest":
+        if self.tools is None and self.functions:
+            self.tools = [ToolDef(type="function", function=f) for f in self.functions]
+            if self.tool_choice is None and self.function_call is not None:
+                fc = self.function_call
+                if isinstance(fc, dict):  # {"name": ...} forces that function
+                    self.tool_choice = {
+                        "type": "function",
+                        "function": {"name": str(fc.get("name") or "")},
+                    }
+                else:  # "auto" | "none"
+                    self.tool_choice = fc
+        return self
 
 
 # ---------- Chat completion response ----------
@@ -162,6 +186,9 @@ class ChoiceMessage(BaseModel):
     # Function calls requested by the model (tool-bridge path only). Each entry
     # is {"id", "type": "function", "function": {"name", "arguments": <str>}}.
     tool_calls: Optional[list[dict[str, Any]]] = None
+    # Legacy shape for `functions` requests: {"name", "arguments": <str>},
+    # set instead of tool_calls.
+    function_call: Optional[dict[str, Any]] = None
 
 
 class Usage(BaseModel):
@@ -204,6 +231,9 @@ class DeltaMessage(BaseModel):
     # carries {"index", "id", "type", "function": {"name", "arguments": ""}};
     # later frames carry only {"index", "function": {"arguments": <fragment>}}.
     tool_calls: Optional[list[dict[str, Any]]] = None
+    # Legacy `functions` streaming: first frame {"name", "arguments": ""}, then
+    # {"arguments": <fragment>} — used instead of tool_calls.
+    function_call: Optional[dict[str, Any]] = None
 
 
 class ChatCompletionChunkChoice(BaseModel):

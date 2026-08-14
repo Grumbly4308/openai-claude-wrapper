@@ -161,6 +161,22 @@ _SSE_HEADERS = {
 app = FastAPI(title="Claude Code OpenAI Wrapper", version="1.0.1")
 
 
+@app.exception_handler(HTTPException)
+async def _openai_error_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """Pass OpenAI-shaped error bodies through verbatim.
+
+    The tool bridge raises HTTPExceptions whose detail already is the OpenAI
+    error envelope ({"error": {message, type, param, code}}) — the shape
+    OpenAI SDKs parse into typed exceptions. Everything else keeps FastAPI's
+    default {"detail": ...} body.
+    """
+    if isinstance(exc.detail, dict) and "error" in exc.detail:
+        return JSONResponse(status_code=exc.status_code, content=exc.detail, headers=exc.headers)
+    return JSONResponse(
+        status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers
+    )
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     # Build the model list once on load by scanning the installed Claude Code
@@ -520,13 +536,21 @@ def _log_request(kind: str, req: Any) -> None:
     was structured is the whole diagnosis in one field.
     """
     rf = getattr(req, "response_format", None)
+    # Tool NAMES, not just a count: duplicate/collision/charset failures are
+    # name-driven, and the names are the only way to see them in a server log.
+    tool_names = [
+        getattr(getattr(t, "function", None), "name", None) or "?"
+        for t in (getattr(req, "tools", None) or [])
+    ]
+    shown = ",".join(tool_names[:8]) + (",…" if len(tool_names) > 8 else "")
     log.info(
-        "%s: model=%s stream=%s json_mode=%s tools=%d",
+        "%s: model=%s stream=%s json_mode=%s tools=%d%s",
         kind,
         req.model,
         bool(getattr(req, "stream", False)),
         getattr(rf, "type", None) or "off",
-        len(getattr(req, "tools", None) or []),
+        len(tool_names),
+        f" [{shown}]" if tool_names else "",
     )
 
 
@@ -609,6 +633,18 @@ async def _tool_bridge_completion(req: ChatCompletionRequest):
     if USAGE_LEDGER.enabled:
         await USAGE_LEDGER.record(session_key, result.input_tokens + result.output_tokens)
 
+    # Legacy `functions` clients read message.function_call (a single call)
+    # and finish_reason "function_call" instead of the tool_calls shape.
+    tool_calls, function_call, finish_reason = result.tool_calls, None, result.finish_reason
+    if req.functions is not None and tool_calls:
+        if len(tool_calls) > 1:
+            log.warning(
+                "dropping %d parallel call(s): legacy function_call responses carry one call",
+                len(tool_calls) - 1,
+            )
+        function_call, tool_calls = tool_calls[0]["function"], None
+        finish_reason = "function_call"
+
     response = ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex[:24]}",
         created=int(time.time()),
@@ -619,9 +655,10 @@ async def _tool_bridge_completion(req: ChatCompletionRequest):
                 message=ChoiceMessage(
                     role="assistant",
                     content=result.content,
-                    tool_calls=result.tool_calls,
+                    tool_calls=tool_calls,
+                    function_call=function_call,
                 ),
-                finish_reason=result.finish_reason,
+                finish_reason=finish_reason,
             )
         ],
         usage=Usage(

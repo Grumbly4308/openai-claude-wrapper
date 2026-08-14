@@ -67,6 +67,14 @@ WEB_SEARCH_TOOL = {
 }
 
 
+def _fn_tool(name: str) -> dict:
+    """A minimal client function-tool declaration."""
+    return {
+        "type": "function",
+        "function": {"name": name, "parameters": {"type": "object", "properties": {}}},
+    }
+
+
 def _anthropic_tool_use_response() -> dict:
     return {
         "id": "msg_01",
@@ -707,9 +715,10 @@ def test_json_mode_unparseable_errors(bridge):
         },
     )
     assert r.status_code == 502
-    detail = r.json()["detail"]
-    assert "I need more details" in detail
-    assert "json_object" in detail
+    err = r.json()["error"]
+    assert "I need more details" in err["message"]
+    assert "json_object" in err["message"]
+    assert err["type"] == "api_error"
 
 
 def test_json_mode_streaming_unparseable_errors(bridge):
@@ -783,8 +792,9 @@ def test_client_tools_denied_by_profile(bridge, profiles):
         }
     )
     assert r.status_code == 400
-    detail = r.json()["detail"]
-    assert "client_tools" in detail and "web_search" in detail
+    err = r.json()["error"]
+    assert err["type"] == "invalid_request_error" and err["param"] == "tools"
+    assert "client_tools" in err["message"] and "web_search" in err["message"]
 
 
 def test_code_interpreter_injected_after_client_tools(bridge, profiles):
@@ -818,9 +828,29 @@ def test_bridge_web_search_needs_env_opt_in(bridge, profiles, monkeypatch):
     assert r.status_code == 200
     assert [t.get("name") for t in capture.requests[0]["tools"]] == ["web_search"]
 
-    # Env opt-in → injected, basic variant for Haiku. The client's own
-    # "web_search" function and the server tool share a name here; the server
-    # tool is typed, the client one isn't — assert on both fields.
+    # Env opt-in → injected, basic variant for Haiku. The client tool keeps a
+    # distinct name here; a client tool NAMED web_search suppresses injection
+    # instead (see test_client_tool_shadows_server_web_search).
+    monkeypatch.setenv("CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH", "true")
+    capture = bridge(_anthropic_tool_use_response())
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [_fn_tool("lookup")],
+        }
+    )
+    assert r.status_code == 200
+    sent = capture.requests[0]["tools"]
+    assert len(sent) == 2
+    assert sent[0]["name"] == "lookup"
+    assert sent[1] == {"type": "web_search_20250305", "name": "web_search"}
+
+
+def test_client_tool_shadows_server_web_search(bridge, profiles, monkeypatch):
+    """A client tool reusing a server tool's name wins; the server tool is not
+    injected — the Messages API rejects duplicate names, so sending both used
+    to 502 opaquely."""
     monkeypatch.setenv("CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH", "true")
     capture = bridge(_anthropic_tool_use_response())
     r = _post(
@@ -832,8 +862,8 @@ def test_bridge_web_search_needs_env_opt_in(bridge, profiles, monkeypatch):
     )
     assert r.status_code == 200
     sent = capture.requests[0]["tools"]
-    assert len(sent) == 2
-    assert sent[1] == {"type": "web_search_20250305", "name": "web_search"}
+    assert len(sent) == 1
+    assert sent[0]["name"] == "web_search" and "type" not in sent[0]
 
 
 def test_web_search_version_tracks_model_family(bridge, profiles, monkeypatch):
@@ -843,7 +873,7 @@ def test_web_search_version_tracks_model_family(bridge, profiles, monkeypatch):
         {
             "model": "claude-sonnet-4-6",
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [WEB_SEARCH_TOOL],
+            "tools": [_fn_tool("lookup")],
         }
     )
     assert r.status_code == 200
@@ -950,7 +980,9 @@ def test_wrapper_tool_name_collision_is_rejected(bridge, profiles):
         }
     )
     assert r.status_code == 400
-    assert "calculate" in r.json()["detail"]
+    err = r.json()["error"]
+    assert err["type"] == "invalid_request_error"
+    assert "calculate" in err["message"]
 
 
 def test_hybrid_loop_round_cap(bridge, profiles):
@@ -968,7 +1000,8 @@ def test_hybrid_loop_round_cap(bridge, profiles):
         }
     )
     assert r.status_code == 502
-    assert "rounds" in r.json()["detail"]
+    err = r.json()["error"]
+    assert "rounds" in err["message"] and err["code"] == "tool_loop_limit"
     assert len(capture.requests) == 8
 
 
@@ -1065,3 +1098,283 @@ def test_streaming_hybrid_loop_suppresses_wrapper_calls(bridge, profiles):
     # Usage sums both rounds.
     usage = [c for c in chunks if not c.get("choices")][0]["usage"]
     assert usage["prompt_tokens"] == 70 and usage["completion_tokens"] == 11
+
+
+# ---------- OpenAI compat matrix: one test per contract quirk ----------
+
+
+def test_duplicate_tool_names_deduped_last_wins(bridge):
+    """OpenAI tolerates duplicate names; the Messages API rejects them. The
+    bridge dedupes (last definition wins) instead of 502ing opaquely."""
+    capture = bridge(_anthropic_tool_use_response())
+    first = _fn_tool("web_search")
+    second = {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "the newer definition",
+            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+        },
+    }
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [first, second],
+        }
+    )
+    assert r.status_code == 200
+    sent = capture.requests[0]["tools"]
+    assert len(sent) == 1
+    assert sent[0]["description"] == "the newer definition"
+    assert sent[0]["input_schema"]["properties"] == {"q": {"type": "string"}}
+
+
+def test_tool_names_sanitized_and_reverse_mapped(bridge):
+    """Dotted/namespaced names go upstream API-safe and come back verbatim —
+    in tool defs, forced tool_choice, echoed history, and response calls."""
+    resp = _anthropic_tool_use_response()
+    resp["content"][0]["name"] = "repo_search_v2"  # what the API would echo
+    capture = bridge(resp)
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [
+                {"role": "user", "content": "search the repo"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "toolu_prev",
+                            "type": "function",
+                            "function": {"name": "repo.search/v2", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "toolu_prev", "content": "nothing"},
+            ],
+            "tools": [_fn_tool("repo.search/v2")],
+            "tool_choice": {"type": "function", "function": {"name": "repo.search/v2"}},
+        }
+    )
+    assert r.status_code == 200
+    sent = capture.requests[0]
+    # Outbound: definition, forced choice, and history echo all sanitized.
+    assert sent["tools"][0]["name"] == "repo_search_v2"
+    assert sent["tool_choice"] == {"type": "tool", "name": "repo_search_v2"}
+    assistant = [m for m in sent["messages"] if m["role"] == "assistant"][0]
+    assert assistant["content"][0]["name"] == "repo_search_v2"
+    # Inbound: the client gets its own spelling back.
+    (tc,) = r.json()["choices"][0]["message"]["tool_calls"]
+    assert tc["function"]["name"] == "repo.search/v2"
+
+
+def test_sanitized_name_collision_disambiguated(bridge):
+    """"a.b" and "a_b" must not both sanitize to the same upstream name."""
+    capture = bridge(_anthropic_tool_use_response())
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [_fn_tool("a_b"), _fn_tool("a.b")],
+        }
+    )
+    assert r.status_code == 200
+    names = [t["name"] for t in capture.requests[0]["tools"]]
+    assert names == ["a_b", "a_b_2"]
+
+
+def test_sanitized_name_wrapper_collision_rejected(bridge, profiles):
+    """A name that only collides with a wrapper tool AFTER sanitization is
+    still caught — the guard runs on the names the API will actually see."""
+    bridge()
+    profiles({"models": [{"match": "claude-haiku-4-5", "add": ["time_calc"]}]})
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [_fn_tool("get.current.time")],
+        }
+    )
+    assert r.status_code == 400
+    err = r.json()["error"]
+    assert err["type"] == "invalid_request_error"
+    assert "get.current.time" in err["message"]
+
+
+def test_max_completion_tokens_wins_over_max_tokens(bridge):
+    capture = bridge(_anthropic_tool_use_response())
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+            "max_tokens": 100,
+            "max_completion_tokens": 555,
+        }
+    )
+    assert r.status_code == 200
+    assert capture.requests[0]["max_tokens"] == 555
+
+
+def test_legacy_functions_translated_and_answered_in_kind(bridge):
+    """openai<1.0 shape: `functions`/`function_call` in, `message.function_call`
+    + finish_reason "function_call" out."""
+    capture = bridge(_anthropic_tool_use_response())
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "weather in Paris?"}],
+            "functions": [
+                {
+                    "name": "web_search",
+                    "description": "Search the web",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+                }
+            ],
+            "function_call": {"name": "web_search"},
+        }
+    )
+    assert r.status_code == 200
+    # Outbound: translated to tools + forced tool_choice.
+    sent = capture.requests[0]
+    assert sent["tools"][0]["name"] == "web_search"
+    assert sent["tool_choice"] == {"type": "tool", "name": "web_search"}
+    # Inbound: the legacy response shape, not tool_calls.
+    choice = r.json()["choices"][0]
+    assert choice["finish_reason"] == "function_call"
+    assert "tool_calls" not in choice["message"]
+    fc = choice["message"]["function_call"]
+    assert fc["name"] == "web_search"
+    assert json.loads(fc["arguments"]) == {"query": "weather in Paris"}
+
+
+def test_legacy_functions_streaming_uses_function_call_deltas(bridge):
+    events = [
+        {"type": "message_start",
+         "message": {"id": "msg_01", "usage": {"input_tokens": 10, "output_tokens": 1}}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "tool_use", "id": "toolu_1", "name": "web_search", "input": {}}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "input_json_delta", "partial_json": "{\"query\": \"paris\"}"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+         "usage": {"output_tokens": 5}},
+        {"type": "message_stop"},
+    ]
+    bridge(_sse(events))
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "session_id": "toolbridge-legacy-stream",
+            "model": "claude-haiku-4-5",
+            "stream": True,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "functions": [{"name": "web_search", "parameters": {"type": "object"}}],
+        },
+    ) as r:
+        assert r.status_code == 200
+        payloads = [l[5:].strip() for l in r.iter_lines() if l.startswith("data:")]
+    chunks = [json.loads(p) for p in payloads if p != "[DONE]"]
+    deltas = [c["choices"][0]["delta"] for c in chunks if c.get("choices")]
+    assert not any(d.get("tool_calls") for d in deltas)
+    fc_frames = [d["function_call"] for d in deltas if d.get("function_call")]
+    assert fc_frames[0]["name"] == "web_search"
+    assert json.loads("".join(f.get("arguments", "") for f in fc_frames)) == {"query": "paris"}
+    finish = [
+        c["choices"][0]["finish_reason"]
+        for c in chunks
+        if c.get("choices") and c["choices"][0].get("finish_reason")
+    ]
+    assert finish == ["function_call"]
+
+
+def test_preflight_rejects_non_function_tool_type(bridge):
+    bridge()
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "web_search", "function": {"name": "x"}}],
+        }
+    )
+    assert r.status_code == 400
+    err = r.json()["error"]
+    assert err["type"] == "invalid_request_error"
+    assert err["param"] == "tools[0].type"
+
+
+def test_preflight_rejects_empty_tool_name(bridge):
+    bridge()
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [_fn_tool("  ")],
+        }
+    )
+    assert r.status_code == 400
+    assert r.json()["error"]["param"] == "tools[0].function.name"
+
+
+def test_preflight_rejects_bad_tool_choice(bridge):
+    bridge()
+    base = {
+        "model": "claude-haiku-4-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [WEB_SEARCH_TOOL],
+    }
+    r = _post({**base, "tool_choice": "always"})
+    assert r.status_code == 400
+    assert r.json()["error"]["param"] == "tool_choice"
+
+    # A forced function must be declared in tools.
+    r = _post({**base, "tool_choice": {"type": "function", "function": {"name": "nope"}}})
+    assert r.status_code == 400
+    err = r.json()["error"]
+    assert err["param"] == "tool_choice.function.name"
+    assert "nope" in err["message"]
+
+
+def test_preflight_rejects_tool_message_without_id(bridge):
+    bridge()
+    r = _post(
+        {
+            "model": "claude-haiku-4-5",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "tool", "content": "result"},
+            ],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 400
+    err = r.json()["error"]
+    assert err["type"] == "invalid_request_error"
+    assert err["param"] == "messages[1].tool_call_id"
+
+
+def test_preflight_error_streams_on_the_error_channel(bridge):
+    """Streaming requests can't 400 after the head is sent mid-turn, but a
+    pre-flight failure surfaces as an OpenAI-shaped SSE error, not a repr."""
+    bridge()
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "session_id": "toolbridge-preflight-stream",
+            "model": "claude-haiku-4-5",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+            "tool_choice": "always",
+        },
+    ) as r:
+        assert r.status_code == 200
+        payloads = [l[5:].strip() for l in r.iter_lines() if l.startswith("data:")]
+    chunks = [json.loads(p) for p in payloads if p != "[DONE]"]
+    (err,) = [c["error"] for c in chunks if "error" in c]
+    assert err["type"] == "invalid_request_error"
+    assert "always" in err["message"] and "{" not in err["message"]

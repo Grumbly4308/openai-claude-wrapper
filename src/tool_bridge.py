@@ -87,6 +87,26 @@ _STOP_REASON_MAP = {
 }
 
 
+def openai_error(
+    status: int,
+    message: str,
+    err_type: str = "invalid_request_error",
+    param: Optional[str] = None,
+    code: Optional[str] = None,
+) -> HTTPException:
+    """An HTTPException whose body is the OpenAI error envelope.
+
+    OpenAI clients surface errors from ``{"error": {message, type, param,
+    code}}``, not FastAPI's ``{"detail": ...}`` — main.py's exception handler
+    returns this detail verbatim. Returned (not raised) so call sites read
+    ``raise openai_error(...)``.
+    """
+    return HTTPException(
+        status_code=status,
+        detail={"error": {"message": message, "type": err_type, "param": param, "code": code}},
+    )
+
+
 @dataclass
 class BridgeResult:
     """Non-streaming outcome, ready to be wrapped in a chat.completion."""
@@ -150,13 +170,13 @@ def resolve_auth() -> tuple[dict[str, str], bool]:
     token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip() or _oauth_access_token()
     if token:
         return {"authorization": f"Bearer {token}"}, True
-    raise HTTPException(
-        status_code=502,
-        detail=(
-            "function calling requires direct Anthropic API access, but no "
-            "credential was found: set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, "
-            f"or log the Claude Code CLI in so {_CREDENTIALS_FILE} exists"
-        ),
+    raise openai_error(
+        502,
+        "function calling requires direct Anthropic API access, but no "
+        "credential was found: set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, "
+        f"or log the Claude Code CLI in so {_CREDENTIALS_FILE} exists",
+        err_type="api_error",
+        code="no_upstream_credential",
     )
 
 
@@ -220,33 +240,126 @@ def _api_model(run_model: str) -> tuple[str, bool]:
     return m, wants_1m
 
 
-def _tools_to_anthropic(req: ChatCompletionRequest) -> tuple[Optional[list[dict]], Optional[dict]]:
-    """Map tools + tool_choice. ``tool_choice: "none"`` sends no tools at all."""
+# The Messages API requires tool names to match this; OpenAI clients send
+# dotted/namespaced names ("mcp.server.tool") that the OpenAI API tolerates.
+_TOOL_NAME_BAD = re.compile(r"[^a-zA-Z0-9_-]")
+_TOOL_NAME_MAX = 64
+
+
+def _preflight(req: ChatCompletionRequest) -> None:
+    """Reject malformed tools requests here, with an OpenAI-shaped 400 naming
+    the offending param, instead of letting them die upstream as an opaque 502."""
+    declared: set[str] = set()
+    for i, t in enumerate(req.tools or []):
+        if t.type != "function":
+            raise openai_error(
+                400,
+                f"tools[{i}].type must be 'function', got {t.type!r}",
+                param=f"tools[{i}].type",
+            )
+        if not t.function.name.strip():
+            raise openai_error(
+                400,
+                f"tools[{i}].function.name must be a non-empty string",
+                param=f"tools[{i}].function.name",
+            )
+        declared.add(t.function.name)
+    tc = req.tool_choice
+    if isinstance(tc, str) and tc not in ("auto", "none", "required"):
+        raise openai_error(
+            400,
+            f"tool_choice must be 'auto', 'none', 'required' or a named function, got {tc!r}",
+            param="tool_choice",
+        )
+    if isinstance(tc, dict):
+        name = ((tc.get("function") or {}).get("name")) or ""
+        if not name:
+            raise openai_error(
+                400, "tool_choice.function.name is required", param="tool_choice.function.name"
+            )
+        if name not in declared:
+            raise openai_error(
+                400,
+                f"tool_choice names function {name!r}, which is not declared in tools",
+                param="tool_choice.function.name",
+            )
+    for i, msg in enumerate(req.messages):
+        if msg.role == "tool" and not (msg.tool_call_id or "").strip():
+            raise openai_error(
+                400,
+                f"messages[{i}] has role 'tool' but no tool_call_id",
+                param=f"messages[{i}].tool_call_id",
+            )
+
+
+def _sanitize_name(name: str) -> str:
+    return _TOOL_NAME_BAD.sub("_", name)[:_TOOL_NAME_MAX] or "tool"
+
+
+def _sanitize_names(names: list[str]) -> dict[str, str]:
+    """Original -> API-safe name, deterministic. Post-sanitize collisions
+    ("a.b" and "a_b") get a numeric suffix in declaration order."""
+    mapping: dict[str, str] = {}
+    used: set[str] = set()
+    for name in names:
+        safe = _sanitize_name(name)
+        if safe in used:
+            i = 2
+            while True:
+                candidate = f"{safe[: _TOOL_NAME_MAX - len(str(i)) - 1]}_{i}"
+                if candidate not in used:
+                    safe = candidate
+                    break
+                i += 1
+        mapping[name] = safe
+        used.add(safe)
+    return mapping
+
+
+def _client_tools(
+    req: ChatCompletionRequest,
+) -> tuple[list[dict[str, Any]], Optional[dict[str, Any]], dict[str, str]]:
+    """Map tools + tool_choice; returns (tools, tool_choice, orig→safe names).
+
+    ``tool_choice: "none"`` sends no tools at all. Duplicate names are deduped
+    last-definition-wins (the OpenAI API tolerates duplicates, the Messages API
+    rejects them), then names are sanitized to the API's charset/length.
+    """
     if req.tool_choice == "none":
-        return None, None
+        return [], None, {}
+    by_name: dict[str, Any] = {}
+    total = 0
+    for t in req.tools or []:
+        if t.type == "function":
+            by_name[t.function.name] = t.function
+            total += 1
+    if not by_name:
+        return [], None, {}
+    if total > len(by_name):
+        log.warning(
+            "deduplicated %d duplicate tool name(s); last definition wins", total - len(by_name)
+        )
+    name_map = _sanitize_names(list(by_name))
     tools = [
         {
-            "name": t.function.name,
-            "description": t.function.description or "",
+            "name": name_map[name],
+            "description": fn.description or "",
             # `parameters` maps to `input_schema` verbatim — never rewritten.
-            "input_schema": t.function.parameters or {"type": "object", "properties": {}},
+            "input_schema": fn.parameters or {"type": "object", "properties": {}},
         }
-        for t in (req.tools or [])
-        if t.type == "function"
+        for name, fn in by_name.items()
     ]
-    if not tools:
-        return None, None
     choice: dict[str, Any]
     if isinstance(req.tool_choice, dict):
         name = ((req.tool_choice.get("function") or {}).get("name")) or ""
-        choice = {"type": "tool", "name": name}
+        choice = {"type": "tool", "name": name_map.get(name, name)}
     elif req.tool_choice == "required":
         choice = {"type": "any"}
     else:  # "auto" or absent
         choice = {"type": "auto"}
     if req.parallel_tool_calls is False:
         choice["disable_parallel_tool_use"] = True
-    return tools, choice
+    return tools, choice, name_map
 
 
 def _message_text(msg: ChatMessage) -> str:
@@ -286,11 +399,14 @@ def _user_blocks(msg: ChatMessage) -> list[dict[str, Any]]:
     return blocks
 
 
-def messages_to_anthropic(messages: list[ChatMessage]) -> tuple[list[str], list[dict[str, Any]]]:
+def messages_to_anthropic(
+    messages: list[ChatMessage], name_map: Optional[dict[str, str]] = None
+) -> tuple[list[str], list[dict[str, Any]]]:
     """Translate an OpenAI transcript to (system texts, Anthropic messages).
 
     - assistant.tool_calls become tool_use blocks (arguments parsed to objects,
-      ids reused verbatim so the round-trip is lossless);
+      ids reused verbatim so the round-trip is lossless; names go through the
+      same orig→safe map as the tool definitions, so echoed history matches);
     - role:"tool" messages become tool_result blocks in a USER message, with
       consecutive tool messages merged into one (the API wants every parallel
       result in the single next user turn);
@@ -336,11 +452,18 @@ def messages_to_anthropic(messages: list[ChatMessage]) -> tuple[list[str], list[
                     parsed = {}
                 if not isinstance(parsed, dict):
                     parsed = {}
+                raw_name = (tc.function.name if tc.function else "") or ""
+                if name_map and raw_name in name_map:
+                    name = name_map[raw_name]
+                else:
+                    # History may cite a tool no longer declared; still keep
+                    # the name inside the API's charset.
+                    name = _sanitize_name(raw_name) if raw_name else ""
                 blocks.append(
                     {
                         "type": "tool_use",
                         "id": tc.id or f"toolu_{uuid.uuid4().hex[:24]}",
-                        "name": (tc.function.name if tc.function else "") or "",
+                        "name": name,
                         "input": parsed,
                     }
                 )
@@ -352,13 +475,19 @@ def messages_to_anthropic(messages: list[ChatMessage]) -> tuple[list[str], list[
 
 def build_request(
     req: ChatCompletionRequest, run_model: str, stream: bool
-) -> tuple[dict[str, Any], dict[str, str]]:
-    """Build the Messages API payload + headers for a tools request."""
+) -> tuple[dict[str, Any], dict[str, str], dict[str, str]]:
+    """Build the Messages API payload + headers for a tools request.
+
+    Returns (payload, headers, safe→original tool-name map) — responses run
+    tool names back through the map so the client only ever sees its own.
+    """
+    _preflight(req)
     auth_headers, is_oauth = resolve_auth()
     model, wants_1m = _api_model(run_model)
-    system_texts, messages = messages_to_anthropic(req.messages)
+    tools, tool_choice, name_map = _client_tools(req)
+    system_texts, messages = messages_to_anthropic(req.messages, name_map)
     if not messages:
-        raise HTTPException(status_code=400, detail="no prompt content derived from messages")
+        raise openai_error(400, "no prompt content derived from messages", param="messages")
 
     system_blocks: list[dict[str, Any]] = []
     if is_oauth:
@@ -373,7 +502,9 @@ def build_request(
 
     payload: dict[str, Any] = {
         "model": model,
-        "max_tokens": req.max_tokens or _DEFAULT_MAX_TOKENS,
+        # max_completion_tokens is OpenAI's successor to the deprecated
+        # max_tokens; honor it first when a client sends both.
+        "max_tokens": req.max_completion_tokens or req.max_tokens or _DEFAULT_MAX_TOKENS,
         "messages": messages,
         "stream": stream,
     }
@@ -384,34 +515,46 @@ def build_request(
     if req.top_p is not None:
         payload["top_p"] = req.top_p
     caps = resolve_profile(run_model)
-    tools, tool_choice = _tools_to_anthropic(req)
+    rev_map = {safe: orig for orig, safe in name_map.items()}
     if tools and Capability.CLIENT_TOOLS not in caps:
-        declared = ", ".join(sorted(t["name"] for t in tools))
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"model '{run_model}' does not accept client-declared tools "
-                f"(capability 'client_tools' is not in its profile); declared: {declared}"
-            ),
+        declared = ", ".join(sorted(name_map))
+        raise openai_error(
+            400,
+            f"model '{run_model}' does not accept client-declared tools "
+            f"(capability 'client_tools' is not in its profile); declared: {declared}",
+            param="tools",
         )
     # Injected tools go after the client's, in fixed order, so the rendered
     # tool list stays deterministic for prompt caching. Wrapper-owned tools
     # (memory, time/calc) are executed by the bridge's hybrid loop, never
     # surfaced to the caller.
+    client_names = {t["name"] for t in tools}
     wrapper_defs = wrapper_tools.tool_definitions(caps)
-    shadowed = {t["name"] for t in tools or []} & {
-        d.get("name") for d in wrapper_defs
-    }
+    shadowed = client_names & {d.get("name") for d in wrapper_defs}
     if shadowed:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"client tool name(s) {sorted(shadowed)} collide with wrapper-owned "
-                f"tools enabled for model '{run_model}'; rename the client tool or "
-                "remove the capability from the model's profile"
-            ),
+        # Report the caller's spelling, not the sanitized one.
+        names = sorted(rev_map.get(n, n) for n in shadowed)
+        raise openai_error(
+            400,
+            f"client tool name(s) {names} collide with wrapper-owned "
+            f"tools enabled for model '{run_model}'; rename the client tool or "
+            "remove the capability from the model's profile",
+            param="tools",
         )
-    all_tools = (tools or []) + _server_tools(run_model, caps) + wrapper_defs
+    # A client tool may reuse a server-side tool's name (clients commonly
+    # declare their own "web_search"); the API rejects the duplicate, so the
+    # client's definition wins and the server tool sits this request out.
+    server_defs = []
+    for s in _server_tools(run_model, caps):
+        if s["name"] in client_names:
+            log.warning(
+                "client tool %r shadows the %s server tool; not injecting it",
+                s["name"],
+                s["type"],
+            )
+        else:
+            server_defs.append(s)
+    all_tools = tools + server_defs + wrapper_defs
     if all_tools:
         payload["tools"] = all_tools
         if tools:
@@ -429,7 +572,7 @@ def build_request(
     }
     if betas:
         headers["anthropic-beta"] = ",".join(betas)
-    return payload, headers
+    return payload, headers, rev_map
 
 
 # ---------- Anthropic -> OpenAI translation ----------
@@ -462,7 +605,7 @@ async def complete(
     Assistant content is echoed back verbatim between rounds — thinking and
     server-tool blocks included, which the API requires for a tool loop.
     """
-    payload, headers = build_request(req, run_model, stream=False)
+    payload, headers, rev_map = build_request(req, run_model, stream=False)
     wrapper_names = wrapper_tool_names(resolve_profile(run_model))
     client = _get_client()
     input_tokens = output_tokens = 0
@@ -474,11 +617,15 @@ async def complete(
                 f"{ANTHROPIC_BASE_URL}/v1/messages", json=payload, headers=headers
             )
         except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"anthropic api unreachable: {e}")
+            raise openai_error(
+                502, f"anthropic api unreachable: {e}", err_type="api_error", code="upstream_error"
+            )
         if resp.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"anthropic api error {resp.status_code}: {resp.text[:500]}",
+            raise openai_error(
+                502,
+                f"anthropic api error {resp.status_code}: {resp.text[:500]}",
+                err_type="api_error",
+                code="upstream_error",
             )
         data = resp.json()
         usage = data.get("usage") or {}
@@ -512,9 +659,11 @@ async def complete(
                 results.append(result)
             payload["messages"].append({"role": "user", "content": results})
     else:
-        raise HTTPException(
-            status_code=502,
-            detail=f"wrapper tool loop exceeded {_MAX_TOOL_ROUNDS} rounds without an answer",
+        raise openai_error(
+            502,
+            f"wrapper tool loop exceeded {_MAX_TOOL_ROUNDS} rounds without an answer",
+            err_type="api_error",
+            code="tool_loop_limit",
         )
 
     text_parts: list[str] = []
@@ -524,12 +673,15 @@ async def complete(
         if btype == "text" and block.get("text"):
             text_parts.append(block["text"])
         elif btype == "tool_use" and block.get("name") not in wrapper_names:
+            name = block.get("name") or ""
             tool_calls.append(
                 {
                     "id": block.get("id") or f"toolu_{uuid.uuid4().hex[:24]}",
                     "type": "function",
                     "function": {
-                        "name": block.get("name") or "",
+                        # Give the client back the name it declared, not the
+                        # sanitized one the API saw.
+                        "name": rev_map.get(name, name),
                         # OpenAI clients JSON.parse this — it MUST be a string.
                         "arguments": json.dumps(block.get("input") or {}),
                     },
@@ -545,7 +697,9 @@ async def complete(
     if not tool_calls and wants_json(req):
         cleaned = extract_raw_json(content)
         if cleaned is None:
-            raise HTTPException(status_code=502, detail=json_mode_error(req, content))
+            raise openai_error(
+                502, json_mode_error(req, content), err_type="api_error", code="json_mode_failed"
+            )
         content = cleaned
     return BridgeResult(
         content=content if content else None,
@@ -633,9 +787,14 @@ async def stream(
     stop_reason: Optional[str] = None
     input_tokens = output_tokens = 0
     errored: Optional[str] = None
+    errored_type = "upstream_error"
+    # Legacy `functions` clients read delta.function_call, not delta.tool_calls,
+    # and the shape carries a single call — extra parallel calls are dropped.
+    legacy = req.functions is not None
+    rev_map: dict[str, str] = {}
 
     try:
-        payload, headers = build_request(req, run_model, stream=True)
+        payload, headers, rev_map = build_request(req, run_model, stream=True)
         wrapper_names = wrapper_tool_names(resolve_profile(run_model))
         client = _get_client()
         # Hybrid loop, same turn-taking rules as complete(): wrapper-owned
@@ -675,25 +834,43 @@ async def stream(
                                 block.get("type") == "tool_use"
                                 and block.get("name") not in wrapper_names
                             ):
-                                tc_index_of[a_idx] = next_tc_index
                                 any_client_calls = True
-                                yield chunk(
-                                    DeltaMessage(
-                                        tool_calls=[
-                                            {
-                                                "index": next_tc_index,
-                                                "id": block.get("id")
-                                                or f"toolu_{uuid.uuid4().hex[:24]}",
-                                                "type": "function",
-                                                "function": {
-                                                    "name": block.get("name") or "",
-                                                    "arguments": "",
-                                                },
-                                            }
-                                        ]
+                                name = block.get("name") or ""
+                                name = rev_map.get(name, name)
+                                if legacy and next_tc_index > 0:
+                                    # The legacy shape has no second slot.
+                                    log.warning(
+                                        "dropping parallel call to %r: legacy "
+                                        "function_call responses carry one call",
+                                        name,
                                     )
-                                )
-                                next_tc_index += 1
+                                elif legacy:
+                                    tc_index_of[a_idx] = next_tc_index
+                                    next_tc_index += 1
+                                    yield chunk(
+                                        DeltaMessage(
+                                            function_call={"name": name, "arguments": ""}
+                                        )
+                                    )
+                                else:
+                                    tc_index_of[a_idx] = next_tc_index
+                                    yield chunk(
+                                        DeltaMessage(
+                                            tool_calls=[
+                                                {
+                                                    "index": next_tc_index,
+                                                    "id": block.get("id")
+                                                    or f"toolu_{uuid.uuid4().hex[:24]}",
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": name,
+                                                        "arguments": "",
+                                                    },
+                                                }
+                                            ]
+                                        )
+                                    )
+                                    next_tc_index += 1
                         elif etype == "content_block_delta":
                             delta = evt.get("delta") or {}
                             dtype = delta.get("type")
@@ -711,13 +888,21 @@ async def stream(
                                 acc["partial"] += fragment
                                 idx = tc_index_of.get(int(evt.get("index") or 0))
                                 if fragment and idx is not None:
-                                    yield chunk(
-                                        DeltaMessage(
-                                            tool_calls=[
-                                                {"index": idx, "function": {"arguments": fragment}}
-                                            ]
+                                    if legacy:
+                                        yield chunk(
+                                            DeltaMessage(function_call={"arguments": fragment})
                                         )
-                                    )
+                                    else:
+                                        yield chunk(
+                                            DeltaMessage(
+                                                tool_calls=[
+                                                    {
+                                                        "index": idx,
+                                                        "function": {"arguments": fragment},
+                                                    }
+                                                ]
+                                            )
+                                        )
                             elif dtype == "thinking_delta" and delta.get("thinking"):
                                 acc["thinking"] = acc.get("thinking", "") + delta["thinking"]
                             elif dtype == "signature_delta" and delta.get("signature"):
@@ -764,7 +949,13 @@ async def stream(
         else:
             errored = f"wrapper tool loop exceeded {_MAX_TOOL_ROUNDS} rounds without an answer"
     except HTTPException as e:
-        errored = str(e.detail)
+        # openai_error details carry the envelope; surface its message/type on
+        # the SSE error channel instead of a stringified dict.
+        if isinstance(e.detail, dict) and isinstance(e.detail.get("error"), dict):
+            errored = str(e.detail["error"].get("message") or "request failed")
+            errored_type = str(e.detail["error"].get("type") or errored_type)
+        else:
+            errored = str(e.detail)
     except httpx.HTTPError as e:
         errored = f"anthropic api stream failed: {e}"
     except Exception as e:  # pragma: no cover - defensive
@@ -793,7 +984,10 @@ async def stream(
             else:
                 yield chunk(DeltaMessage(content=cleaned))
 
-    yield chunk(DeltaMessage(), finish=_finish_reason(stop_reason, any_client_calls))
+    finish = _finish_reason(stop_reason, any_client_calls)
+    if legacy and finish == "tool_calls":
+        finish = "function_call"
+    yield chunk(DeltaMessage(), finish=finish)
     if (req.stream_options or {}).get("include_usage"):
         usage_chunk = ChatCompletionChunk(
             id=chunk_id,
@@ -808,6 +1002,6 @@ async def stream(
         )
         yield f"data: {usage_chunk.model_dump_json(exclude_none=True)}\n\n".encode("utf-8")
     if errored:
-        err_payload = {"error": {"message": errored, "type": "upstream_error"}}
+        err_payload = {"error": {"message": errored, "type": errored_type}}
         yield f"data: {json.dumps(err_payload)}\n\n".encode("utf-8")
     yield b"data: [DONE]\n\n"

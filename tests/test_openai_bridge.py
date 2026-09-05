@@ -761,6 +761,13 @@ def _stub_runner(final_text="agentic ok"):
 
 
 def test_codex_agent_routes_tools_requests_to_the_openai_bridge(codex_mode, monkeypatch):
+    # A Platform credential must resolve for this test's subject to be
+    # selected at all: tool mode `auto` (the default) routes credential-less
+    # deployments to the codex CLI loop instead — that side is pinned in
+    # test_codex_cli_tools.py. This test pins the other side: WITH a
+    # credential, tools go to the OpenAI passthrough, and never to the
+    # anthropic bridge.
+    monkeypatch.setattr(openai_bridge, "has_platform_credential", lambda: True)
     calls: list[str] = []
 
     async def _stub_complete(req, run_model, session_key=""):

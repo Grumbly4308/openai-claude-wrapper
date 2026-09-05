@@ -128,8 +128,13 @@ services:
       CLAUDE_WRAPPER_DOWNLOAD_URL_TTL: "${CLAUDE_WRAPPER_DOWNLOAD_URL_TTL:-2592000}"
       CLAUDE_WRAPPER_WORKSPACE_HINT: "${CLAUDE_WRAPPER_WORKSPACE_HINT:-on}"
       CLAUDE_WRAPPER_WORKSPACE_PROMPT: "${CLAUDE_WRAPPER_WORKSPACE_PROMPT:-}"
-      # Empty falls through to the code default (gpt-6-astra under codex).
-      CLAUDE_WRAPPER_DEFAULT_MODEL: "${CLAUDE_WRAPPER_DEFAULT_MODEL:-}"
+      # Fed from CODEX_WRAPPER_DEFAULT_MODEL, not CLAUDE_WRAPPER_DEFAULT_MODEL:
+      # the shared .env ships the latter set to a Claude id, which would become
+      # this stack's default AND be appended to /v1/models — every `auto`
+      # request then runs `codex --model claude-…` and fails upstream. Same
+      # deconfliction as CODEX_WRAPPER_PORT. Empty falls through to the code
+      # default (gpt-6-astra under codex).
+      CLAUDE_WRAPPER_DEFAULT_MODEL: "${CODEX_WRAPPER_DEFAULT_MODEL:-}"
       # Comma list overriding the built-in codex model ids (no discovery scan).
       CLAUDE_WRAPPER_CODEX_MODELS: "${CLAUDE_WRAPPER_CODEX_MODELS:-}"
       CLAUDE_WRAPPER_EFFORT: "${CLAUDE_WRAPPER_EFFORT:-medium}"

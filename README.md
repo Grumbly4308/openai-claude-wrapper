@@ -738,6 +738,7 @@ Note `OPENAI_API_KEY` and the `CODEX_REFRESH_*` refresher knobs (see
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `CLAUDE_WRAPPER_DEFAULT_MODEL` | Model for `"model": "auto"` or an absent model. Always added to the advertised list. | `claude-opus-4-8` |
+| `CODEX_WRAPPER_DEFAULT_MODEL` | Same, for the codex stack (`docker-compose.codex.yml` feeds it into `CLAUDE_WRAPPER_DEFAULT_MODEL`). A separate variable so the shared `.env`'s Claude id doesn't become the codex default — which would advertise a Claude model on `/v1/models` and fail every `auto` request. Empty = `gpt-6-astra`. | blank |
 | `CLAUDE_WRAPPER_EFFORT` | Server-default reasoning effort. Empty means the `--effort` flag is not passed at all. | code: empty · compose: `medium` |
 | `CLAUDE_WRAPPER_MODEL_DISCOVERY` | `auto` scans the installed CLI binary; `off` serves the static fallback list. | `auto` |
 | `CLAUDE_WRAPPER_ANTHROPIC_BASE_URL` | Messages API base for the tool bridge. | `https://api.anthropic.com` |

@@ -194,11 +194,17 @@ def _agent_from_env() -> str:
 CODEX_DEFAULT_MODEL = "gpt-6-astra"  # the codex CLI's own default in 0.153.x
 
 # Static list, mirroring FALLBACK_MODELS' role. Sourced from ids the shipped
-# codex binary knows (verified 0.153.4); there is no discovery scan for codex —
-# override with CLAUDE_WRAPPER_CODEX_MODELS as OpenAI ships/retires ids.
+# codex binary knows (gpt-6-astra through gpt-5.5 verified against 0.153.4;
+# the 5.6 family and codex-spark follow the family's id convention, unverified
+# against a live CLI); there is no discovery scan for codex — override with
+# CLAUDE_WRAPPER_CODEX_MODELS as OpenAI ships/retires ids.
 CODEX_FALLBACK_MODELS: tuple[str, ...] = (
     "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
     "gpt-5.2-codex",
     "gpt-5.2",
     "gpt-5.1-codex-max",

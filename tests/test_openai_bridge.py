@@ -635,6 +635,30 @@ def test_client_tools_denied_by_profile(codex_mode, bridge, profiles):
     assert "client_tools" in err["message"] and "web_search" in err["message"]
 
 
+def test_auto_model_with_suffixed_default_applies_effort(codex_mode, bridge, monkeypatch):
+    # "auto" resolves to the server default BEFORE the effort suffix is read.
+    # The bridge used to derive effort from the literal "auto", so with a
+    # suffixed default model the envelope claimed an effort the payload never
+    # carried — the two must come from the same resolved string.
+    capture = bridge(_openai_tool_call_response())
+    for mod in (src_main, openai_bridge):
+        monkeypatch.setattr(
+            mod,
+            "SETTINGS",
+            dataclasses.replace(mod.SETTINGS, agent="codex", default_model="gpt-5.2:high"),
+        )
+    r = _post(
+        {
+            "model": "auto",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert capture.requests[0]["model"] == "gpt-5.2"
+    assert capture.requests[0]["reasoning_effort"] == "high"
+    assert r.json()["effort"]["applied"] == "high"
+
+
 def test_codex_tuned_ids_rejected_for_tools_requests(codex_mode, bridge):
     """*-codex ids are Responses-API-only upstream: a tools request on one must
     die as a clear 400 here, not as an opaque upstream-404 passthrough."""

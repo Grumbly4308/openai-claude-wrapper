@@ -166,6 +166,17 @@ def resolve_auth() -> dict[str, str]:
 # ---------- payload ----------
 
 
+def _request_effort(req: ChatCompletionRequest) -> Optional[str]:
+    """Effort suffix of the model this request actually RESOLVES to — the
+    same computation main performs before building the envelope's `effort`
+    claim. Deriving from req.model alone lied for "auto": with a suffixed
+    default model the envelope claimed the effort was applied while the
+    payload never carried it."""
+    model = req.model if req.model and req.model != "auto" else SETTINGS.default_model
+    _, effort = split_model_effort(model)
+    return effort
+
+
 def build_payload(
     req: ChatCompletionRequest, run_model: str, effort: Optional[str], stream: bool
 ) -> dict[str, Any]:
@@ -277,7 +288,7 @@ async def complete(
     # The signature carries no effort (parity with the Claude bridge), so it is
     # re-derived here — the same computation main._tool_bridge_completion
     # performs, so the response envelope's `effort` claim and the payload agree.
-    _, effort = split_model_effort(req.model)
+    effort = _request_effort(req)
     payload = build_payload(req, run_model, effort, stream=False)
     headers = resolve_auth()
     client = _get_client()
@@ -349,9 +360,9 @@ async def stream(
     errored_type = "upstream_error"
 
     try:
-        # Same re-derivation as complete() — the payload must claim the same
-        # effort the envelope main built from req.model does.
-        _, effort = split_model_effort(req.model)
+        # Same re-derivation as complete() — the payload must carry the same
+        # effort the envelope main built from the resolved model does.
+        effort = _request_effort(req)
         payload = build_payload(req, run_model, effort, stream=True)
         # Usage capture: the ledger can only record what upstream reports, so
         # when the caller wired on_usage and the client didn't ask for the

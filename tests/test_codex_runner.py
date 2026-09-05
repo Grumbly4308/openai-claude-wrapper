@@ -318,4 +318,21 @@ def test_registry_entries_are_agent_scoped():
         _, created = await codex_reg.get_or_create_uuid("k3")
         assert created
 
+        # has() must apply the same agent predicate as get_or_create_uuid:
+        # prepare_messages keys replay-only mode off it, so a mismatch that
+        # reads as "present" would pair a fresh thread with a trailing-message
+        # prompt and silently drop the conversation history on a stack switch.
+        (root / "k4.json").write_text(
+            json.dumps({"key": "k4", "uuid": "u4", "agent": "claude"})
+        )
+        assert claude_reg.has("k4")
+        assert not codex_reg.has("k4")
+        # Legacy untagged reads as claude; corrupt reads as absent for both.
+        (root / "k5.json").write_text(json.dumps({"key": "k5", "uuid": "u5"}))
+        assert claude_reg.has("k5")
+        assert not codex_reg.has("k5")
+        (root / "k6.json").write_text("not json")
+        assert not claude_reg.has("k6")
+        assert not codex_reg.has("k6")
+
     asyncio.run(_go())

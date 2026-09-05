@@ -271,8 +271,22 @@ class SessionRegistry:
         return self.root / f"{key}.json"
 
     def has(self, key: str) -> bool:
-        """Return True if a uuid is already bound to this session key."""
-        return self._path(key).exists()
+        """Return True if a uuid THIS agent minted is bound to this session key.
+
+        Agent-aware on purpose, with the same predicate as get_or_create_uuid:
+        prepare_messages uses this to enter replay-only mode (send only the
+        trailing message, trust the CLI's own log for history), which is only
+        sound when the coming run will actually resume. A mismatched or
+        unreadable entry means get_or_create_uuid will mint fresh — reporting
+        it as present here would pair a brand-new thread with a history-less
+        prompt and silently drop the conversation on a stack switch.
+        """
+        try:
+            with open(self._path(key), "r") as f:
+                data = json.load(f)
+        except Exception:
+            return False
+        return data.get("agent", "claude") == self.agent
 
     async def lock_for(self, key: str) -> asyncio.Lock:
         async with self._registry_lock:

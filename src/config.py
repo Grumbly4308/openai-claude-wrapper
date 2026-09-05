@@ -220,6 +220,13 @@ def _codex_models_from_env() -> tuple[str, ...]:
     return ids or CODEX_FALLBACK_MODELS
 
 
+# Codex's built-in web_search tool. Read as an env var rather than a Settings
+# field because BOTH containers need it live: the agent passes the -c override
+# when spawning the CLI, and the wrapper decides whether /v1/models may
+# advertise the web_search capability (capabilities.resolve_profile).
+CODEX_WEB_SEARCH_ENV = "CLAUDE_WRAPPER_CODEX_WEB_SEARCH"
+
+
 # Reasoning-effort values `codex exec` accepts via -c model_reasoning_effort
 # (verified live: none|minimal|low|medium|high|xhigh; default medium).
 CODEX_EFFORT_LEVELS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh")

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from .agent_runner import BaseAgentRunner, SessionRegistry, StreamEvent, TurnState
-from .config import CODEX_EFFORT_CHOICES
+from .config import CODEX_EFFORT_CHOICES, CODEX_WEB_SEARCH_ENV, _bool_env
 
 log = logging.getLogger("claude_wrapper.runner")
 
@@ -103,6 +103,13 @@ class CodexRunner(BaseAgentRunner):
             "--dangerously-bypass-approvals-and-sandbox",
             "-c", "check_for_update_on_startup=false",  # no update probe through squid
         ]
+        if _bool_env(CODEX_WEB_SEARCH_ENV, False):
+            # Codex's own web_search tool, off by default in the CLI. Enabling
+            # it is what makes "search the web" work on the AGENT path — no
+            # Platform API key involved, unlike client-declared tools which
+            # leave for the bridge. Its result items already normalize into
+            # tool_use/tool_result frames (_handle_event below).
+            argv += ["-c", "tools.web_search=true"]
         if model:
             argv += ["--model", model]
         eff, _src = self._resolve_effort(model, effort)

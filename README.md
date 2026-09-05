@@ -1541,6 +1541,7 @@ Capabilities: `vision`, `file_upload`, `web_search`, `code_interpreter`,
 | `CLAUDE_WRAPPER_MODEL_PROFILE_OVERRIDES` | Inline JSON, same schema, applied after the file. |
 | `CLAUDE_WRAPPER_EXPOSE_TERMINAL` | **Default off.** Hard gate for `terminal`: until set, the capability is masked out of every profile — a profile file alone can never hand a chat UI a shell — and chat runs carry `--disallowedTools Bash`. Set it to restore the classic everything-on behavior. |
 | `CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH` | Default off. Lets the tool bridge inject Anthropic's server-side web search for `web_search`-profiled models (new billing surface, hence its own opt-in). |
+| `CLAUDE_WRAPPER_CODEX_WEB_SEARCH` | Default off. Enables codex's **own** `web_search` tool (`-c tools.web_search=true`) on CLI turns, and is what lets a codex model advertise the `web_search` capability. This is the agent path, so it needs no OpenAI Platform key — the way to get web search on a ChatGPT-plan login. Set it on **both** codex app services (the compose file does). |
 | `CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS` | Hybrid-loop round cap per turn (default 8). |
 | `CLAUDE_WRAPPER_IMAGE_BACKEND_URL` / `_KEY` / `_MODEL` | Optional OpenAI-compatible image backend; configured, `/v1/images/generations` proxies there instead of the SVG delegation path. |
 
@@ -1588,9 +1589,12 @@ Claude-tool names and do not apply. In particular
 `CLAUDE_WRAPPER_EXPOSE_TERMINAL` cannot disable codex's command execution:
 the shell is intrinsic to that agent, and the container sandbox is the
 enforcement boundary (see
-[Limitations](#limitations-and-known-gaps)). The wrapper-owned `memory` /
-`time_calc` capabilities are inert under codex — the OpenAI passthrough has
-no hybrid loop to execute them in.
+[Limitations](#limitations-and-known-gaps)). Conversely `web_search` is
+advertised for codex ids only while `CLAUDE_WRAPPER_CODEX_WEB_SEARCH` is on,
+because codex's own search tool is opt-in — the rule in both directions is
+that the list reports what the CLI will really be given. The wrapper-owned
+`memory` / `time_calc` capabilities are inert under codex — the OpenAI
+passthrough has no hybrid loop to execute them in.
 
 **OpenWebUI**: OpenWebUI doesn't map pulled model metadata into its
 capability toggles, so `deploy/openwebui_capability_sync.py` — run **on the
@@ -2126,11 +2130,13 @@ fail the same way on the first real request instead of at boot.
 - **Codex has no per-tool CLI gating.** `--disallowedTools` is Claude-only;
   under codex, command execution is intrinsic to the agent and the container
   sandbox is the enforcement boundary. `CLAUDE_WRAPPER_EXPOSE_TERMINAL` cannot
-  disable it — and `/v1/models` is honest about that: under codex the
-  CLI-shaped capabilities (`terminal`, `web_search`, `sub_agents`) always
-  advertise as present, even if a profile removes them, because the removal
-  would not be enforced. Profiles still genuinely gate `client_tools` (the
-  bridge enforces it).
+  disable it — and `/v1/models` is honest about that: under codex `terminal`
+  and `sub_agents` always advertise as present, even if a profile removes
+  them, because the removal would not be enforced. `web_search` is the
+  exception in the other direction: codex's own search tool is opt-in
+  (`CLAUDE_WRAPPER_CODEX_WEB_SEARCH`), so it is advertised only when the
+  runner will actually enable it. Profiles still genuinely gate
+  `client_tools` (the bridge enforces it).
 - **No wrapper-owned tools on the codex bridge.** `memory` and `time_calc`
   live in the Anthropic hybrid loop; the OpenAI passthrough never injects them.
 - **Codex-tuned model ids cannot take `tools` requests.** OpenAI serves the

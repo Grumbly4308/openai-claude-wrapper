@@ -256,14 +256,21 @@ def resolve_profile(model: str) -> frozenset[Capability]:
     caps = _resolve(base, _config_cache)
     if _config.SETTINGS.agent == "codex":
         # Honesty over gating: the codex CLI has no per-tool switches — its
-        # command execution, web access and delegation are intrinsic and
-        # cannot be removed per-run (see codex_runner._build_argv), so a
-        # profile removal or the terminal env toggle would only falsify
-        # /v1/models while enforcement stayed nil. The CLI-shaped
-        # capabilities therefore always advertise as present under codex;
+        # command execution and delegation are intrinsic and cannot be removed
+        # per-run (see codex_runner._build_argv), so a profile removal or the
+        # terminal env toggle would only falsify /v1/models while enforcement
+        # stayed nil. Those capabilities therefore always advertise as present;
         # profiles still govern the rest (notably client_tools, which the
         # openai bridge really enforces).
-        caps = caps | frozenset(_CLI_TOOLS_BY_CAPABILITY)
+        caps = caps | {Capability.TERMINAL, Capability.SUB_AGENTS}
+        # web_search is the exception: codex's own search tool is OPT-IN
+        # (CLAUDE_WRAPPER_CODEX_WEB_SEARCH turns on the -c override), so the
+        # same honesty rule cuts the other way — advertise it only when the
+        # runner will actually enable it.
+        if _bool_env(_config.CODEX_WEB_SEARCH_ENV, False):
+            caps = caps | {Capability.WEB_SEARCH}
+        else:
+            caps = caps - {Capability.WEB_SEARCH}
     elif Capability.TERMINAL in caps and not _bool_env(TERMINAL_TOGGLE_ENV, False):
         log.debug(
             "terminal capability masked for %s (%s not enabled)", base, TERMINAL_TOGGLE_ENV

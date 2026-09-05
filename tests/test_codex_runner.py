@@ -132,6 +132,19 @@ def test_claude_only_efforts_are_dropped():
         assert not any("model_reasoning_effort" in a for a in argv), eff
 
 
+def test_web_search_override_is_opt_in(monkeypatch):
+    # Codex's own web_search is off in the CLI by default; the knob is what
+    # makes "search the web" work on the agent path (no Platform key).
+    runner = _runner("argv-search")
+    argv = runner._build_argv(session_uuid="u", model="gpt-5.2", resume=False)
+    assert not any("web_search" in a for a in argv)
+
+    monkeypatch.setenv("CLAUDE_WRAPPER_CODEX_WEB_SEARCH", "true")
+    argv = runner._build_argv(session_uuid="u", model="gpt-5.2", resume=False)
+    assert argv.index("tools.web_search=true") == argv.index("-c", argv.index("-c") + 1) + 1
+    assert argv[-1] == "-"
+
+
 def test_capability_gating_adds_nothing():
     runner = _runner("argv-gate")
     gated = runner._build_argv(

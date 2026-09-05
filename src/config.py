@@ -486,10 +486,20 @@ ULTRACODE_EFFORT = "ultracode"
 # given model is decided per-model by effort_choices_for().
 EFFORT_CHOICES: tuple[str, ...] = EFFORT_LEVELS + (ULTRACODE_EFFORT,)
 
-# The recognition set is the union of both agents' vocabularies on purpose:
-# recognizing "(minimal)" on a claude id merely strips it, and _resolve_effort
-# then drops it as effort-unsupported — no claude-advertised id changes.
-_EFFORT_CHOICE_SET = frozenset(EFFORT_CHOICES) | frozenset(CODEX_EFFORT_CHOICES)
+# Recognition is per-agent, NOT a union of both vocabularies: recognizing
+# "(minimal)" on a claude deployment would silently strip it and run at the
+# server default — flipping what was a loud CLI rejection (and a 404 on
+# GET /v1/models/<id>:minimal) into a request that succeeds while ignoring
+# what the client asked for. An unrecognized suffix stays part of the model
+# string and fails where it always failed.
+_CLAUDE_EFFORT_CHOICE_SET = frozenset(EFFORT_CHOICES)
+_CODEX_EFFORT_CHOICE_SET = frozenset(CODEX_EFFORT_CHOICES)
+
+
+def _effort_choice_set() -> frozenset[str]:
+    return (
+        _CODEX_EFFORT_CHOICE_SET if SETTINGS.agent == "codex" else _CLAUDE_EFFORT_CHOICE_SET
+    )
 
 # Family-rule version boundaries for effort support (from the model docs):
 # effort landed on Opus 4.5 and on Sonnet 4.6.
@@ -617,12 +627,13 @@ def split_model_effort(model: str) -> tuple[str, str | None]:
     so plain model ids keep using the server-default effort.
     """
     m = (model or "").strip()
+    choices = _effort_choice_set()
     paren = re.match(r"^(?P<base>.+?)\s*\((?P<lvl>[A-Za-z]+)\)\s*$", m)
-    if paren and paren.group("lvl").lower() in _EFFORT_CHOICE_SET:
+    if paren and paren.group("lvl").lower() in choices:
         return paren.group("base").strip(), paren.group("lvl").lower()
     if ":" in m:
         base, _, lvl = m.rpartition(":")
-        if base.strip() and lvl.strip().lower() in _EFFORT_CHOICE_SET:
+        if base.strip() and lvl.strip().lower() in choices:
             return base.strip(), lvl.strip().lower()
     return m, None
 

@@ -192,6 +192,26 @@ def test_codex_mode_effort_vocabulary(codex_config):
     )
     # ":none" is recognized (runner-acceptance path) even though never advertised.
     assert codex_config.split_model_effort("gpt-5.2:none") == ("gpt-5.2", "none")
+    # ...and the claude-only tokens are NOT: an unrecognized suffix stays in
+    # the model string and fails loudly downstream instead of being stripped.
+    assert codex_config.split_model_effort("gpt-5.2:max") == ("gpt-5.2:max", None)
+
+
+def test_effort_recognition_is_per_agent():
+    # Under claude (the process default here), the codex-only tokens must not
+    # parse: origin behavior was a loud CLI rejection / 404 on the variant id,
+    # and stripping the suffix would flip that into a silent success at the
+    # server default — a zero-behavior-change violation.
+    assert config.split_model_effort("claude-sonnet-4-6:minimal") == (
+        "claude-sonnet-4-6:minimal",
+        None,
+    )
+    assert config.split_model_effort("claude-opus-4-8 (none)") == (
+        "claude-opus-4-8 (none)",
+        None,
+    )
+    # The shared tokens still parse.
+    assert config.split_model_effort("claude-opus-4-8:high") == ("claude-opus-4-8", "high")
 
 
 def test_codex_mode_owner(codex_config):

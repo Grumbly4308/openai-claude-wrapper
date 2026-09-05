@@ -352,6 +352,46 @@ def test_legacy_functions_forwarded_and_answered_in_kind(codex_mode, bridge):
     }
 
 
+def test_both_tool_families_prefer_the_modern_one(codex_mode, bridge):
+    """A migration-era client sending tools AND functions keeps its modern
+    contract: tools/tool_choice go upstream, the legacy pair is dropped, and
+    the response is NOT down-converted to function_call."""
+    capture = bridge(_openai_tool_call_response())
+    r = _post(
+        {
+            "model": "gpt-5.2",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [WEB_SEARCH_TOOL],
+            "tool_choice": "auto",
+            "functions": [
+                {"name": "web_search", "parameters": {"type": "object", "properties": {}}}
+            ],
+        }
+    )
+    assert r.status_code == 200
+    (sent,) = capture.requests
+    assert "tools" in sent and sent["tool_choice"] == "auto"
+    assert "functions" not in sent and "function_call" not in sent
+    choice = r.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert "function_call" not in choice["message"]
+    assert choice["message"]["tool_calls"]
+
+
+def test_base_url_accepts_the_sdk_v1_convention(monkeypatch):
+    """OPENAI_BASE_URL=https://host/v1 is what every OpenAI-compatible backend
+    documents; the trailing /v1 must not double into /v1/v1/..."""
+    import importlib
+
+    monkeypatch.setenv("CLAUDE_WRAPPER_OPENAI_BASE_URL", "http://vllm.internal:8000/v1/")
+    try:
+        importlib.reload(openai_bridge)
+        assert openai_bridge.OPENAI_BASE_URL == "http://vllm.internal:8000"
+    finally:
+        monkeypatch.delenv("CLAUDE_WRAPPER_OPENAI_BASE_URL")
+        importlib.reload(openai_bridge)
+
+
 # ---------- complete(): status-mapping ladder ----------
 
 

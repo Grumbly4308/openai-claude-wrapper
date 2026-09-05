@@ -50,6 +50,12 @@ log = logging.getLogger("claude_wrapper.openai_bridge")
 OPENAI_BASE_URL = (
     os.environ.get("CLAUDE_WRAPPER_OPENAI_BASE_URL", "").strip() or "https://api.openai.com"
 ).rstrip("/")
+if OPENAI_BASE_URL.endswith("/v1"):
+    # Accept the OpenAI SDK's convention too (OPENAI_BASE_URL=https://host/v1
+    # is what every compatible backend documents): the request paths below
+    # append /v1/..., so a suffixed value would 404 at /v1/v1/chat/completions
+    # with an upstream error naming neither the URL nor the doubled path.
+    OPENAI_BASE_URL = OPENAI_BASE_URL[: -len("/v1")]
 
 # NOTE: no CLAUDE_WRAPPER_TOOLS_MAX_TOKENS equivalent here — unlike the
 # Messages API, OpenAI does not require max_tokens; absent means model default.
@@ -185,7 +191,7 @@ def build_payload(
     payload = req.model_dump(exclude_none=True)
     for key in _WRAPPER_EXTENSION_KEYS:
         payload.pop(key, None)
-    if req.functions is not None:
+    if req.legacy_functions_shape:
         # Legacy `functions` clients: models._adopt_legacy_functions synthesized
         # tools/tool_choice while leaving the legacy fields set, so a verbatim
         # dump would send BOTH parameter families upstream. Forward the legacy
@@ -195,6 +201,12 @@ def build_payload(
         # bridge needs no legacy down-conversion of its own.
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
+    else:
+        # Modern contract (including a migration-era client that sent BOTH
+        # families): tools/tool_choice win, the legacy pair is the redundant
+        # copy — upstream rejects requests carrying both.
+        payload.pop("functions", None)
+        payload.pop("function_call", None)
     payload["model"] = run_model
     payload["stream"] = stream
     if "-codex" in run_model and OPENAI_BASE_URL == "https://api.openai.com":

@@ -790,7 +790,7 @@ async def stream(
     errored_type = "upstream_error"
     # Legacy `functions` clients read delta.function_call, not delta.tool_calls,
     # and the shape carries a single call — extra parallel calls are dropped.
-    legacy = req.functions is not None
+    legacy = req.legacy_functions_shape
     rev_map: dict[str, str] = {}
 
     try:

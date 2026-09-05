@@ -689,7 +689,7 @@ async def _tool_bridge_completion(req: ChatCompletionRequest):
     # Legacy `functions` clients read message.function_call (a single call)
     # and finish_reason "function_call" instead of the tool_calls shape.
     tool_calls, function_call, finish_reason = result.tool_calls, None, result.finish_reason
-    if req.functions is not None and tool_calls:
+    if req.legacy_functions_shape and tool_calls:
         if len(tool_calls) > 1:
             log.warning(
                 "dropping %d parallel call(s): legacy function_call responses carry one call",

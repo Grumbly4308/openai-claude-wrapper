@@ -226,6 +226,26 @@ def _codex_models_from_env() -> tuple[str, ...]:
 # advertise the web_search capability (capabilities.resolve_profile).
 CODEX_WEB_SEARCH_ENV = "CLAUDE_WRAPPER_CODEX_WEB_SEARCH"
 
+# Which path serves client-declared tools under codex:
+#   auto   — the CLI loop when no OpenAI Platform credential resolves, the
+#            bridge when one does. Right default: a ChatGPT-plan deployment
+#            gets working function calling instead of a 502 telling it to buy
+#            Platform access, and a key-holding deployment keeps native calls.
+#   cli    — always the CLI loop (codex_cli_tools), never a Platform call.
+#   bridge — always the passthrough; fail loudly when no key is configured.
+CODEX_TOOL_MODE_ENV = "CLAUDE_WRAPPER_CODEX_TOOL_MODE"
+CODEX_TOOL_MODES = ("auto", "cli", "bridge")
+
+
+def codex_tool_mode() -> str:
+    raw = (os.environ.get(CODEX_TOOL_MODE_ENV, "") or "auto").strip().lower()
+    if raw not in CODEX_TOOL_MODES:
+        raise ValueError(
+            f"{CODEX_TOOL_MODE_ENV}={raw!r} is not valid "
+            f"(expected one of: {', '.join(CODEX_TOOL_MODES)})"
+        )
+    return raw
+
 
 # Reasoning-effort values `codex exec` accepts via -c model_reasoning_effort
 # (verified live: none|minimal|low|medium|high|xhigh; default medium).

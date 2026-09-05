@@ -143,8 +143,11 @@ services:
       CLAUDE_WRAPPER_WORKERS: "${CLAUDE_WRAPPER_WORKERS:-1}"
       # The token-budget plan multipliers are Anthropic-plan-shaped (pro/max);
       # no ChatGPT-plan calibration exists, so the cap ships OFF here. Set
-      # CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE for a custom cap.
-      CLAUDE_WRAPPER_SESSION_PLAN: "${CLAUDE_WRAPPER_SESSION_PLAN:-off}"
+      # CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE for a custom cap. Fed from its
+      # own variable, not CLAUDE_WRAPPER_SESSION_PLAN — the shared .env ships
+      # that one as `max 5x`, which would silently re-enable the
+      # Anthropic-calibrated cap here and make the `off` default dead.
+      CLAUDE_WRAPPER_SESSION_PLAN: "${CODEX_WRAPPER_SESSION_PLAN:-off}"
       CLAUDE_WRAPPER_PRO_SESSION_TOKENS: "${CLAUDE_WRAPPER_PRO_SESSION_TOKENS:-1500000}"
       CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE: "${CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE:-0}"
       CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT: "${CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT:-5}"

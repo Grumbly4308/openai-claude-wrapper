@@ -836,7 +836,7 @@ compose file):
 | `CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS` | `AskUserQuestion` | empty string | Compose passes an empty value, which **overrides** the code default and stops `--disallowedTools` from being passed at all. The dead `AskUserQuestion` tool is then reachable again. |
 | `CLAUDE_WRAPPER_EFFORT` | empty (no flag) | `medium` | A compose deployment pins effort at medium; a bare-Python run lets the CLI pick. |
 | `CLAUDE_WRAPPER_WORKSPACE_HINT` | `false` | `on` | Off in code deliberately, because the hint changes the *shape* of the reply and `/v1/completions`, assistants runs and the batches worker share the same path. |
-| `CLAUDE_WRAPPER_SESSION_PLAN` | `max 5x` | `off` (`docker-compose.codex.yml` only) | The [usage cap](#per-conversation-usage-cap-usage-checkpoint)'s plan presets are Anthropic-shaped; no ChatGPT-plan calibration exists, so the codex stack ships the cap off. Set `CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE` for a custom cap. |
+| `CLAUDE_WRAPPER_SESSION_PLAN` | `max 5x` | `off` (`docker-compose.codex.yml`, via `CODEX_WRAPPER_SESSION_PLAN`) | The [usage cap](#per-conversation-usage-cap-usage-checkpoint)'s plan presets are Anthropic-shaped; no ChatGPT-plan calibration exists, so the codex stack ships the cap off — on its own variable, so the shared `.env`'s `max 5x` cannot silently re-enable it. Set `CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE` for a custom cap. |
 
 Removed and ignored: `CLAUDE_WRAPPER_JSON_SNIFF`. It is documented as removed in
 `.env.example` and read nowhere in the code.
@@ -1978,16 +1978,18 @@ with `docker compose exec`.
 
 ## Running the tests
 
-The suite is 14 files covering endpoints, JSON mode, the budget, downloads,
+The suite is 23 files covering endpoints, JSON mode, the budget, downloads,
 effort, the tool bridge, the KB addendum, PDF handling, the sandbox shim, resume
-self-healing and model discovery. It stubs Claude Code, so **no Docker and no
-Anthropic credentials are required**.
+self-healing, model discovery — and, since the codex integration: the agent
+selector, the codex runner, the OpenAI bridge and the entrypoint roles. It
+stubs both CLIs, so **no Docker and no Anthropic or OpenAI credentials are
+required**.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt pytest        # pytest is NOT in requirements.txt
 CLAUDE_WRAPPER_DATA=/tmp/cw-test python -m pytest tests -q
-# 171 passed
+# 332 passed  (the exact count moves with every added test; treat ±a few as fine)
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same command on Python 3.11, preceded by
@@ -1996,8 +1998,8 @@ under a second — three separate import-level breakages reached `main` before t
 guard existed. CI does not lint, type-check, build the image, or validate the
 compose files.
 
-Seven of the test files also run standalone (`python tests/test_endpoints.py`)
-and print a `RESULT pass=N fail=M` line; the other seven are pytest-only and use
+Nine of the test files also run standalone (`python tests/test_endpoints.py`)
+and print a `RESULT pass=N fail=M` line; the rest are pytest-only and use
 fixtures. Prefer the pytest command — the standalone path in `test_endpoints.py`
 executes 27 of the 31 tests defined in that file, and its `check()` helper counts
 failures without asserting, so a failure there does not fail the file under
@@ -2087,7 +2089,7 @@ fail the same way on the first real request instead of at boot.
 | --- | --- |
 | `src/` | The application. `main.py` (routes + SSE), `agent_runner.py` (agent-neutral runner core + sessions), `claude_runner.py` (Claude CLI dialect), `codex_runner.py` (codex exec dialect), `converters.py` (prompt building), `tool_bridge.py` (Messages API path), `openai_bridge.py` (OpenAI passthrough for codex tools requests), `agent_shim.py` (sandbox agent service), plus per-area routers. |
 | `docker-compose.codex.yml` | The codex variant of the default sandboxed stack — see [Quick start (Codex)](#quick-start-codex). |
-| `tests/` | 14 test files; see [Running the tests](#running-the-tests). |
+| `tests/` | 23 test files; see [Running the tests](#running-the-tests). |
 | `sandbox/` | `squid.conf` and `allowlist.txt`, bind-mounted into the squid container. Config only — there is no `sandbox` executable despite what the comments in those files suggest. |
 | `tools/` | Host-side helper scripts, not part of the service and not in the image. `split_pdf.py` slices a PDF by page range or outline chapter; `chat_with_pdfs.py` uploads PDFs as binary `file_id`s and posts a chat completion, bypassing Open WebUI's text extraction. |
 | `deploy/` | **Historical.** An archived incident runbook for a mis-mounted `claude-home` volume. Both fixes shipped; `fix-claude-home-mount.sh` fails its own preflight by design and must not be run. |

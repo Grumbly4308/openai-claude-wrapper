@@ -91,10 +91,14 @@ class CodexRunner(BaseAgentRunner):
             "--json",
             "--skip-git-repo-check",  # session cwds are not git repos
             # The container IS the sandbox (network-isolated agent + squid, README
-            # "Sandboxed deployment"); codex's own seccomp/landlock layer is
-            # redundant here and unreliable under cap_drop:ALL. This flag is
-            # sanctioned HERE ONLY — never in the refresher, which runs with
-            # ordinary egress and no container sandbox (see entrypoint.sh §6.4).
+            # "Sandboxed deployment"): codex's own approvals/sandbox layer is
+            # redundant here, and its write restrictions would break the very
+            # tool use these turns exist for (session workspaces, generated
+            # files). This flag is sanctioned HERE ONLY — the refresher, which
+            # has ordinary egress and no network boundary, runs its turn under
+            # codex's own read-only sandbox instead, where a sandbox that
+            # fails to set up fails CLOSED (no turn, logged, retried) rather
+            # than open (see entrypoint.sh cmd_codex_refresher).
             "--dangerously-bypass-approvals-and-sandbox",
             "-c", "check_for_update_on_startup=false",  # no update probe through squid
         ]

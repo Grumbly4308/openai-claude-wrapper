@@ -119,9 +119,15 @@ services:
 
       # Everything below is identical to docker-compose.yml — the API surface
       # and its features are unchanged by the agent swap.
-      # Only needed for function-calling (tools) requests: the passthrough
-      # calls the OpenAI Platform API, which a ChatGPT-plan login cannot.
+      # Only needed for NATIVE function calling: the passthrough calls the
+      # OpenAI Platform API, which a ChatGPT-plan login cannot. Without it the
+      # default tool mode (auto) serves tools through the codex CLI instead —
+      # see CLAUDE_WRAPPER_CODEX_TOOL_MODE below.
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      # auto | cli | bridge. auto (default) uses the CLI loop when no Platform
+      # credential resolves and the passthrough when one does, so a
+      # ChatGPT-plan deployment gets working tools instead of a 502.
+      CLAUDE_WRAPPER_CODEX_TOOL_MODE: "${CLAUDE_WRAPPER_CODEX_TOOL_MODE:-}"
       # Tool-bridge passthrough target; empty means https://api.openai.com.
       CLAUDE_WRAPPER_OPENAI_BASE_URL: "${CLAUDE_WRAPPER_OPENAI_BASE_URL:-}"
       CLAUDE_WRAPPER_API_KEYS: "${CLAUDE_WRAPPER_API_KEYS:-}"

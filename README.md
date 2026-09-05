@@ -729,6 +729,7 @@ them with no fallback, so a stripped environment aborts at start.
 | `CLAUDE_WRAPPER_CODEX_CREDENTIALS_FILE` | Where the wrapper reads `codex login`'s auth state. | `$CODEX_HOME/auth.json` |
 | `CLAUDE_WRAPPER_OPENAI_BASE_URL` | OpenAI API base for the tools passthrough (codex only). | `https://api.openai.com` |
 | `CLAUDE_WRAPPER_CODEX_MODELS` | Comma-separated override of the advertised codex model list. | built-in list |
+| `CLAUDE_WRAPPER_CODEX_TOOL_MODE` | `auto` \| `cli` \| `bridge` — which path serves client-declared tools. `auto` falls back to the CLI loop when no Platform key resolves, so a ChatGPT-plan deployment gets working function calling. Invalid values refuse to boot. See [Codex function calling](#codex-function-calling). | `auto` |
 
 Note `OPENAI_API_KEY` and the `CODEX_REFRESH_*` refresher knobs (see
 `.env.example`) have no `CLAUDE_WRAPPER_` prefix.
@@ -1773,17 +1774,48 @@ you deploy. Precedence:
   and mounting it into the one internet-facing container would expose it for
   zero benefit. Uncomment the mount only if you persist an API key there.
 
-**The plan-token asymmetry: a ChatGPT-plan login drives CLI turns only.
-Function-calling (`tools`) requests need an API key — without one they return
-a 502 (`no_upstream_credential`) naming the two working options.** Unlike
-Claude, whose plan login is bridge-usable, ChatGPT-plan tokens authenticate
-against the Codex backend, not the OpenAI Platform API — sending one to
-`/v1/chat/completions` is both non-functional and a plan-terms violation, so
-the wrapper never tries.
+**The plan-token asymmetry: a ChatGPT-plan login drives CLI turns only.**
+Unlike Claude, whose plan login is bridge-usable, ChatGPT-plan tokens
+authenticate against the Codex backend, not the OpenAI Platform API — sending
+one to `/v1/chat/completions` is both non-functional and a plan-terms
+violation, so the wrapper never tries. Native function calling therefore needs
+an API key; [Codex function calling](#codex-function-calling) is how a
+plan-only deployment gets tool calls anyway.
 
 When OpenAI rejects the wrapper's upstream credential (401/403), clients see
 a fixed 502 message; the upstream body — which can echo fragments of the
 presented key — goes to the server log only.
+
+### Codex function calling
+
+Client-declared `tools` can be served two ways under codex, chosen by
+`CLAUDE_WRAPPER_CODEX_TOOL_MODE`:
+
+| Mode | Path | Needs a key? |
+| --- | --- | --- |
+| `auto` (default) | CLI loop when no Platform credential resolves, passthrough when one does | no |
+| `cli` | always the CLI loop (`src/codex_cli_tools.py`) | no |
+| `bridge` | always the passthrough (`src/openai_bridge.py`); 502s without a key | yes |
+
+The **CLI loop** exists because a ChatGPT-plan deployment has no way to reach
+the Platform API. Since `codex exec` has no protocol for returning a caller's
+tool calls, the contract rides in the prompt: the client's tool definitions and
+their JSON schemas are rendered as a protocol block, codex replies with a
+single JSON envelope (`{"tool_calls": [...]}` or `{"content": "..."}`), and the
+wrapper turns that back into OpenAI-shaped `tool_calls` with
+`finish_reason: "tool_calls"`. The client executes the tool and sends results
+back as `role: "tool"` messages, which the transcript already renders — so a
+standard OpenAI tool loop (LangChain, the OpenAI SDK, an agentic search UI)
+works unmodified.
+
+Robustness measures, because a prompt is not a schema-enforced API: fenced
+output and the OpenAI-native `{"function": {...}}` nesting are both accepted,
+`arguments` is coerced to a valid JSON string whatever the model emits, a call
+naming a tool the client never declared is dropped rather than forwarded, and
+anything unparseable degrades to a plain text answer instead of an error. The
+boot log states which path is active, and each tools request is logged
+`[codex-cli-tools]` or `[tool-bridge]`. Limits are listed in
+[Limitations](#limitations-and-known-gaps).
 
 ### Keeping the credential alive
 
@@ -2095,7 +2127,7 @@ fail the same way on the first real request instead of at boot.
 
 | Path | What it is |
 | --- | --- |
-| `src/` | The application. `main.py` (routes + SSE), `agent_runner.py` (agent-neutral runner core + sessions), `claude_runner.py` (Claude CLI dialect), `codex_runner.py` (codex exec dialect), `converters.py` (prompt building), `tool_bridge.py` (Messages API path), `openai_bridge.py` (OpenAI passthrough for codex tools requests), `agent_shim.py` (sandbox agent service), plus per-area routers. |
+| `src/` | The application. `main.py` (routes + SSE), `agent_runner.py` (agent-neutral runner core + sessions), `claude_runner.py` (Claude CLI dialect), `codex_runner.py` (codex exec dialect), `converters.py` (prompt building), `tool_bridge.py` (Messages API path), `openai_bridge.py` (OpenAI passthrough for codex tools requests), `codex_cli_tools.py` (prompt-declared function calling on the codex CLI, no API key), `agent_shim.py` (sandbox agent service), plus per-area routers. |
 | `docker-compose.codex.yml` | The codex variant of the default sandboxed stack — see [Quick start (Codex)](#quick-start-codex). |
 | `tests/` | 23 test files; see [Running the tests](#running-the-tests). |
 | `sandbox/` | `squid.conf` and `allowlist.txt`, bind-mounted into the squid container. Config only — there is no `sandbox` executable despite what the comments in those files suggest. |
@@ -2110,6 +2142,16 @@ fail the same way on the first real request instead of at boot.
   the tool bridge (Messages API, `tool_calls` returned, no CLI and therefore no
   generated files); requests without them run the agentic CLI path, where Claude
   manages its own tools internally and only the final assistant text is surfaced.
+  Under codex without a Platform key this splits differently — see
+  [Codex function calling](#codex-function-calling).
+- **Codex tool calls are prompt-declared, not native.** The CLI loop carries the
+  tool contract in the prompt rather than in a function-calling API, so it is
+  less reliable than either native path: a model can ignore the envelope (the
+  reply then degrades to plain text rather than erroring), parallel tool calls
+  are emitted only if the model volunteers them, and streaming is
+  whole-response rather than incremental. Set
+  `CLAUDE_WRAPPER_CODEX_TOOL_MODE=bridge` with an `OPENAI_API_KEY` when you
+  need native behaviour.
 - **OpenAI surface coverage is partial.** There is no list-threads, no
   thread/message/vector-store *modify*, no message retrieve/delete, no run
   cancel, and no `submit_tool_outputs`. Fine-tuning is stubbed (501 on writes,

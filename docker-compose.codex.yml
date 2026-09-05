@@ -326,9 +326,13 @@ services:
     # use, and accepts no inbound connections — trusted plumbing, which is why
     # direct egress is acceptable here and never on codex-agent. That posture
     # is also why its refresh turn runs under codex's own read-only sandbox,
-    # never with the bypass flag the sandboxed agent container earns (see
-    # entrypoint.sh cmd_codex_refresher). Idle it is a sleep loop; its only
-    # cost is a few one-word turns a month.
+    # never with the bypass flag the sandboxed agent container earns — and
+    # against a PRIVATE CODEX_HOME holding auth.json alone: the volume's
+    # config.toml is agent-writable and codex executes config directives, so
+    # loading it here would let a prompt-injected agent run commands with
+    # this container's un-allowlisted egress (see entrypoint.sh
+    # cmd_codex_refresher). Idle it is a sleep loop; its only cost is a few
+    # one-word turns a month.
     build:
       context: .
       dockerfile: Dockerfile

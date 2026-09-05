@@ -1864,8 +1864,14 @@ The codex story is the same shape with different machinery: codex refreshes
 its ChatGPT tokens automatically **on use**, so an idle deployment is the
 failure mode, and the `codex-refresher` service covers it — it watches
 `auth.json` and spends one minimal turn whenever `last_refresh` goes stale.
-That refresh turn runs under codex's own read-only sandbox: the refresher
-runs no agent code and executes no model-driven tool use. Treat the
+That refresh turn runs under codex's own read-only sandbox — and against a
+private `CODEX_HOME` seeded with `auth.json` alone, because the volume's
+`config.toml` is agent-writable and codex executes config directives
+(`mcp_servers` commands spawn as plain subprocesses): loading it in a
+container with ordinary egress would hand a prompt-injected agent a way
+around Squid entirely. The refresher runs no agent code and executes no
+model-driven tool use; only the credential crosses back. `codex-login` takes
+the same precaution. Treat the
 refresh-lifetime figures as estimates — OpenAI does not publish them, and the
 refresher logs the token age on every pass so you can watch the real
 behaviour.

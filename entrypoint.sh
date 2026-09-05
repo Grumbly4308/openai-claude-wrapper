@@ -318,11 +318,40 @@ PY
             # with approvals left at their exec defaults. The bypass flag
             # exists ONLY in CodexRunner._build_argv, where the
             # network-isolated agent container is the boundary.
-            printf 'ok' | codex exec --json --skip-git-repo-check \
-                --sandbox read-only --ephemeral - >/dev/null 2>&1 || true
+            #
+            # The turn runs against a PRIVATE CODEX_HOME seeded with auth.json
+            # alone. The volume's config.toml is agent-writable, and codex
+            # executes config directives (mcp_servers commands spawn as plain
+            # subprocesses at session start, outside its command sandbox) —
+            # read from THIS container, that would hand a prompt-injected
+            # agent arbitrary command execution with ordinary egress, squid
+            # never consulted. Only the credential crosses the boundary, in
+            # either direction.
+            local turn_home
+            turn_home="$(mktemp -d)"
+            if ! cp -p "${CODEX_HOME_DIR}/auth.json" "${turn_home}/auth.json" 2>/dev/null; then
+                rm -rf "${turn_home}"
+                echo "codex-refresher: auth.json vanished mid-pass; retrying in ${retry}s" >&2
+                sleep "${retry}"; continue
+            fi
+            cp -p "${turn_home}/auth.json" "${turn_home}/auth.json.before"
+            # stdout (the JSON event stream) is noise; stderr stays on the
+            # container log so a turn that dies at startup is diagnosable
+            # instead of silently retrying until the refresh token expires.
+            printf 'ok' | CODEX_HOME="${turn_home}" codex exec --json \
+                --skip-git-repo-check --sandbox read-only --ephemeral - \
+                >/dev/null || true
             # (--ephemeral so refresher turns never enter the resumable
             # thread store; codex refreshes stale tokens on use as a side
             # effect.)
+            if ! cmp -s "${turn_home}/auth.json" "${turn_home}/auth.json.before"; then
+                # Renewed: publish to the volume. Compared against the
+                # pre-turn snapshot, not the volume copy, so a concurrent
+                # renewal by the agent's own CLI is never clobbered with a
+                # stale credential.
+                cp "${turn_home}/auth.json" "${CODEX_HOME_DIR}/auth.json"
+            fi
+            rm -rf "${turn_home}"
             local kind_after age_after
             read -r kind_after age_after <<<"$(cred_state)"
             if [[ "${kind_after}" == "tokens" && "${age_after}" != "none" ]] \
@@ -346,7 +375,21 @@ cmd_codex_login() {
     # (the default browser flow's localhost:1455 callback server is
     # unreachable in a run container unless you publish the port:
     #   docker compose ... run --rm -it -p 1455:1455 codex-refresher codex login).
-    exec codex login --device-auth "$@"
+    #
+    # Same private-CODEX_HOME discipline as the refresher's turn: the volume
+    # config.toml is agent-writable and codex executes config directives, so
+    # the login runs against a scratch home (a fresh login needs nothing from
+    # the volume) and only auth.json is copied back.
+    local login_home rc=0
+    login_home="$(mktemp -d)"
+    CODEX_HOME="${login_home}" codex login --device-auth "$@" || rc=$?
+    if [[ -f "${login_home}/auth.json" ]]; then
+        cp "${login_home}/auth.json" "${CODEX_HOME_DIR}/auth.json"
+        chmod 600 "${CODEX_HOME_DIR}/auth.json"
+        echo "codex-login: credential stored in ${CODEX_HOME_DIR}/auth.json" >&2
+    fi
+    rm -rf "${login_home}"
+    exit "${rc}"
 }
 
 cmd_setup_token() {
@@ -404,6 +447,12 @@ case "${1:-serve}" in
         cmd_codex_login "$@"
         ;;
     codex)
+        # Operator escape hatch, and unlike codex-refresher/codex-login it
+        # runs against the VOLUME home — deliberately, so `codex logout`,
+        # thread inspection and `login --with-api-key` see real state. That
+        # also means it reads the agent-writable config.toml, whose
+        # directives codex executes: do not run this role on a deployment
+        # you suspect is compromised.
         shift
         exec codex "$@"
         ;;

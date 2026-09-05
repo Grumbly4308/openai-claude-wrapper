@@ -1886,18 +1886,22 @@ chmod 600 ~/claude-oauth-backup.json
 
 ### Entrypoint subcommands
 
-Available via `docker compose run --rm -it claude-wrapper <cmd>`:
+Available via `docker compose run --rm -it claude-wrapper <cmd>` — except the
+`codex-*`/`codex` rows, which exist only in codex-stack images (the claude
+build ships no codex binary): run those as
+`docker compose -f docker-compose.codex.yml run --rm -it codex-refresher <cmd>`.
 
 | Command | Purpose |
 | --- | --- |
 | `serve` (also `start`, `run`, or no argument) | Start the uvicorn API server |
 | `agent` / `shim` | Start the agent shim — used by the sandbox topology |
+| `refresher` / `refresh` | Keep the volume's Claude login renewed — the claude-refresher service's role |
 | `login` / `init` | Interactive Claude Code OAuth login |
-| `setup-token` / `token` | Mint a long-lived OAuth token |
+| `setup-token` / `token` | Mint a long-lived OAuth token (printed, not saved) |
 | `shell` / `bash` | Drop into bash inside the container |
 | `claude …` | Run any other `claude` CLI command |
 | `codex-login` | Codex device-code login — the codex stack's bootstrap |
-| `codex-refresher` | Keep a ChatGPT-plan `auth.json` fresh — used by the codex stack |
+| `codex-refresher` | Keep a ChatGPT-plan `auth.json` fresh — the codex-refresher service's role |
 | `codex …` | Run any other `codex` CLI command |
 | anything else | Executed verbatim |
 

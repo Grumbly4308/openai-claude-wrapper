@@ -186,6 +186,24 @@ def build_payload(
         payload.pop("tool_choice", None)
     payload["model"] = run_model
     payload["stream"] = stream
+    if "-codex" in run_model and OPENAI_BASE_URL == "https://api.openai.com":
+        # The codex-tuned ids are served only by the Responses API — the real
+        # api.openai.com rejects them at /v1/chat/completions, so without this
+        # gate every tools request on an advertised *-codex model dies as an
+        # opaque upstream-404 passthrough. Fail loud with the fix instead.
+        # Scoped to the default base URL on purpose: a custom
+        # CLAUDE_WRAPPER_OPENAI_BASE_URL backend (vLLM, a proxy) may well
+        # serve these ids on chat.completions, and that must keep working.
+        raise openai_error(
+            400,
+            f"model '{run_model}' is a codex-tuned id, which OpenAI serves only "
+            "via the Responses API — function-calling (tools) requests go "
+            "through /v1/chat/completions and cannot use it. Pick a non-codex "
+            "model for tools requests, or drop `tools` to run this model "
+            "through the codex CLI",
+            param="model",
+            code="model_not_bridge_capable",
+        )
     if effort and effort in CODEX_EFFORT_CHOICES:
         # Only the explicit per-request suffix maps. SETTINGS.effort (server
         # default, ships "medium") is NOT injected: non-reasoning OpenAI models

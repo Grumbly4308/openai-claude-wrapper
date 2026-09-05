@@ -83,7 +83,7 @@ def _openai_tool_call_response() -> dict:
         "id": "chatcmpl-up1",
         "object": "chat.completion",
         "created": 1,
-        "model": "gpt-5.2-codex",
+        "model": "gpt-5.2",
         "choices": [
             {
                 "index": 0,
@@ -229,7 +229,7 @@ def test_outbound_key_set_pinned_and_wrapper_fields_stripped(codex_mode, bridge)
     capture = bridge(_openai_tool_call_response())
     r = _post(
         {
-            "model": "gpt-5.2-codex",
+            "model": "gpt-5.2",
             "temperature": 0,
             "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
             "tools": [WEB_SEARCH_TOOL],
@@ -240,7 +240,7 @@ def test_outbound_key_set_pinned_and_wrapper_fields_stripped(codex_mode, bridge)
     assert r.status_code == 200
     (sent,) = capture.requests
     assert set(sent) == {"model", "messages", "stream", "tools", "temperature"}
-    assert sent["model"] == "gpt-5.2-codex"
+    assert sent["model"] == "gpt-5.2"
     assert sent["stream"] is False
     assert sent["tools"] == [WEB_SEARCH_TOOL]
     assert capture.last_headers["authorization"] == "Bearer sk-test"
@@ -273,8 +273,8 @@ def test_reasoning_effort_present_iff_suffix_given(codex_mode, bridge):
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [WEB_SEARCH_TOOL],
     }
-    r = _post({**base, "model": "gpt-5.2-codex:high"})
-    assert capture.requests[0]["model"] == "gpt-5.2-codex"
+    r = _post({**base, "model": "gpt-5.2:high"})
+    assert capture.requests[0]["model"] == "gpt-5.2"
     assert capture.requests[0]["reasoning_effort"] == "high"
     # The non-streaming path re-derives effort inside the bridge, so the
     # envelope's claim and the payload agree.
@@ -284,10 +284,10 @@ def test_reasoning_effort_present_iff_suffix_given(codex_mode, bridge):
         "requested": "high",
     }
 
-    _post({**base, "model": "gpt-5.2-codex:none"})
+    _post({**base, "model": "gpt-5.2:none"})
     assert capture.requests[1]["reasoning_effort"] == "none"
 
-    r = _post({**base, "model": "gpt-5.2-codex"})
+    r = _post({**base, "model": "gpt-5.2"})
     assert "reasoning_effort" not in capture.requests[2]
     assert r.json()["effort"]["applied"] == "api-default"
 
@@ -304,7 +304,7 @@ def test_response_format_and_tool_choice_pass_through_verbatim(codex_mode, bridg
     tool_choice = {"type": "function", "function": {"name": "web_search"}}
     r = _post(
         {
-            "model": "gpt-5.2-codex",
+            "model": "gpt-5.2",
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [WEB_SEARCH_TOOL],
             "tool_choice": tool_choice,
@@ -331,7 +331,7 @@ def test_legacy_functions_forwarded_and_answered_in_kind(codex_mode, bridge):
     capture = bridge(legacy_response)
     r = _post(
         {
-            "model": "gpt-5.2-codex",
+            "model": "gpt-5.2",
             "messages": [{"role": "user", "content": "weather?"}],
             "functions": [
                 {"name": "web_search", "parameters": {"type": "object", "properties": {}}}
@@ -373,7 +373,7 @@ def test_upstream_400_envelope_passes_through(codex_mode, bridge):
     )
     r = _post(
         {
-            "model": "gpt-5.2-codex",
+            "model": "gpt-5.2",
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [WEB_SEARCH_TOOL],
         }
@@ -394,7 +394,7 @@ def test_upstream_401_becomes_fixed_message_502(codex_mode, bridge, caplog):
     with caplog.at_level(logging.ERROR, logger="claude_wrapper.openai_bridge"):
         r = _post(
             {
-                "model": "gpt-5.2-codex",
+                "model": "gpt-5.2",
                 "messages": [{"role": "user", "content": "hi"}],
                 "tools": [WEB_SEARCH_TOOL],
             }
@@ -412,7 +412,7 @@ def test_upstream_5xx_wrapped_as_502(codex_mode, bridge):
     bridge(httpx.Response(500, text="upstream exploded"))
     r = _post(
         {
-            "model": "gpt-5.2-codex",
+            "model": "gpt-5.2",
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [WEB_SEARCH_TOOL],
         }
@@ -427,7 +427,7 @@ def test_connect_error_is_502_unreachable(codex_mode, bridge):
     bridge(httpx.ConnectError("connection refused"))
     r = _post(
         {
-            "model": "gpt-5.2-codex",
+            "model": "gpt-5.2",
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [WEB_SEARCH_TOOL],
         }
@@ -444,7 +444,7 @@ def _chunk_base() -> dict:
         "id": "chatcmpl-up1",
         "object": "chat.completion.chunk",
         "created": 1,
-        "model": "gpt-5.2-codex",
+        "model": "gpt-5.2",
     }
 
 
@@ -496,7 +496,7 @@ def _collect_stream(body: dict, on_usage=None) -> tuple[str, list[str]]:
 
 
 _STREAM_BODY = {
-    "model": "gpt-5.2-codex",
+    "model": "gpt-5.2",
     "stream": True,
     "messages": [{"role": "user", "content": "weather?"}],
     "tools": [WEB_SEARCH_TOOL],
@@ -605,10 +605,10 @@ def profiles(monkeypatch):
 def test_client_tools_denied_by_profile(codex_mode, bridge, profiles):
     """The one non-proxy gate: same 400 as the claude bridge, same param."""
     bridge(_openai_tool_call_response())
-    profiles({"models": [{"match": "gpt-5.2-codex", "remove": ["client_tools"]}]})
+    profiles({"models": [{"match": "gpt-5.2", "remove": ["client_tools"]}]})
     r = _post(
         {
-            "model": "gpt-5.2-codex",
+            "model": "gpt-5.2",
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [WEB_SEARCH_TOOL],
         }
@@ -617,6 +617,41 @@ def test_client_tools_denied_by_profile(codex_mode, bridge, profiles):
     err = r.json()["error"]
     assert err["type"] == "invalid_request_error" and err["param"] == "tools"
     assert "client_tools" in err["message"] and "web_search" in err["message"]
+
+
+def test_codex_tuned_ids_rejected_for_tools_requests(codex_mode, bridge):
+    """*-codex ids are Responses-API-only upstream: a tools request on one must
+    die as a clear 400 here, not as an opaque upstream-404 passthrough."""
+    capture = bridge(_openai_tool_call_response())
+    for model in ("gpt-5.2-codex", "gpt-5.3-codex-spark:high"):
+        r = _post(
+            {
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [WEB_SEARCH_TOOL],
+            }
+        )
+        assert r.status_code == 400
+        err = r.json()["error"]
+        assert err["param"] == "model" and err["code"] == "model_not_bridge_capable"
+        assert "Responses API" in err["message"]
+    assert capture.requests == []  # nothing reached upstream
+
+
+def test_codex_tuned_gate_skipped_on_custom_base_url(codex_mode, bridge, monkeypatch):
+    """A custom OPENAI_BASE_URL backend may well serve codex ids on
+    chat.completions — the gate is scoped to the real api.openai.com."""
+    capture = bridge(_openai_tool_call_response())
+    monkeypatch.setattr(openai_bridge, "OPENAI_BASE_URL", "http://vllm.internal:8000")
+    r = _post(
+        {
+            "model": "gpt-5.2-codex",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [WEB_SEARCH_TOOL],
+        }
+    )
+    assert r.status_code == 200
+    assert capture.requests[0]["model"] == "gpt-5.2-codex"
 
 
 # ---------- main.py routing + owned_by under agent=codex ----------
@@ -662,14 +697,14 @@ def test_codex_agent_routes_tools_requests_to_the_openai_bridge(codex_mode, monk
     monkeypatch.setattr(tool_bridge, "complete", _wrong_bridge)
     r = _post(
         {
-            "model": "gpt-5.2-codex",
+            "model": "gpt-5.2",
             "messages": [{"role": "user", "content": "hi"}],
             "tools": [WEB_SEARCH_TOOL],
         }
     )
     assert r.status_code == 200
     assert r.json()["choices"][0]["message"]["content"] == "bridged"
-    assert calls == ["gpt-5.2-codex"]
+    assert calls == ["gpt-5.2"]
 
 
 def test_codex_agent_toolless_requests_stay_on_the_runner(codex_mode, monkeypatch):

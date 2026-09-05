@@ -2117,6 +2117,13 @@ fail the same way on the first real request instead of at boot.
   disable it.
 - **No wrapper-owned tools on the codex bridge.** `memory` and `time_calc`
   live in the Anthropic hybrid loop; the OpenAI passthrough never injects them.
+- **Codex-tuned model ids cannot take `tools` requests.** OpenAI serves the
+  `*-codex` ids only via the Responses API, and the passthrough speaks
+  `/v1/chat/completions` — such requests are rejected with a 400 naming the
+  fix (use a non-codex id, or drop `tools` for the CLI path) rather than
+  forwarded into an opaque upstream 404. The gate applies only against the
+  default `api.openai.com`; a custom `CLAUDE_WRAPPER_OPENAI_BASE_URL` backend
+  is assumed to know its own model surface.
 - **The token budget is uncalibrated for ChatGPT plans.** The plan presets are
   Anthropic-shaped, so the codex stack ships the cap off.
 - **Codex streaming is item-granular.** `codex exec --json` emits whole text

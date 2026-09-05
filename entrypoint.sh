@@ -2,7 +2,10 @@
 set -euo pipefail
 
 CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-${HOME:-/home/claude}/.claude}"
-mkdir -p "${CLAUDE_WRAPPER_WORKSPACE}" "${CLAUDE_WRAPPER_FILES}" "${CLAUDE_WRAPPER_SESSIONS}" "${CLAUDE_HOME}"
+CODEX_HOME_DIR="${CODEX_HOME:-${HOME:-/home/claude}/.codex}"
+mkdir -p "${CLAUDE_WRAPPER_WORKSPACE}" "${CLAUDE_WRAPPER_FILES}" "${CLAUDE_WRAPPER_SESSIONS}" "${CLAUDE_HOME}" "${CODEX_HOME_DIR}"
+
+agent_kind() { echo "${CLAUDE_WRAPPER_AGENT:-claude}"; }
 
 has_saved_login() {
     # Claude Code stores credentials in ~/.claude/ — but presence alone is not
@@ -37,7 +40,63 @@ has_env_auth() {
     [[ -n "${ANTHROPIC_API_KEY:-}" ]] || [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]
 }
 
+has_codex_saved_login() {
+    # Codex keeps auth in ${CODEX_HOME}/auth.json — either an API key
+    # (auth_mode=apikey) or ChatGPT-plan OAuth tokens. Unlike the claude file,
+    # token expiry is not recorded readably, so presence of tokens counts as
+    # viable — opaque is not the same as expired (same philosophy as the
+    # claude helper above).
+    [[ -f "${CODEX_HOME_DIR}/auth.json" ]] || return 1
+    python3 - "${CODEX_HOME_DIR}/auth.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    o = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(1)
+if o.get('auth_mode') == 'apikey' and o.get('OPENAI_API_KEY'):
+    raise SystemExit(0)
+if (o.get('tokens') or {}).get('access_token'):
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+has_codex_env_auth() {
+    [[ -n "${OPENAI_API_KEY:-}" ]] || [[ -n "${CODEX_API_KEY:-}" ]]
+}
+
+warn_if_no_codex_auth() {
+    if ! has_codex_saved_login && ! has_codex_env_auth; then
+        cat >&2 <<'MSG'
+================================================================
+  claude-wrapper: no usable Codex credential. No OPENAI_API_KEY is
+  set and the volume login is missing.
+
+  Bootstrap a ChatGPT-plan login into the codex-home volume from a
+  container with ordinary networking (README "First-time login (Codex)"):
+
+      docker compose -f docker-compose.codex.yml run --rm -it codex-refresher codex-login
+      # follow the device-code flow in your browser
+
+  …or use API-key auth instead: set OPENAI_API_KEY in .env, or persist
+  it to the volume:
+
+      printenv OPENAI_API_KEY | docker compose -f docker-compose.codex.yml \
+          run --rm -T codex-refresher codex login --with-api-key
+
+  (API requests will fail until one of the above is done.)
+================================================================
+MSG
+    fi
+}
+
 warn_if_no_auth() {
+    # Dispatch on the wrapped agent: each stack warns about its own vendor's
+    # credential, not the other one's.
+    if [[ "$(agent_kind)" == codex ]]; then
+        warn_if_no_codex_auth
+        return
+    fi
     if ! has_saved_login && ! has_env_auth; then
         cat >&2 <<'MSG'
 ================================================================
@@ -185,6 +244,111 @@ cmd_login() {
     exec claude
 }
 
+cmd_codex_refresher() {
+    # Keeps the codex volume login alive regardless of traffic. Codex renews
+    # its ChatGPT tokens only when it runs, and the refresh token's lifetime
+    # is finite (~28 days observed historically — an estimate, not a
+    # published figure), so an idle deployment drifts past it no matter how
+    # healthy its network path is. This role runs the same CLI against the
+    # same codex-home volume from a container with ordinary networking — the
+    # position the device-code login bootstrap already works from — and
+    # spends one throwaway turn whenever last_refresh goes stale, which makes
+    # codex rewrite auth.json for every reader of the volume.
+    #
+    # An environment credential would make codex ignore the file entirely,
+    # so this loop would burn turns renewing nothing. Refuse rather than
+    # silently measure the wrong thing.
+    if [[ -n "${OPENAI_API_KEY:-}" || -n "${CODEX_API_KEY:-}" ]]; then
+        echo "codex-refresher: OPENAI_API_KEY / CODEX_API_KEY is set — codex" >&2
+        echo "ignores the volume login while one is present, so this loop" >&2
+        echo "cannot renew anything. Compose pins both empty for this service;" >&2
+        echo "find what overrode that." >&2
+        exit 1
+    fi
+
+    local check="${CODEX_REFRESH_CHECK_SECONDS:-3600}"
+    local stale="${CODEX_REFRESH_STALE_SECONDS:-86400}"
+    local retry="${CODEX_REFRESH_RETRY_SECONDS:-3600}"
+
+    # Prints "none" (no readable login), "apikey", or
+    # "tokens <seconds-since-last_refresh|none>".
+    cred_state() {
+        python3 - "${CODEX_HOME_DIR}/auth.json" <<'PY' 2>/dev/null || echo none
+import datetime, json, sys, time
+try:
+    o = json.load(open(sys.argv[1]))
+except Exception:
+    print('none'); raise SystemExit
+if o.get('auth_mode') == 'apikey' and o.get('OPENAI_API_KEY'):
+    print('apikey'); raise SystemExit
+if not (o.get('tokens') or {}).get('access_token'):
+    print('none'); raise SystemExit
+try:
+    lr = datetime.datetime.fromisoformat(str(o['last_refresh']).replace('Z', '+00:00'))
+    print('tokens', int(time.time() - lr.timestamp()))
+except Exception:
+    print('tokens', 'none')
+PY
+    }
+
+    echo "codex-refresher: watching ${CODEX_HOME_DIR}/auth.json" >&2
+    echo "codex-refresher: check every ${check}s, refresh past ${stale}s, retry after ${retry}s" >&2
+    while :; do
+        local kind age
+        read -r kind age <<<"$(cred_state)"
+        if [[ "${kind}" == "none" ]]; then
+            echo "codex-refresher: no readable login in the volume — bootstrap one" >&2
+            echo "codex-refresher: (README 'First-time login (Codex)'); checking again in ${check}s" >&2
+            sleep "${check}"; continue
+        fi
+        if [[ "${kind}" == "apikey" ]]; then
+            echo "codex-refresher: API-key auth needs no refresh; sleeping $((check * 24))s" >&2
+            sleep "$((check * 24))"; continue
+        fi
+        # The age is logged every pass on purpose: how often codex actually
+        # rolls last_refresh forward is an open question this log answers.
+        echo "codex-refresher: last_refresh $([[ "${age}" == none ]] && echo unreadable || echo "$((age / 3600))h ($((age / 60))m) ago")" >&2
+        if [[ "${age}" == "none" ]] || (( age > stale )); then
+            echo "codex-refresher: stale — spending one CLI turn" >&2
+            # Sandboxed on purpose: this container has ordinary egress and no
+            # container-level sandbox (the documented refresher posture is
+            # "runs no agent code, executes no model-driven tool use" —
+            # docker-compose.yml claude-refresher header). Token refresh needs
+            # auth traffic, not tool use, so the model turn runs read-only
+            # with approvals left at their exec defaults. The bypass flag
+            # exists ONLY in CodexRunner._build_argv, where the
+            # network-isolated agent container is the boundary.
+            printf 'ok' | codex exec --json --skip-git-repo-check \
+                --sandbox read-only --ephemeral - >/dev/null 2>&1 || true
+            # (--ephemeral so refresher turns never enter the resumable
+            # thread store; codex refreshes stale tokens on use as a side
+            # effect.)
+            local kind_after age_after
+            read -r kind_after age_after <<<"$(cred_state)"
+            if [[ "${kind_after}" == "tokens" && "${age_after}" != "none" ]] \
+                && { [[ "${age}" == "none" ]] || (( age_after < age )); }; then
+                echo "codex-refresher: renewed — last_refresh $((age_after / 60))m ago" >&2
+            else
+                # Codex may decline to refresh a still-valid token; back off
+                # rather than burning a turn every pass until it does.
+                echo "codex-refresher: turn ran but the token did not renew; retrying in ${retry}s" >&2
+                sleep "${retry}"; continue
+            fi
+        fi
+        sleep "${check}"
+    done
+}
+
+cmd_codex_login() {
+    echo "launching codex device-code login..." >&2
+    echo "credentials will be written to ${CODEX_HOME_DIR}/auth.json (codex-home volume)." >&2
+    # Device-auth needs no localhost callback, so it works from `compose run`
+    # (the default browser flow's localhost:1455 callback server is
+    # unreachable in a run container unless you publish the port:
+    #   docker compose ... run --rm -it -p 1455:1455 codex-refresher codex login).
+    exec codex login --device-auth "$@"
+}
+
 cmd_setup_token() {
     echo "launching 'claude setup-token' — follow the prompts to generate" >&2
     echo "a long-lived OAuth token. It is PRINTED, not saved: set it as" >&2
@@ -230,6 +394,18 @@ case "${1:-serve}" in
     claude)
         shift
         cmd_claude "$@"
+        ;;
+    codex-refresher)
+        shift
+        cmd_codex_refresher
+        ;;
+    codex-login)
+        shift
+        cmd_codex_login "$@"
+        ;;
+    codex)
+        shift
+        exec codex "$@"
         ;;
     *)
         # Unknown command — treat as a raw exec so advanced users can run

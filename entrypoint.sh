@@ -131,7 +131,20 @@ MSG
 }
 
 cmd_serve() {
-    warn_if_no_auth
+    # The sandboxed codex stack deliberately does NOT mount codex-home on
+    # this container (the wrapper faces the internet; auth.json's refresh
+    # token has no business here — see docker-compose.codex.yml), so a local
+    # credential probe would print the bootstrap banner on every boot of a
+    # perfectly healthy ChatGPT-plan deployment. When runs are delegated to
+    # a remote agent (CLAUDE_WRAPPER_AGENT_URL set), the agent role performs
+    # the warning where the CLI and its credentials actually live. The claude
+    # wrapper keeps the probe — it mounts claude-home read-only, so its view
+    # is accurate — as does any single-container layout (no agent URL).
+    if [[ "$(agent_kind)" == codex && -n "${CLAUDE_WRAPPER_AGENT_URL:-}" ]]; then
+        echo "claude-wrapper: codex credentials live in the agent container — its log carries any bootstrap warning." >&2
+    else
+        warn_if_no_auth
+    fi
     exec uvicorn src.main:app \
         --host "${CLAUDE_WRAPPER_HOST}" \
         --port "${CLAUDE_WRAPPER_PORT}" \

@@ -543,6 +543,22 @@ def test_stream_client_requested_usage_chunk_is_forwarded(bridge):
     assert capture.requests[0]["stream_options"] == {"include_usage": True}
 
 
+def test_stream_options_merged_not_clobbered(bridge):
+    # The wrapper's piggybacked include_usage must not discard the client's
+    # other stream_options keys.
+    capture = bridge(_sse_bytes(_upstream_chunks()))
+
+    async def _rec(i: int, o: int) -> None:
+        pass
+
+    body = {**_STREAM_BODY, "stream_options": {"include_obfuscation": False}}
+    _collect_stream(body, on_usage=_rec)
+    assert capture.requests[0]["stream_options"] == {
+        "include_obfuscation": False,
+        "include_usage": True,
+    }
+
+
 def test_stream_upstream_500_surfaces_on_the_error_channel(bridge):
     bridge(httpx.Response(500, text="upstream exploded"))
     _, payloads = _collect_stream(_STREAM_BODY)

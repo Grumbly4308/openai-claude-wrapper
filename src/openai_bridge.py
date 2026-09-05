@@ -361,7 +361,13 @@ async def stream(
         if on_usage is not None and not (payload.get("stream_options") or {}).get(
             "include_usage"
         ):
-            payload["stream_options"] = {"include_usage": True}
+            # Merged, not replaced: the client's other stream_options keys
+            # (present or future — e.g. include_obfuscation) must survive the
+            # wrapper's piggybacked usage ask.
+            payload["stream_options"] = {
+                **(payload.get("stream_options") or {}),
+                "include_usage": True,
+            }
             suppress_usage_chunk = True
         headers = resolve_auth()
         client = _get_client()

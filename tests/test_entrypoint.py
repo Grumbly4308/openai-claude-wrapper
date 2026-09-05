@@ -123,6 +123,30 @@ def test_codex_refresh_turn_runs_in_private_home(tmp_path):
     assert "renewed" in proc.stderr
 
 
+def test_serve_credential_banner_defers_to_remote_codex_agent(tmp_path):
+    # The sandboxed codex wrapper has no codex-home mount by design, so its
+    # local probe finding nothing is the HEALTHY state — the banner must not
+    # fire when runs are delegated (agent URL set), and must still fire for
+    # a single-container codex serve (no agent URL), where this container is
+    # the one that needs the credential.
+    serve_env = {
+        "CLAUDE_WRAPPER_AGENT": "codex",
+        "CLAUDE_WRAPPER_HOST": "127.0.0.1",
+        "CLAUDE_WRAPPER_PORT": "0",
+    }
+    # exec uvicorn fails (not installed in the test PATH) — rc is irrelevant,
+    # the assertion is about what hit stderr before the exec.
+    proc = _run(
+        ["serve"], tmp_path,
+        {**serve_env, "CLAUDE_WRAPPER_AGENT_URL": "http://codex-agent:8791"},
+    )
+    assert "no usable Codex credential" not in proc.stderr
+    assert "agent container" in proc.stderr
+
+    proc = _run(["serve"], tmp_path, serve_env)
+    assert "no usable Codex credential" in proc.stderr
+
+
 def test_entrypoint_parses():
     proc = subprocess.run(
         ["bash", "-n", str(ENTRYPOINT)],

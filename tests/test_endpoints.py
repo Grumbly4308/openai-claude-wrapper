@@ -133,6 +133,12 @@ def test_models() -> None:
         "models.list.terminal_gated",
         all("terminal" not in m.get("capabilities", []) for m in entries),
     )
+    # owned_by tracks the selected agent's vendor (config.model_owner); under
+    # the default agent it must stay the value clients have always seen.
+    check(
+        "models.list.owned_by",
+        all(m.get("owned_by") == "anthropic" for m in entries),
+    )
     r = client.get("/v1/models/claude-sonnet-4-6")
     check("models.retrieve", r.status_code == 200 and r.json()["id"] == "claude-sonnet-4-6")
     check("models.retrieve.capabilities", "vision" in (r.json().get("capabilities") or []))

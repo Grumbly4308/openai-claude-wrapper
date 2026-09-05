@@ -325,6 +325,20 @@ class SessionRegistry:
         except FileNotFoundError:
             pass
 
+    # Synchronous twins for generator-unwind paths: a client cancel tears the
+    # stream down via GeneratorExit/CancelledError, where an awaited write can
+    # be swallowed by the very cancellation that triggered the cleanup. The
+    # files are a few dozen bytes; the sync write is effectively instant.
+    def bind_uuid_sync(self, key: str, new_uuid: str) -> None:
+        with open(self._path(key), "w") as f:
+            f.write(json.dumps({"key": key, "uuid": new_uuid, "agent": self.agent}))
+
+    def forget_sync(self, key: str) -> None:
+        try:
+            self._path(key).unlink()
+        except FileNotFoundError:
+            pass
+
 
 class BaseAgentRunner:
     """Agent-neutral run loop; subclasses supply the CLI dialect via hooks."""
@@ -486,6 +500,8 @@ class BaseAgentRunner:
         """
         lock = await self.registry.lock_for(session_key)
         await lock.acquire()
+        turn: Optional[TurnState] = None
+        session_uuid, created, completed = "", False, False
         try:
             session_uuid, created = await self.registry.get_or_create_uuid(session_key)
             cwd = self._session_cwd(session_key)
@@ -544,6 +560,7 @@ class BaseAgentRunner:
                     if normalized.kind == "text" and normalized.text:
                         final_text_parts.append(normalized.text)
                     yield normalized
+            completed = True
 
             # Session-id capture MUST precede the self-heal computation below:
             # bind_uuid unconditionally rewrites the key file, so if forget()
@@ -625,6 +642,21 @@ class BaseAgentRunner:
             if errored:
                 yield StreamEvent(kind="error", text=errored, raw={"session_uuid": session_uuid})
         finally:
+            if not completed and not self.wrapper_assigns_session_id:
+                # A client cancel/disconnect unwound the generator mid-stream,
+                # so the post-loop bookkeeping never ran. For CLI-assigned-id
+                # agents that is poison on a FIRST turn: fresh runs pass no
+                # session flag, so the registry holds a wrapper-minted
+                # placeholder the CLI was never told about, and the next turn
+                # would resume a thread that does not exist — a guaranteed
+                # failed turn before self-heal fires. Persist what the stream
+                # announced (or drop the never-announced placeholder) so the
+                # next turn resumes the real thread — or replays in full.
+                observed = turn.observed_session_uuid if turn is not None else None
+                if observed and observed != session_uuid:
+                    self.registry.bind_uuid_sync(session_key, observed)
+                elif created and observed is None:
+                    self.registry.forget_sync(session_key)
             lock.release()
 
     async def run_collect(

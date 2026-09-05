@@ -292,6 +292,53 @@ def test_transient_error_does_not_fail_the_turn(tmp_path):
     assert result.final_text == "recovered"
 
 
+# ---------- client cancel mid-first-turn ----------
+
+
+def test_cancel_mid_first_turn_persists_the_announced_thread_id(tmp_path):
+    # A client disconnect unwinds run_stream at a yield, skipping the
+    # post-loop bind. Codex was already told nothing about the wrapper's
+    # placeholder (fresh runs pass no session flag), so losing the announced
+    # thread id here used to guarantee a dead resume — and a 502 — on the
+    # next message. The unwind path must persist what the stream announced.
+    script, _ = _fake_codex(tmp_path, _HAPPY_JSONL)
+    runner = _runner("cancel-bind", bin_path=str(script))
+    key = "conv-cancel"
+
+    async def _go():
+        gen = runner.run_stream(prompt="hi", session_key=key, model="gpt-5.2")
+        async for _ in gen:
+            break  # client gone after the first frame
+        await gen.aclose()
+
+    asyncio.run(_go())
+    entry = json.loads((Path(_TMP) / "sessions-cancel-bind" / f"{key}.json").read_text())
+    assert entry == {"key": key, "uuid": THREAD_ID, "agent": "codex"}
+
+
+def test_cancel_before_thread_started_drops_the_placeholder(tmp_path):
+    # Unwound before codex announced any id: the placeholder can never be
+    # resumed, so it must be forgotten now — the next turn then mints fresh
+    # and replays in full instead of burning a turn on a dead resume.
+    script, _ = _fake_codex(
+        tmp_path,
+        lines=(
+            '{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"hi"}}',
+        ),
+    )
+    runner = _runner("cancel-drop", bin_path=str(script))
+    key = "conv-cancel-drop"
+
+    async def _go():
+        gen = runner.run_stream(prompt="hi", session_key=key, model="gpt-5.2")
+        async for _ in gen:
+            break
+        await gen.aclose()
+
+    asyncio.run(_go())
+    assert not (Path(_TMP) / "sessions-cancel-drop" / f"{key}.json").exists()
+
+
 # ---------- registry agent isolation ----------
 
 

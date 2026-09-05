@@ -176,16 +176,16 @@ services:
 
       # ---- Per-model capability profiles (README "Per-model capability
       # profiles") ----
-      # Profiles are resolved in THIS container; the agent only receives the
-      # resulting --disallowedTools argv through the shim. The profile file
-      # follows the same operator-edited-config pattern as squid.conf and
-      # allowlist.txt: edit sandbox/profiles.json in the checkout (mounted
-      # read-only below; ships as a no-op {}), restart the wrapper.
+      # Under codex, profiles govern the BRIDGE only (client_tools): the
+      # codex CLI has no per-tool switches, so the CLI-shaped capabilities
+      # (terminal, web_search, sub_agents) cannot be removed and /v1/models
+      # advertises them as present regardless of what a profile says — the
+      # container sandbox is the enforcement boundary (README "Limitations").
       CLAUDE_WRAPPER_MODEL_PROFILES: "${CLAUDE_WRAPPER_MODEL_PROFILES:-/etc/claude-wrapper/profiles.json}"
       CLAUDE_WRAPPER_MODEL_PROFILE_OVERRIDES: "${CLAUDE_WRAPPER_MODEL_PROFILE_OVERRIDES:-}"
-      # Terminal hard gate (default off). In this topology Bash executes in
-      # the network-isolated agent container, so enabling it here is far
-      # lower-risk than in the sunset single-container layout.
+      # INERT under codex — command execution is intrinsic to the codex CLI
+      # and cannot be toggled off; kept only so a stale .env carrying the
+      # claude knob is visible in `docker inspect` rather than surprising.
       CLAUDE_WRAPPER_EXPOSE_TERMINAL: "${CLAUDE_WRAPPER_EXPOSE_TERMINAL:-}"
       # Bridge server-side web search injection (default off). Executes on
       # Anthropic's infrastructure via api.anthropic.com — already on the

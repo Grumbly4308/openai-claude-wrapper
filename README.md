@@ -2122,7 +2122,11 @@ fail the same way on the first real request instead of at boot.
 - **Codex has no per-tool CLI gating.** `--disallowedTools` is Claude-only;
   under codex, command execution is intrinsic to the agent and the container
   sandbox is the enforcement boundary. `CLAUDE_WRAPPER_EXPOSE_TERMINAL` cannot
-  disable it.
+  disable it — and `/v1/models` is honest about that: under codex the
+  CLI-shaped capabilities (`terminal`, `web_search`, `sub_agents`) always
+  advertise as present, even if a profile removes them, because the removal
+  would not be enforced. Profiles still genuinely gate `client_tools` (the
+  bridge enforces it).
 - **No wrapper-owned tools on the codex bridge.** `memory` and `time_calc`
   live in the Anthropic hybrid loop; the OpenAI passthrough never injects them.
 - **Codex-tuned model ids cannot take `tools` requests.** OpenAI serves the

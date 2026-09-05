@@ -23,9 +23,10 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import download_tokens, tool_bridge
+from . import download_tokens, openai_bridge, tool_bridge
 from .capabilities import resolve_profile
 from .config import (
+    CODEX_EFFORT_CHOICES,
     SETTINGS,
     advertised_models,
     log_agent_credential_status,
@@ -365,6 +366,7 @@ async def _startup() -> None:
 async def _shutdown() -> None:
     await PREPARER.aclose()
     await tool_bridge.aclose()
+    await openai_bridge.aclose()
     await RUNNER.aclose()
 
 
@@ -656,9 +658,16 @@ async def _tool_bridge_completion(req: ChatCompletionRequest):
 
     model = req.model if req.model and req.model != "auto" else SETTINGS.default_model
     run_model, effort = split_model_effort(model)
+    # The agent selector picks the bridge: same routing rule, same call shapes
+    # (openai_bridge mirrors tool_bridge's public surface on purpose).
+    bridge = openai_bridge if SETTINGS.agent == "codex" else tool_bridge
     # Effort is a Claude Code CLI concept; the direct Messages API call has no
     # equivalent, so it is reported as unapplied rather than silently claimed.
     effort_info = {"applied": "api-default", "source": "tool-bridge", "requested": effort}
+    if SETTINGS.agent == "codex" and effort in CODEX_EFFORT_CHOICES:
+        # Unlike Anthropic, the effort DOES apply here: the openai bridge maps
+        # an explicit suffix onto the reasoning_effort request parameter.
+        effort_info = {"applied": effort or "api-default", "source": "tool-bridge", "requested": effort}
 
     if req.stream:
         async def _record(in_tok: int, out_tok: int) -> None:
@@ -666,14 +675,14 @@ async def _tool_bridge_completion(req: ChatCompletionRequest):
                 await USAGE_LEDGER.record(session_key, in_tok + out_tok)
 
         return StreamingResponse(
-            tool_bridge.stream(
+            bridge.stream(
                 req, run_model, model, session_key, effort_info, on_usage=_record
             ),
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
         )
 
-    result = await tool_bridge.complete(req, run_model, session_key)
+    result = await bridge.complete(req, run_model, session_key)
     if USAGE_LEDGER.enabled:
         await USAGE_LEDGER.record(session_key, result.input_tokens + result.output_tokens)
 

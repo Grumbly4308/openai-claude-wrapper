@@ -89,6 +89,35 @@ def test_builtin_default_preserves_todays_behavior():
     assert Capability.MEMORY not in caps
 
 
+# --- codex: advertise only what is enforced -----------------------------------
+
+
+def test_codex_advertises_intrinsic_cli_capabilities(monkeypatch):
+    # The codex CLI has no per-tool switches: terminal/web_search/sub_agents
+    # cannot actually be removed, so a profile removal (or the terminal env
+    # gate) must not falsify /v1/models — the removal would be advertisement
+    # without enforcement. client_tools removal stays real (bridge-enforced).
+    import dataclasses
+
+    from src import config as src_config
+
+    _reset()
+    _write_profile(
+        {"models": [{"match": "gpt-*", "remove": ["terminal", "web_search", "client_tools"]}]}
+    )
+    monkeypatch.setattr(
+        src_config, "SETTINGS", dataclasses.replace(src_config.SETTINGS, agent="codex")
+    )
+    try:
+        caps = resolve_profile("gpt-5.2")
+        assert Capability.TERMINAL in caps
+        assert Capability.WEB_SEARCH in caps
+        assert Capability.SUB_AGENTS in caps
+        assert Capability.CLIENT_TOOLS not in caps
+    finally:
+        _reset()
+
+
 # --- terminal env gate --------------------------------------------------------
 
 

@@ -1,0 +1,429 @@
+# The codex variant of the default stack (CLAUDE_WRAPPER_AGENT=codex). Runs
+# SIDE BY SIDE with docker-compose.yml on the same machine: everything that
+# lands in a machine-global namespace is deconflicted — its own compose
+# project (`name:` below, which prefixes the networks and volumes), its own
+# container names, its own image tag (the INSTALL_CODEX build would otherwise
+# clobber the claude stack's image and vice versa), and its own published
+# port (CODEX_WRAPPER_PORT, default 8001, clear of the claude stack's 8000).
+# Same sandboxed topology, four containers, one inbound door:
+#
+#   [clients] ──> codex-wrapper (FastAPI — the ONLY published port)
+#                     │
+#                     │  backend network (internal: no route to the outside)
+#                     ├──> codex-agent  (OpenAI Codex CLI behind src/agent_shim.py)
+#                     │        │
+#                     │        │  proxied egress only (HTTP(S)_PROXY)
+#                     └───────>└──> squid ──> egress network ──> allowlist hosts
+#
+#   codex-refresher (egress network, no inbound surface) ──> codex-home volume
+#                     keeps the shared ChatGPT login's tokens renewed even while
+#                     the deployment sits idle (see the service's own comment)
+#
+# The agent container — where model-driven tool use actually executes — sits on
+# an internal network with no external route. Its only way out is Squid, which
+# enforces sandbox/allowlist.txt as a CONNECT-only domain allowlist (uncomment
+# the OpenAI block there before first `up`). The API container routes its own
+# upstream calls (the tool-bridge passthrough's api.openai.com requests,
+# client-supplied image_url fetches) through the same proxy via proxy env vars.
+# Note the asymmetry: the agent's isolation is enforced by network topology
+# (hard); the API container's is enforced by proxy env (soft — its own code is
+# trusted, the agent's tool use is not).
+#
+# Works with docker compose and podman-compose:
+#   docker compose -f docker-compose.codex.yml up -d
+#   podman-compose -f docker-compose.codex.yml up -d
+# (If your podman-compose predates top-level `name:` support, add
+# `-p codex-wrapper` to every command — without it the project name falls
+# back to the directory and collides with the claude stack's networks.)
+#
+# Under ROOTLESS podman the same four caveats as docker-compose.yml apply
+# (restart policy at boot, squid's tmpfs mode, `user:` inside the namespace,
+# SELinux :z suffixes) — see that file's header, kept in one place on purpose.
+#
+# One-time CLI auth cannot happen in the agent container — the device-code
+# login needs egress the internal network does not have (README "First-time
+# login (Codex)"). Bootstrap the login once from a container with ordinary
+# networking and the volume mounted; after that codex renews the tokens itself
+# whenever it runs, and the codex-refresher service covers idle stretches:
+#   docker compose -f docker-compose.codex.yml run --rm -it codex-refresher codex-login
+#   # follow the device-code flow in your browser
+# The alternative is API-key auth: set OPENAI_API_KEY in .env (which then
+# shadows any volume login — codex stops exercising and refreshing it).
+
+# Fixed project name so the networks and volumes never share a prefix with
+# the claude stack, which derives its project name from the directory — both
+# files live in one checkout, and without this the two stacks would read as
+# one compose project.
+name: codex-wrapper
+
+services:
+  codex-wrapper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CLAUDE_UID: "${CLAUDE_UID:-1000}"
+        CLAUDE_GID: "${CLAUDE_GID:-1000}"
+        # Same Dockerfile as the claude stack; this arg is what installs the
+        # codex CLI into the image (it is absent from claude-only builds).
+        INSTALL_CODEX: "1"
+    # Qualified with localhost/ so build and run agree on one name. On a podman
+    # host, `up` resolves the unqualified short name to localhost/..., while a
+    # docker-CLI (buildx) build tags docker.io/library/... — that split leaves
+    # the stack recreating containers from a stale localhost-tagged image no
+    # matter how often you rebuild. The qualified name is exact on both engines.
+    image: localhost/codex-wrapper:latest
+    container_name: codex-wrapper
+    restart: always
+    user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["serve"]
+    depends_on:
+      - codex-agent
+      - squid
+    ports:
+      - "0.0.0.0:${CODEX_WRAPPER_PORT:-8001}:${CODEX_WRAPPER_PORT:-8001}"
+    environment:
+      # Fed from CODEX_WRAPPER_PORT, not CLAUDE_WRAPPER_PORT: one .env serves
+      # both stacks, and a shared variable would land two published ports on
+      # the same host port. The default keeps clear of the claude stack's 8000.
+      CLAUDE_WRAPPER_PORT: "${CODEX_WRAPPER_PORT:-8001}"
+      CLAUDE_WRAPPER_HOST: "0.0.0.0"
+
+      # Literal, not ${…}: a stale .env carrying CLAUDE_WRAPPER_AGENT=claude
+      # must not be able to half-select agents across containers.
+      CLAUDE_WRAPPER_AGENT: "codex"
+
+      # Runs execute in the agent container, not here. If you override the URL,
+      # override CLAUDE_WRAPPER_AGENT_PORT to match — the port is spelled out in
+      # both places.
+      CLAUDE_WRAPPER_AGENT_URL: "${CLAUDE_WRAPPER_AGENT_URL:-http://codex-agent:8791}"
+      CLAUDE_WRAPPER_AGENT_TOKEN: "${CLAUDE_WRAPPER_AGENT_TOKEN:-}"
+
+      # The tool-bridge passthrough (function-calling requests hit
+      # api.openai.com directly) and client-supplied image_url fetches leave
+      # THIS container; send them through the same allowlist. The shim hop is
+      # internal and must bypass the proxy.
+      HTTP_PROXY: "http://squid:3128"
+      HTTPS_PROXY: "http://squid:3128"
+      http_proxy: "http://squid:3128"
+      https_proxy: "http://squid:3128"
+      # SANDBOX_EXTRA_NO_PROXY is honored HERE too: the image-backend and KB
+      # comments below direct internal hosts at it, and this container makes
+      # some of those calls itself.
+      NO_PROXY: "codex-agent,squid,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
+      no_proxy: "codex-agent,squid,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
+
+      # Everything below is identical to docker-compose.yml — the API surface
+      # and its features are unchanged by the agent swap.
+      # Only needed for function-calling (tools) requests: the passthrough
+      # calls the OpenAI Platform API, which a ChatGPT-plan login cannot.
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      # Tool-bridge passthrough target; empty means https://api.openai.com.
+      CLAUDE_WRAPPER_OPENAI_BASE_URL: "${CLAUDE_WRAPPER_OPENAI_BASE_URL:-}"
+      CLAUDE_WRAPPER_API_KEYS: "${CLAUDE_WRAPPER_API_KEYS:-}"
+      CLAUDE_WRAPPER_PUBLIC_BASE_URL: "${CLAUDE_WRAPPER_PUBLIC_BASE_URL:-}"
+      CLAUDE_WRAPPER_DERIVE_BASE_URL: "${CLAUDE_WRAPPER_DERIVE_BASE_URL:-on}"
+      CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY: "${CLAUDE_WRAPPER_DOWNLOAD_SIGNING_KEY:-}"
+      CLAUDE_WRAPPER_DOWNLOAD_URL_TTL: "${CLAUDE_WRAPPER_DOWNLOAD_URL_TTL:-2592000}"
+      CLAUDE_WRAPPER_WORKSPACE_HINT: "${CLAUDE_WRAPPER_WORKSPACE_HINT:-on}"
+      CLAUDE_WRAPPER_WORKSPACE_PROMPT: "${CLAUDE_WRAPPER_WORKSPACE_PROMPT:-}"
+      # Fed from CODEX_WRAPPER_DEFAULT_MODEL, not CLAUDE_WRAPPER_DEFAULT_MODEL:
+      # the shared .env ships the latter set to a Claude id, which would become
+      # this stack's default AND be appended to /v1/models — every `auto`
+      # request then runs `codex --model claude-…` and fails upstream. Same
+      # deconfliction as CODEX_WRAPPER_PORT. Empty falls through to the code
+      # default (gpt-6-astra under codex).
+      CLAUDE_WRAPPER_DEFAULT_MODEL: "${CODEX_WRAPPER_DEFAULT_MODEL:-}"
+      # Comma list overriding the built-in codex model ids (no discovery scan).
+      CLAUDE_WRAPPER_CODEX_MODELS: "${CLAUDE_WRAPPER_CODEX_MODELS:-}"
+      # Where the tool-bridge passthrough looks for a persisted API key
+      # (auth.json file mode — only meaningful with the codex-home mount
+      # below uncommented).
+      CLAUDE_WRAPPER_CODEX_CREDENTIALS_FILE: "${CLAUDE_WRAPPER_CODEX_CREDENTIALS_FILE:-}"
+      CLAUDE_WRAPPER_EFFORT: "${CLAUDE_WRAPPER_EFFORT:-medium}"
+      CLAUDE_WRAPPER_MAX_UPLOAD_BYTES: "${CLAUDE_WRAPPER_MAX_UPLOAD_BYTES:-2147483648}"
+      CLAUDE_WRAPPER_REQUEST_TIMEOUT: "${CLAUDE_WRAPPER_REQUEST_TIMEOUT:-1800}"
+      CLAUDE_WRAPPER_WORKERS: "${CLAUDE_WRAPPER_WORKERS:-1}"
+      # The token-budget plan multipliers are Anthropic-plan-shaped (pro/max);
+      # no ChatGPT-plan calibration exists, so the cap ships OFF here. Set
+      # CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE for a custom cap. Fed from its
+      # own variable, not CLAUDE_WRAPPER_SESSION_PLAN — the shared .env ships
+      # that one as `max 5x`, which would silently re-enable the
+      # Anthropic-calibrated cap here and make the `off` default dead.
+      CLAUDE_WRAPPER_SESSION_PLAN: "${CODEX_WRAPPER_SESSION_PLAN:-off}"
+      CLAUDE_WRAPPER_PRO_SESSION_TOKENS: "${CLAUDE_WRAPPER_PRO_SESSION_TOKENS:-1500000}"
+      CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE: "${CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE:-0}"
+      CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT: "${CLAUDE_WRAPPER_SESSION_BLOCK_PERCENT:-5}"
+      CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD: "${CLAUDE_WRAPPER_BUDGET_CONTINUE_KEYWORD:-continue,proceed,keep going,go on,yes}"
+      # The SSE frames are emitted HERE — this is the container that owns the
+      # client connection — so the streaming knobs belong on this service.
+      # CLARIFY and STREAM_PARTIAL are repeated on codex-agent below: they
+      # feed the same SETTINGS object in both containers, and letting the two
+      # disagree gives an API that advertises one behaviour and a CLI that
+      # runs another.
+      CLAUDE_WRAPPER_REASONING_CHANNEL: "${CLAUDE_WRAPPER_REASONING_CHANNEL:-details}"
+      CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY: "${CLAUDE_WRAPPER_SSE_SHOW_ACTIVITY:-true}"
+      CLAUDE_WRAPPER_SSE_HEARTBEAT: "${CLAUDE_WRAPPER_SSE_HEARTBEAT:-15}"
+      CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES: "${CLAUDE_WRAPPER_SSE_PREAMBLE_BYTES:-2048}"
+      CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS: "${CLAUDE_WRAPPER_SSE_PROGRESS_SECONDS:-25}"
+      CLAUDE_WRAPPER_STREAM_PARTIAL: "${CLAUDE_WRAPPER_STREAM_PARTIAL:-true}"
+      CLAUDE_WRAPPER_CLARIFY: "${CLAUDE_WRAPPER_CLARIFY:-on}"
+      CLAUDE_WRAPPER_CLARIFY_PROMPT: "${CLAUDE_WRAPPER_CLARIFY_PROMPT:-}"
+      CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS: "${CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS:-}"
+      CLAUDE_WRAPPER_MODEL_DISCOVERY: "${CLAUDE_WRAPPER_MODEL_DISCOVERY:-auto}"
+      # The KB addendum is BUILT here (the prompt text); the curl calls it
+      # teaches run in the agent container, which carries the same vars below.
+      OPENWEBUI_BASE_URL: "${OPENWEBUI_BASE_URL:-}"
+      OPENWEBUI_API_KEY: "${OPENWEBUI_API_KEY:-}"
+      OPENWEBUI_DEFAULT_COLLECTION: "${OPENWEBUI_DEFAULT_COLLECTION:-}"
+
+      # ---- Per-model capability profiles (README "Per-model capability
+      # profiles") ----
+      # Under codex, profiles govern the BRIDGE only (client_tools): the
+      # codex CLI has no per-tool switches, so the CLI-shaped capabilities
+      # (terminal, web_search, sub_agents) cannot be removed and /v1/models
+      # advertises them as present regardless of what a profile says — the
+      # container sandbox is the enforcement boundary (README "Limitations").
+      CLAUDE_WRAPPER_MODEL_PROFILES: "${CLAUDE_WRAPPER_MODEL_PROFILES:-/etc/claude-wrapper/profiles.json}"
+      CLAUDE_WRAPPER_MODEL_PROFILE_OVERRIDES: "${CLAUDE_WRAPPER_MODEL_PROFILE_OVERRIDES:-}"
+      # INERT under codex — command execution is intrinsic to the codex CLI
+      # and cannot be toggled off; kept only so a stale .env carrying the
+      # claude knob is visible in `docker inspect` rather than surprising.
+      CLAUDE_WRAPPER_EXPOSE_TERMINAL: "${CLAUDE_WRAPPER_EXPOSE_TERMINAL:-}"
+      # Bridge server-side web search injection (default off). Executes on
+      # Anthropic's infrastructure via api.anthropic.com — already on the
+      # allowlist; no extra egress needed.
+      CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH: "${CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH:-}"
+      CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS: "${CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS:-8}"
+      # Optional OpenAI-compatible image backend. Its host must be reachable
+      # from THIS container: add it to sandbox/allowlist.txt (external) or
+      # SANDBOX_EXTRA_NO_PROXY (internal network) — otherwise squid blocks it.
+      CLAUDE_WRAPPER_IMAGE_BACKEND_URL: "${CLAUDE_WRAPPER_IMAGE_BACKEND_URL:-}"
+      CLAUDE_WRAPPER_IMAGE_BACKEND_KEY: "${CLAUDE_WRAPPER_IMAGE_BACKEND_KEY:-}"
+      CLAUDE_WRAPPER_IMAGE_BACKEND_MODEL: "${CLAUDE_WRAPPER_IMAGE_BACKEND_MODEL:-}"
+    volumes:
+      # File store, session registry, usage ledgers, batches — API-only state.
+      # Its own volume (not the claude stack's claude-data): the two wrappers
+      # can run concurrently, and a shared registry/file store would race.
+      - codex-data:/data
+      # Per-session workspaces, shared with the agent AT THE SAME PATH: the
+      # wrapper materializes uploads and collects generated files here; the
+      # CLI runs here.
+      - codex-workspace:/data/workspace
+      # Uncomment ONLY if you persist an API key to the volume via
+      # `codex login --with-api-key` — the tool-bridge passthrough then reads
+      # auth.json here. Left off by default on purpose: for a ChatGPT-plan
+      # login this file holds an OAuth refresh token the bridge deliberately
+      # never uses (README, Auth), and mounting it into the one internet-facing
+      # container would expose it for zero benefit. Env OPENAI_API_KEY needs no
+      # mount. The agent owns the writable mount.
+      # - codex-home:/home/claude/.codex:ro
+      # Per-model capability profiles — operator-edited config, same pattern
+      # as squid.conf / allowlist.txt. Ships as a no-op {}; edit + restart.
+      # On an SELinux host add :z, same caveat as the squid mounts.
+      - ./sandbox/profiles.json:/etc/claude-wrapper/profiles.json:ro
+    networks:
+      - frontend
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CODEX_WRAPPER_PORT:-8001}/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  codex-agent:
+    # Same image as the API container. It declares the build explicitly rather
+    # than relying on codex-wrapper having been built first: this service is
+    # started BEFORE codex-wrapper (depends_on, above), and podman-compose only
+    # builds services that carry a build section — without one, a first `up` on
+    # a clean machine tries to resolve localhost/codex-wrapper:latest as a registry pull.
+    # Both services tag the same image, so the second build is a cache hit.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CLAUDE_UID: "${CLAUDE_UID:-1000}"
+        CLAUDE_GID: "${CLAUDE_GID:-1000}"
+        INSTALL_CODEX: "1"
+    image: localhost/codex-wrapper:latest
+    container_name: codex-agent
+    restart: always
+    user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["agent"]
+    environment:
+      CLAUDE_WRAPPER_HOST: "0.0.0.0"
+      # This is what makes the shim spawn codex instead of claude — and what
+      # its /healthz reports to the wrapper's boot-time agent handshake.
+      CLAUDE_WRAPPER_AGENT: "codex"
+      CLAUDE_WRAPPER_AGENT_PORT: "${CLAUDE_WRAPPER_AGENT_PORT:-8791}"
+      CLAUDE_WRAPPER_AGENT_TOKEN: "${CLAUDE_WRAPPER_AGENT_TOKEN:-}"
+      CLAUDE_WRAPPER_REQUEST_TIMEOUT: "${CLAUDE_WRAPPER_REQUEST_TIMEOUT:-1800}"
+
+      # The CLI is spawned in THIS container, so the knobs that shape the
+      # subprocess have to be here too — on the API service alone they are
+      # inert. STREAM_PARTIAL is inert for codex (its --json stream has no
+      # incremental deltas) but harmless; the clarify trio decides whether
+      # the ask-then-stop prompt is injected.
+      CLAUDE_WRAPPER_STREAM_PARTIAL: "${CLAUDE_WRAPPER_STREAM_PARTIAL:-true}"
+      CLAUDE_WRAPPER_CLARIFY: "${CLAUDE_WRAPPER_CLARIFY:-on}"
+      CLAUDE_WRAPPER_CLARIFY_PROMPT: "${CLAUDE_WRAPPER_CLARIFY_PROMPT:-}"
+      CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS: "${CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS:-}"
+
+      # CLI credentials (only needed if you skip the ChatGPT login).
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      # The codex executable the runner spawns, and where boot-time credential
+      # checks look for auth.json. The CLI runs in THIS container, so the
+      # knobs live here — on the wrapper they would be inert.
+      CLAUDE_WRAPPER_CODEX_BIN: "${CLAUDE_WRAPPER_CODEX_BIN:-}"
+      CLAUDE_WRAPPER_CODEX_CREDENTIALS_FILE: "${CLAUDE_WRAPPER_CODEX_CREDENTIALS_FILE:-}"
+      # Codex stderr tracing knob for debugging (RUST_LOG syntax).
+      RUST_LOG: "${CODEX_RUST_LOG:-}"
+
+      # THE sandbox integration: this container sits on an internal network,
+      # so these proxy vars are the only route out. The runner copies its
+      # environment into every CLI run, and the CLI's shell subprocesses
+      # inherit it — curl, pip, git and the CLI itself all flow through
+      # Squid's allowlist with no code changes. Add internal hosts the agent
+      # must reach directly (e.g. your OpenWebUI) to SANDBOX_EXTRA_NO_PROXY.
+      # No CLAUDE_CODE_PROXY_RESOLVES_HOSTS here — that flag is Claude-only;
+      # codex honors HTTPS_PROXY for both its HTTPS and WebSocket transports,
+      # verified through a CONNECT proxy.
+      HTTP_PROXY: "http://squid:3128"
+      HTTPS_PROXY: "http://squid:3128"
+      http_proxy: "http://squid:3128"
+      https_proxy: "http://squid:3128"
+      NO_PROXY: "codex-wrapper,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
+      no_proxy: "codex-wrapper,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
+
+      # The KB curl calls execute here.
+      OPENWEBUI_BASE_URL: "${OPENWEBUI_BASE_URL:-}"
+      OPENWEBUI_API_KEY: "${OPENWEBUI_API_KEY:-}"
+      OPENWEBUI_DEFAULT_COLLECTION: "${OPENWEBUI_DEFAULT_COLLECTION:-}"
+    volumes:
+      - codex-workspace:/data/workspace
+      # Codex's own state and credentials live HERE (writable): auth.json,
+      # config.toml and the sqlite thread store. Do NOT try to log in via this
+      # service — no device-code flow completes behind the proxy. Bootstrap
+      # via the refresher (which has ordinary networking):
+      #   docker compose -f docker-compose.codex.yml run --rm -it codex-refresher codex-login
+      - codex-home:/home/claude/.codex
+      # Host drop folder: files are read by the CLI, which runs in this
+      # container — so the inbox mounts here, not on the API.
+      - ${CLAUDE_INBOX_DIR:-./inbox}:/data/inbox:ro
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CLAUDE_WRAPPER_AGENT_PORT:-8791}/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  codex-refresher:
+    # Keeps the volume login alive so nothing else has to. Codex refreshes its
+    # ChatGPT tokens automatically ON USE — an idle deployment never uses it,
+    # and the refresh token has a finite lifetime (~28 days observed
+    # historically; treated as an estimate) — so this service spends one
+    # throwaway turn whenever last_refresh goes stale. It doubles as the
+    # login-bootstrap vehicle: ordinary networking plus the volume, the exact
+    # position claude-refresher occupies in the claude stack.
+    #
+    # Security posture: it runs no agent code, executes no model-driven tool
+    # use, and accepts no inbound connections — trusted plumbing, which is why
+    # direct egress is acceptable here and never on codex-agent. That posture
+    # is also why its refresh turn runs under codex's own read-only sandbox,
+    # never with the bypass flag the sandboxed agent container earns — and
+    # against a PRIVATE CODEX_HOME holding auth.json alone: the volume's
+    # config.toml is agent-writable and codex executes config directives, so
+    # loading it here would let a prompt-injected agent run commands with
+    # this container's un-allowlisted egress (see entrypoint.sh
+    # cmd_codex_refresher). Idle it is a sleep loop; its only cost is a few
+    # one-word turns a month.
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CLAUDE_UID: "${CLAUDE_UID:-1000}"
+        CLAUDE_GID: "${CLAUDE_GID:-1000}"
+        INSTALL_CODEX: "1"
+    image: localhost/codex-wrapper:latest
+    container_name: codex-refresher
+    restart: always
+    user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    command: ["codex-refresher"]
+    environment:
+      # Pinned empty ON PURPOSE — not wired to .env. An environment credential
+      # makes codex ignore the volume login, and this service exists only to
+      # renew that login; with either set it would burn turns renewing
+      # nothing. The entrypoint refuses to start if they leak in anyway.
+      OPENAI_API_KEY: ""
+      CODEX_API_KEY: ""
+      # How often to look at the credential file, the last_refresh age that
+      # triggers a renewal turn, and the back-off after a turn that did not
+      # move last_refresh (codex may decline to refresh a still-fresh token —
+      # without the back-off that is a turn burned every check).
+      CODEX_REFRESH_CHECK_SECONDS: "${CODEX_REFRESH_CHECK_SECONDS:-3600}"
+      CODEX_REFRESH_STALE_SECONDS: "${CODEX_REFRESH_STALE_SECONDS:-86400}"
+      CODEX_REFRESH_RETRY_SECONDS: "${CODEX_REFRESH_RETRY_SECONDS:-3600}"
+    volumes:
+      # Writable on purpose: renewing the tokens means rewriting auth.json
+      # for every reader of this volume.
+      - codex-home:/home/claude/.codex
+    networks:
+      - egress
+
+  squid:
+    image: docker.io/ubuntu/squid:latest
+    container_name: codex-squid
+    restart: always
+    # Unprivileged from the first instruction: squid never runs as root, so it
+    # cannot write /var/run/squid.pid — squid.conf points the pid file at
+    # /var/cache/squid instead, and both writable paths are tmpfs.
+    user: "proxy"
+    entrypoint: ["squid", "-N", "-Y", "-C", "-f", "/etc/squid/squid.conf"]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ./sandbox/squid.conf:/etc/squid/squid.conf:ro
+      - ./sandbox/allowlist.txt:/etc/squid/allowlist.txt:ro
+    # mode is explicit because the runtimes disagree on the default: docker
+    # gives a tmpfs 1777, rootless podman gives it root-owned 0755. Squid runs
+    # as `proxy` and writes its pid file to /var/cache/squid, so under podman
+    # the default is a FATAL at startup and an endless restart loop.
+    tmpfs:
+      - /var/cache/squid:mode=1777
+      - /var/log/squid:mode=1777
+    networks:
+      - backend
+      - egress
+
+networks:
+  # Inbound: the published API port. Non-internal, which also means the API
+  # container retains a direct route out — its egress discipline comes from
+  # the proxy env above. Firewall the host if you want that hardened too.
+  frontend: {}
+  # The sandbox: no external route. API <-> agent <-> squid only.
+  backend:
+    internal: true
+  # Squid's way out.
+  egress: {}
+
+volumes:
+  codex-data:
+  codex-workspace:
+  codex-home:

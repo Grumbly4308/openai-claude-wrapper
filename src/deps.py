@@ -8,7 +8,9 @@ from typing import Optional
 from fastapi import Header, HTTPException, Query
 
 from . import download_tokens
-from .claude_runner import ClaudeRunner, RemoteAgentExecutor, SessionRegistry
+from .agent_runner import RemoteAgentExecutor, SessionRegistry
+from .claude_runner import ClaudeRunner
+from .codex_runner import CodexRunner
 from .config import SETTINGS
 from .converters import MessagePreparer
 from .delegate import Delegator
@@ -17,7 +19,11 @@ from .usage import UsageLedger
 
 
 FILE_STORE = FileStore(SETTINGS.files_dir)
-SESSIONS = SessionRegistry(SETTINGS.sessions_dir)
+# Entries are tagged with the selected agent (see SessionRegistry): claude-data
+# survives a stack switch, and a mismatched entry reads as absent instead of
+# handing one agent's session uuid to the other's CLI. Legacy untagged entries
+# read as claude, so default deployments resume exactly as before.
+SESSIONS = SessionRegistry(SETTINGS.sessions_dir, agent=SETTINGS.agent)
 # Per-conversation token accounting. Stored in a dedicated subdir so its
 # "{key}.json" files never collide with SessionRegistry's, which live directly
 # under sessions_dir. Disabled (no-op) unless a session token allowance is set.
@@ -31,10 +37,14 @@ if USAGE_LEDGER.enabled:
         SETTINGS.session_block_tokens,
         SETTINGS.session_block_percent,
     )
-RUNNER = ClaudeRunner(
+# Which CLI the wrapper drives: Claude Code by default, or the codex CLI when
+# CLAUDE_WRAPPER_AGENT=codex. Both runner classes take the same construction
+# surface (agent_bin is ClaudeRunner's canonical alias for claude_bin).
+_runner_cls = CodexRunner if SETTINGS.agent == "codex" else ClaudeRunner
+RUNNER = _runner_cls(
     registry=SESSIONS,
     workspace_root=SETTINGS.workspace_dir,
-    claude_bin=SETTINGS.claude_bin,
+    agent_bin=SETTINGS.agent_bin,
     request_timeout_seconds=SETTINGS.request_timeout_seconds,
     effort=SETTINGS.effort,
     # Empty when CLAUDE_WRAPPER_CLARIFY=off, which makes clarify=True a no-op.
@@ -43,6 +53,7 @@ RUNNER = ClaudeRunner(
     # Empty when CLAUDE_WRAPPER_WORKSPACE_HINT=off, which makes
     # workspace_hint=True a no-op.
     workspace_system_prompt=SETTINGS.workspace_system_prompt if SETTINGS.workspace_hint_enabled else "",
+    # CodexRunner forces this False internally (codex --json has no deltas).
     stream_partial_messages=SETTINGS.stream_partial_messages,
     # Sandboxed topology: send runs to the agent shim instead of spawning the
     # CLI here. None keeps the classic local subprocess.

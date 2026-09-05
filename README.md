@@ -1,6 +1,8 @@
 # claude-wrapper
 
-OpenAI-compatible HTTP API in front of [Claude Code](https://docs.claude.com/en/docs/claude-code), packaged as a container.
+OpenAI-compatible HTTP API in front of [Claude Code](https://docs.claude.com/en/docs/claude-code)
+(default) or the [OpenAI Codex CLI](https://github.com/openai/codex), selected
+per deployment, packaged as a container.
 
 - Drop-in replacement for `https://api.openai.com` in any OpenAI client.
 - Handles text, images, audio, video, PDFs and arbitrary binary files through
@@ -19,8 +21,10 @@ OpenAI-compatible HTTP API in front of [Claude Code](https://docs.claude.com/en/
 ## Contents
 
 - [Requirements](#requirements)
+- [Choosing the wrapped agent](#choosing-the-wrapped-agent)
 - [Quick start (Docker Compose)](#quick-start-docker-compose)
 - [Quick start (Podman)](#quick-start-podman)
+- [Quick start (Codex)](#quick-start-codex)
 - [Sandboxed deployment](#sandboxed-deployment-network-isolated-agent)
 - [Single-container layout (sunset)](#single-container-layout-sunset)
 - [Configuration reference](#configuration-reference)
@@ -31,6 +35,7 @@ OpenAI-compatible HTTP API in front of [Claude Code](https://docs.claude.com/en/
 - [Per-conversation usage cap](#per-conversation-usage-cap-usage-checkpoint)
 - [Models and reasoning effort](#models-and-reasoning-effort)
 - [Auth](#auth)
+  - [Codex → OpenAI](#codex--openai)
 - [Data and persistence](#data-and-persistence)
 - [Concurrency](#concurrency)
 - [Running the tests](#running-the-tests)
@@ -48,6 +53,9 @@ OpenAI-compatible HTTP API in front of [Claude Code](https://docs.claude.com/en/
     for the two ways to drive it and the caveats of each.
 - An Anthropic account that can log into Claude Code, **or** an
   `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`.
+- For a Codex deployment instead: an OpenAI account on a ChatGPT plan that can
+  log into the Codex CLI, **or** an `OPENAI_API_KEY` — see
+  [Choosing the wrapped agent](#choosing-the-wrapped-agent).
 - Disk: budget **~5 GB** to be comfortable. The image itself lands around
   2–3 GB (ffmpeg, imagemagick, librsvg, the Claude Code CLI, and `fastembed`,
   which pulls `onnxruntime`). On top of that, the default embedding model
@@ -57,6 +65,49 @@ OpenAI-compatible HTTP API in front of [Claude Code](https://docs.claude.com/en/
 
 The compose files use `${VAR:-default}` interpolation throughout and do not
 declare a `version:` key, so any Compose v2-compatible frontend works.
+
+---
+
+## Choosing the wrapped agent
+
+The wrapper drives one agent per deployment: Claude Code (the default) or the
+OpenAI Codex CLI. Selection is deploy-time, not per-request — you pick a
+stack, and only the selected agent's container runs and only its models are
+advertised on `/v1/models`:
+
+- **`docker-compose.yml`** — the Claude stack, and today's behavior unchanged.
+  It pins `CLAUDE_WRAPPER_AGENT: "claude"` on its app services.
+- **`docker-compose.codex.yml`** — the Codex stack: same topology, same
+  security guarantees, with `codex-agent` and `codex-refresher` in place of
+  their Claude counterparts and `CLAUDE_WRAPPER_AGENT: "codex"` pinned on its
+  app services. Everything machine-global lives in its own `codex-*`
+  namespace — compose project, container names, image tag, volumes, and the
+  published port (`CODEX_WRAPPER_PORT`, default `8001`) — so both stacks run
+  side by side on one machine. See [Quick start (Codex)](#quick-start-codex).
+
+The env var is pinned as a literal in each compose file on purpose — a stale
+`.env` must not be able to half-select agents across containers. As a knob it
+matters only in the sunset
+[single-container layout](#single-container-layout-sunset), where it alone
+selects the agent. Validation fails closed: any value other than `claude` or
+`codex` refuses to boot with an error naming the variable, instead of silently
+serving the wrong model list.
+
+At startup the wrapper also verifies the topology it was handed: it asks the
+agent shim's `/healthz` which agent that container runs. A mismatch — say a
+codex wrapper pointed at a claude agent by a stale `CLAUDE_WRAPPER_AGENT_URL`
+— refuses to boot, naming both values; an agent container that is merely not
+up yet only logs a warning, because `depends_on` does not guarantee readiness
+and the wrapper must not crash-loop while the agent boots.
+
+Why two files rather than compose `profiles:`? Profiles would require
+`COMPOSE_PROFILES` in every existing `.env` just to keep the default stack
+starting (a hard failure on `git pull && docker compose up -d`),
+podman-compose's support for them is unreliable, and this README already uses
+the word "profiles" for
+[per-model capability profiles](#per-model-capability-profiles). File choice
+is also the selection convention the repo already has (`docker-compose.yml`
+vs `docker-compose.single.yml`).
 
 ---
 
@@ -260,7 +311,9 @@ docker-compose ps                       # smoke test: connects, lists nothing
 ```
 
 Then follow [1. Configure](#1-configure) onward, substituting `docker-compose`
-for `docker compose`. Steps 1–5 are otherwise identical.
+for `docker compose`. Steps 1–5 are otherwise identical. The
+[codex stack](#quick-start-codex) works the same way — add
+`-f docker-compose.codex.yml` to each command, exactly as under Docker.
 
 ### Surviving reboots
 
@@ -352,7 +405,9 @@ two ways that have both caused real failures here:
 
 - **`run` rejects `-i`/`-t`.** `podman-compose run` allocates a TTY itself and
   errors with `unrecognized arguments: -it`. Drop the flags, or bypass compose
-  for that step: `podman exec -it claude-wrapper /app/entrypoint.sh login`.
+  for that step: `podman exec -it claude-wrapper /app/entrypoint.sh login`
+  (codex stack: `podman exec -it codex-refresher /app/entrypoint.sh
+  codex-login`).
 - **`${VAR:-default}` may not expand.** The symptom is a service whose
   environment holds the literal string, e.g. uvicorn dying with
   `Invalid value for '--port': '${CLAUDE_WRAPPER_AGENT_PORT:-8791}'`. Check with
@@ -368,6 +423,105 @@ in use` and leave a half-started stack:
 podman rm -f claude-wrapper claude-agent claude-squid 2>/dev/null
 podman pod ls && podman pod rm -f <pod-name>
 ```
+
+(On the codex stack the names are `codex-wrapper codex-agent codex-refresher
+codex-squid` — no name is shared with the claude stack, so the two can run
+side by side.)
+
+---
+
+## Quick start (Codex)
+
+This brings up the **same sandboxed stack driving the OpenAI Codex CLI**
+instead of Claude Code: `docker-compose.codex.yml` swaps in a `codex-agent`
+and a `codex-refresher` while keeping the topology — and its security
+guarantees — identical. The steps mirror the
+[Docker quick start](#quick-start-docker-compose); only the compose file and
+the credential flow differ. Background:
+[Choosing the wrapped agent](#choosing-the-wrapped-agent).
+
+### 1. Configure
+
+Follow [1. Configure](#1-configure) from the Docker quick start unchanged —
+same `.env`, same `CLAUDE_UID`/`CLAUDE_GID` warning. One codex-specific knob:
+the stack publishes on `CODEX_WRAPPER_PORT` (default `8001`), not
+`CLAUDE_WRAPPER_PORT` — separate variables so both stacks can share the
+`.env` and the machine. Then open
+`sandbox/allowlist.txt` and uncomment `api.openai.com` in the OpenAI Codex
+block. It ships commented out — the default Claude deployment should not
+carry OpenAI egress — and it is split by auth mode: if you will use a
+ChatGPT-plan login rather than an API key, uncomment `chatgpt.com` and
+`auth.openai.com` too; an API-key-only deployment leaves them commented.
+
+### 2. Build the image
+
+```bash
+docker compose -f docker-compose.codex.yml build
+```
+
+Same Dockerfile, its own `localhost/codex-wrapper:latest` tag — the codex
+compose file sets the `INSTALL_CODEX=1` build arg, which adds
+`@openai/codex@latest` to the image. Like the Claude CLI it is unpinned, so
+two builds a week apart can ship different codex versions. The tag is
+separate from the claude stack's `localhost/claude-wrapper:latest` on
+purpose: the two builds differ (a Claude-built image contains no codex
+binary at all), and a shared tag would let each stack's build silently
+clobber the other's image.
+
+### 3. Initialize Codex credentials (one time)
+
+Stores the login in the shared `codex-home` volume, where it survives
+restarts, rebuilds and `docker compose down`. The interactive flow cannot
+complete from inside the isolated agent container, so the bootstrap runs in
+the refresher — it has ordinary networking and the writable mount (details:
+[First-time login (Codex)](#first-time-login-codex)):
+
+```bash
+# Device-code flow — prints a URL + code to enter in any browser:
+docker compose -f docker-compose.codex.yml run --rm -it codex-refresher codex-login
+```
+
+Skip this entirely if you set `OPENAI_API_KEY` in `.env`. A third option is
+persisting an API key to the volume with `codex login --with-api-key`, which
+then requires uncommenting the wrapper's read-only `codex-home` mount for
+function-calling (tools) requests to read it — see
+[Codex → OpenAI](#codex--openai).
+
+If you'd rather use a raw container, get the volume name from the running
+agent rather than guessing it — a `-v` naming a volume that does not exist
+**creates an empty one**:
+
+```bash
+podman inspect codex-agent \
+    --format '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{"\n"}}{{end}}'
+
+podman exec codex-agent stat -c '%y' /home/claude/.codex/auth.json
+```
+
+That last line is the check that matters: the mtime of `auth.json` must be
+from just now. If it has not moved, the credential did not land, whatever the
+CLI printed.
+
+### 4. Run the server
+
+```bash
+docker compose -f docker-compose.codex.yml up -d
+```
+
+Confirm:
+
+```bash
+curl -fsS http://localhost:8001/healthz     # {"status":"ok"}
+docker compose -f docker-compose.codex.yml ps
+                         # codex-wrapper, codex-agent, codex-refresher,
+                         # codex-squid — all Up
+docker compose -f docker-compose.codex.yml logs -f codex-wrapper
+```
+
+Then verify the sandbox is fencing egress, exactly as in the
+[sandboxed deployment](#sandboxed-deployment-network-isolated-agent) check —
+substituting `codex-agent` for `claude-agent` and `api.openai.com` for the
+allowed host.
 
 ---
 
@@ -385,6 +539,10 @@ except through a domain allowlist:
                   │        │  HTTP(S)_PROXY egress only
                   └───────>└──> squid ──> sandbox/allowlist.txt hosts
 ```
+
+`docker-compose.codex.yml` is the same picture with `codex-agent` in place of
+`claude-agent` — the Codex CLI behind the same `src/agent_shim.py`, the same
+squid, the same single published port.
 
 ```bash
 docker compose up -d --build
@@ -414,7 +572,10 @@ docker compose exec claude-agent \
   minimal service exposing `GET /healthz` and `POST /run` that spawns the CLI and
   streams its stream-json stdout back verbatim. The shim never takes the binary
   path from the caller, confines `cwd` to the shared workspace volume, and can
-  require a bearer token (`CLAUDE_WRAPPER_AGENT_TOKEN`).
+  require a bearer token (`CLAUDE_WRAPPER_AGENT_TOKEN`). Codex runs behind the
+  **same shim contract**: same `/healthz` + `/run` surface, the binary still
+  comes from the shim container's own environment (never from the caller), and
+  a caller's env overlay cannot steer binary or loader resolution either.
 - The per-session workspace is a volume mounted **at the same path in both
   containers**, so uploads materialized by the API and files generated by the CLI
   need no copying. The file store, session registry and usage ledgers stay
@@ -437,11 +598,14 @@ docker compose exec claude-agent \
   fires (measured A/B; CREDENTIALS-FIX.md Round 4). Current CLIs hand target
   hostnames to Squid in the CONNECT line anyway, so runs work without it. If
   an older CLI dies before any CONNECT, the `.env` knob turns it back on — at
-  the cost of in-agent OAuth.
+  the cost of in-agent OAuth. The knob is Claude-only: codex's HTTPS and
+  WebSocket transports both honor `HTTPS_PROXY` natively, so there is no codex
+  equivalent to reach for.
 
 ### The shipped allowlist
 
-Thirteen hosts are active out of the box:
+Thirteen hosts are active out of the box — the OpenAI Codex block that sits
+below them ships fully commented:
 
 `api.anthropic.com`, `claude.ai`, `claude.com`, `code.claude.com`,
 `platform.claude.com`, `downloads.claude.ai`, `bridge.claudeusercontent.com`,
@@ -453,6 +617,15 @@ interactive OAuth login and CLI features; `sandbox/allowlist.txt`'s own comments
 recommend deleting them on an API-key-only deployment. To change the list, edit
 the file and restart the squid container — the `./sandbox allow` helper referenced
 in that file's comments **does not exist in this repository**.
+
+The commented **OpenAI Codex block** (uncommenting it is step 1 of
+[Quick start (Codex)](#quick-start-codex)) is split by auth mode, in the same
+every-line-is-an-exit spirit as the Claude guidance: `api.openai.com` is
+always needed under codex — the model API plus the tools passthrough — while
+`chatgpt.com` and `auth.openai.com` serve the ChatGPT-plan login only, so an
+API-key deployment leaves them commented. Squid is CONNECT-only, so the
+WebSocket transport codex tries first (`wss://api.openai.com`) rides the same
+CONNECT:443 entry as HTTPS.
 
 ### Operational notes
 
@@ -469,7 +642,8 @@ endpoints — with these caveats:
   to the allowlist, or pre-install the models. pip itself is already covered.
 - **Function calling (`tools`)** is served by the API container's direct
   Messages-API call, routed through the same proxy, so `api.anthropic.com` must
-  stay on the allowlist.
+  stay on the allowlist. Under codex the passthrough calls `api.openai.com`
+  instead, which must stay allowlisted for the same reason.
 - **`http(s)` `image_url` fetches** leave the API container and are governed by
   the allowlist too — which turns the SSRF surface noted under
   [Multimodal input](#multimodal-input) into a policy decision.
@@ -479,8 +653,9 @@ endpoints — with these caveats:
 - The agent's isolation is enforced by network topology (hard); the API
   container's egress discipline is proxy-env only (soft), because its inbound port
   needs a non-internal network. Firewall the host if you want both hard.
-- Both the squid image (`docker.io/ubuntu/squid:latest`) and the Claude Code CLI
-  are unpinned. Pin them yourself if you need reproducibility.
+- The squid image (`docker.io/ubuntu/squid:latest`), the Claude Code CLI and
+  the codex CLI (when the image is built with `INSTALL_CODEX=1`) are all
+  unpinned. Pin them yourself if you need reproducibility.
 
 ---
 
@@ -504,6 +679,15 @@ this layout only:
 docker compose -f docker-compose.single.yml -f docker-compose.host-credentials.yml up -d
 ```
 
+`CLAUDE_WRAPPER_AGENT` works in this layout too — here the env var alone
+selects the agent, since there is no per-agent compose file. Codex support is
+built for the sandboxed stack; running it single-container additionally
+requires `CLAUDE_WRAPPER_SESSION_PLAN=off` (the token cap's plan presets are
+Anthropic-shaped — see
+[Defaults that differ](#defaults-that-differ-between-code-and-compose)) and an
+image built with `--build-arg INSTALL_CODEX=1`. Either way the layout remains
+sunset.
+
 ## Configuration reference
 
 Everything is environment-driven. `.env.example` is the annotated master copy;
@@ -516,6 +700,7 @@ this table is the code-level truth. Booleans are false only for
 | --- | --- | --- |
 | `CLAUDE_UID` / `CLAUDE_GID` | Build arg + runtime uid/gid. | `1000` |
 | `CLAUDE_WRAPPER_PORT` | uvicorn port, published host port, healthcheck. | `8000` |
+| `CODEX_WRAPPER_PORT` | Same, for the codex stack (`docker-compose.codex.yml` feeds it into `CLAUDE_WRAPPER_PORT`). A separate variable so one `.env` can run both stacks side by side without a host-port collision. | `8001` |
 | `CLAUDE_WRAPPER_HOST` | uvicorn bind address. | `0.0.0.0` |
 | `CLAUDE_WRAPPER_WORKERS` | `uvicorn --workers`. **Leave at 1** — see [Concurrency](#concurrency). | `1` |
 | `CLAUDE_INBOX_DIR` | Host drop folder → `/data/inbox` (read-only). | `./inbox` |
@@ -538,12 +723,22 @@ them with no fallback, so a stripped environment aborts at start.
 | `CLAUDE_CODE_OAUTH_TOKEN` | Pre-minted OAuth token. | blank |
 | `CLAUDE_HOST_CREDENTIALS` | Host `~/.claude/.credentials.json` for the overlay. Compose errors if the overlay is used and this is unset. | none |
 | `CLAUDE_WRAPPER_CREDENTIALS_FILE` | Where the tool bridge reads the CLI's OAuth token. | `~/.claude/.credentials.json` |
+| `CLAUDE_WRAPPER_AGENT` | Which agent the wrapper drives: `claude` \| `codex`. Any other value refuses to boot. | `claude` |
+| `OPENAI_API_KEY` | OpenAI API key for the codex CLI and the tools passthrough (codex only). | blank |
+| `CLAUDE_WRAPPER_CODEX_BIN` | Path or name of the `codex` executable. | `codex` |
+| `CLAUDE_WRAPPER_CODEX_CREDENTIALS_FILE` | Where the wrapper reads `codex login`'s auth state. | `$CODEX_HOME/auth.json` |
+| `CLAUDE_WRAPPER_OPENAI_BASE_URL` | OpenAI API base for the tools passthrough (codex only). | `https://api.openai.com` |
+| `CLAUDE_WRAPPER_CODEX_MODELS` | Comma-separated override of the advertised codex model list. | built-in list |
+
+Note `OPENAI_API_KEY` and the `CODEX_REFRESH_*` refresher knobs (see
+`.env.example`) have no `CLAUDE_WRAPPER_` prefix.
 
 ### Model and effort
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `CLAUDE_WRAPPER_DEFAULT_MODEL` | Model for `"model": "auto"` or an absent model. Always added to the advertised list. | `claude-opus-4-8` |
+| `CODEX_WRAPPER_DEFAULT_MODEL` | Same, for the codex stack (`docker-compose.codex.yml` feeds it into `CLAUDE_WRAPPER_DEFAULT_MODEL`). A separate variable so the shared `.env`'s Claude id doesn't become the codex default — which would advertise a Claude model on `/v1/models` and fail every `auto` request. Empty = `gpt-6-astra`. | blank |
 | `CLAUDE_WRAPPER_EFFORT` | Server-default reasoning effort. Empty means the `--effort` flag is not passed at all. | code: empty · compose: `medium` |
 | `CLAUDE_WRAPPER_MODEL_DISCOVERY` | `auto` scans the installed CLI binary; `off` serves the static fallback list. | `auto` |
 | `CLAUDE_WRAPPER_ANTHROPIC_BASE_URL` | Messages API base for the tool bridge. | `https://api.anthropic.com` |
@@ -632,14 +827,16 @@ If you change `CLAUDE_WRAPPER_AGENT_PORT`, change the port inside
 
 ### Defaults that differ between code and compose
 
-Three variables resolve differently depending on whether you run under compose
-with a populated `.env` or import the app directly:
+Four variables resolve differently depending on whether you run under compose
+with a populated `.env` or import the app directly (the last only in the codex
+compose file):
 
 | Variable | Code default | Compose default | Consequence |
 | --- | --- | --- | --- |
 | `CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS` | `AskUserQuestion` | empty string | Compose passes an empty value, which **overrides** the code default and stops `--disallowedTools` from being passed at all. The dead `AskUserQuestion` tool is then reachable again. |
 | `CLAUDE_WRAPPER_EFFORT` | empty (no flag) | `medium` | A compose deployment pins effort at medium; a bare-Python run lets the CLI pick. |
 | `CLAUDE_WRAPPER_WORKSPACE_HINT` | `false` | `on` | Off in code deliberately, because the hint changes the *shape* of the reply and `/v1/completions`, assistants runs and the batches worker share the same path. |
+| `CLAUDE_WRAPPER_SESSION_PLAN` | `max 5x` | `off` (`docker-compose.codex.yml`, via `CODEX_WRAPPER_SESSION_PLAN`) | The [usage cap](#per-conversation-usage-cap-usage-checkpoint)'s plan presets are Anthropic-shaped; no ChatGPT-plan calibration exists, so the codex stack ships the cap off — on its own variable, so the shared `.env`'s `max 5x` cannot silently re-enable it. Set `CLAUDE_WRAPPER_SESSION_TOKEN_ALLOWANCE` for a custom cap. |
 
 Removed and ignored: `CLAUDE_WRAPPER_JSON_SNIFF`. It is documented as removed in
 `.env.example` and read nowhere in the code.
@@ -912,6 +1109,12 @@ Note the compose caveat in [Defaults that differ](#defaults-that-differ-between-
 the tool-suppression half of this only takes effect if
 `CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS` is actually set in your `.env`.
 
+Under codex, both this protocol and the workspace hint travel as a leading
+prompt block instead — `codex exec` has no `--append-system-prompt` — with the
+same enable conditions. The `--disallowedTools AskUserQuestion` half is
+Claude-only and moot for codex, which has no interactive question tool to
+suppress.
+
 ### If your client sends `tools` (Open WebUI native function calling)
 
 A request that declares `tools` is served by the **tool bridge**, which calls the
@@ -930,6 +1133,15 @@ ways: the CLI runs its own tool loop and cannot surface a caller-declared tool.
 Routing a tools-carrying turn to the CLI anyway would silently drop the client's
 tools, so a real agentic client offering a tool on its opening turn would get
 prose instead of a `tool_call` and its loop would stall.
+
+The routing rule is agent-independent — tools or the CLI, never both in one
+turn. Under codex the bridge is a near-pure proxy to OpenAI's own
+`/v1/chat/completions`: native `response_format`, client-declared OpenAI
+built-in tools and `tool_choice` pass through verbatim, and legacy `functions`
+clients keep the legacy wire shape end-to-end. The wrapper-owned `memory` /
+`time_calc` tools do not exist on this path, and tool-path streams carry no
+`session_id` / `effort` extension fields — upstream chunks are forwarded
+as-is.
 
 ### OpenWebUI knowledge base
 
@@ -1264,6 +1476,12 @@ hardcoded set. A maintained denylist drops models Anthropic has deprecated
 also falls back to that list automatically if the binary can't be read. Pass
 `"model": "auto"` to use `CLAUDE_WRAPPER_DEFAULT_MODEL`.
 
+Under `CLAUDE_WRAPPER_AGENT=codex` there is no binary scan —
+`CLAUDE_WRAPPER_MODEL_DISCOVERY` is claude-only. `/v1/models` serves a static
+codex list, overridable with `CLAUDE_WRAPPER_CODEX_MODELS`, and every entry
+carries `owned_by: openai`. `"model": "auto"` resolves to `gpt-6-astra`
+unless `CLAUDE_WRAPPER_DEFAULT_MODEL` says otherwise.
+
 Each effort-capable model is advertised with one variant per effort level it
 accepts (the *family rule*):
 
@@ -1284,6 +1502,15 @@ Responses report what actually happened in the `effort` field —
 `source` is one of `request`, `server-default`, `model-incapable` or
 `effort-unsupported`. That is how you confirm a variant took effect rather than
 being silently dropped for a model that doesn't support it.
+
+Codex models advertise a different variant set: `(minimal)` `(low)` `(medium)`
+`(high)` `(xhigh)` on every id — effort is a request parameter there, not
+model-gated the way `claude --effort` is — and never `(max)` or `(ultracode)`,
+which resolve as `effort-unsupported`. An explicit `:none` suffix is honored
+(it reaches the CLI instead of silently falling back to codex's default)
+though never advertised. The server default (`CLAUDE_WRAPPER_EFFORT`) applies
+to CLI turns but **not** to the tools passthrough, which maps only the
+explicit per-request suffix.
 
 The `(ultracode)` variant is special: it requests xhigh effort **plus** Claude
 Code's dynamic-workflow (multi-agent) orchestration. Because ultracode is gated
@@ -1354,6 +1581,16 @@ Enforcement is layered per path:
   `time_calc` — execute inside the bridge's hybrid loop and are invisible
   to the client. They activate only on tools-carrying requests; tool-less
   chats take the CLI path, which has its own built-ins.
+
+Under codex, profiles still gate the tool bridge and `/v1/models`
+advertisement for codex ids, but the CLI-side translations above are
+Claude-tool names and do not apply. In particular
+`CLAUDE_WRAPPER_EXPOSE_TERMINAL` cannot disable codex's command execution:
+the shell is intrinsic to that agent, and the container sandbox is the
+enforcement boundary (see
+[Limitations](#limitations-and-known-gaps)). The wrapper-owned `memory` /
+`time_calc` capabilities are inert under codex — the OpenAI passthrough has
+no hybrid loop to execute them in.
 
 **OpenWebUI**: OpenWebUI doesn't map pulled model metadata into its
 capability toggles, so `deploy/openwebui_capability_sync.py` — run **on the
@@ -1428,6 +1665,37 @@ setting that suppresses file refresh entirely (see
 API-key-only deployment you can delete the eight `claude.ai` / `claude.com`
 entries from `sandbox/allowlist.txt`, which that file's own comments recommend.
 
+### First-time login (Codex)
+
+The same bootstrap logic applies to the codex stack: the interactive flows
+cannot complete from inside the isolated `codex-agent`, and doing the one-time
+login from a container with ordinary networking, writing into the volume the
+agent reads, is a legitimate bootstrap, not a workaround — the sandbox exists
+to constrain model-driven tool use, not the operator's initial setup. The
+`codex-refresher` service is in exactly that position:
+
+```bash
+docker compose -f docker-compose.codex.yml run --rm -it codex-refresher codex-login
+# follow the device-code flow in your browser
+```
+
+`codex-login` uses the device-auth flow deliberately: codex's default browser
+flow spins up a callback server on `localhost:1455`, which is unreachable in a
+`run` container unless you publish the port
+(`run --rm -it -p 1455:1455 codex-refresher codex login`). Device auth needs
+no callback.
+
+The check that matters afterwards is the same one as for Claude — the mtime
+of the credential file must be from just now:
+
+```bash
+podman exec codex-agent stat -c '%y' /home/claude/.codex/auth.json
+```
+
+After that, the running `codex-refresher` keeps the login renewed — see
+[Keeping the credential alive](#keeping-the-credential-alive). Skip all of
+this if you set `OPENAI_API_KEY` in `.env`.
+
 ### 1. Claude Code → Anthropic
 
 The two mechanisms are genuinely different, and they cannot both be active —
@@ -1482,6 +1750,36 @@ an environment credential wins and then nothing renews the file underneath it.
 
   The overlay targets `claude-wrapper` and is therefore **inert under the sandbox
   topology**, where the CLI runs in `claude-agent`.
+
+### Codex → OpenAI
+
+The codex counterpart of the layer above, with one asymmetry that decides what
+you deploy. Precedence:
+
+- **`OPENAI_API_KEY` (environment)** wins whenever set. As with the Claude env
+  vars, this is the single most surprising behaviour: an env key makes codex
+  ignore the volume login entirely, and then nothing exercises — or refreshes —
+  the file credential underneath it. The boot report warns when it detects the
+  shadowing.
+- **`auth.json` in the `codex-home` volume** otherwise — either a ChatGPT-plan
+  login (from `codex-login`, self-renewing on use) or a persisted API key
+  (`codex login --with-api-key`). The wrapper container's read-only mount of
+  this file **ships commented out on purpose**: a ChatGPT-plan `auth.json`
+  holds an OAuth refresh token the tools passthrough deliberately never uses,
+  and mounting it into the one internet-facing container would expose it for
+  zero benefit. Uncomment the mount only if you persist an API key there.
+
+**The plan-token asymmetry: a ChatGPT-plan login drives CLI turns only.
+Function-calling (`tools`) requests need an API key — without one they return
+a 502 (`no_upstream_credential`) naming the two working options.** Unlike
+Claude, whose plan login is bridge-usable, ChatGPT-plan tokens authenticate
+against the Codex backend, not the OpenAI Platform API — sending one to
+`/v1/chat/completions` is both non-functional and a plan-terms violation, so
+the wrapper never tries.
+
+When OpenAI rejects the wrapper's upstream credential (401/403), clients see
+a fixed 502 message; the upstream body — which can echo fragments of the
+presented key — goes to the server log only.
 
 ### Keeping the credential alive
 
@@ -1562,6 +1860,22 @@ no mention of credentials. Four things keep that from happening:
    that uvicorn is alive, nothing more. It is not a credential check, and it was
    not one when squid was down either.
 
+The codex story is the same shape with different machinery: codex refreshes
+its ChatGPT tokens automatically **on use**, so an idle deployment is the
+failure mode, and the `codex-refresher` service covers it — it watches
+`auth.json` and spends one minimal turn whenever `last_refresh` goes stale.
+That refresh turn runs under codex's own read-only sandbox — and against a
+private `CODEX_HOME` seeded with `auth.json` alone, because the volume's
+`config.toml` is agent-writable and codex executes config directives
+(`mcp_servers` commands spawn as plain subprocesses): loading it in a
+container with ordinary egress would hand a prompt-injected agent a way
+around Squid entirely. The refresher runs no agent code and executes no
+model-driven tool use; only the credential crosses back. `codex-login` takes
+the same precaution. Treat the
+refresh-lifetime figures as estimates — OpenAI does not publish them, and the
+refresher logs the token age on every pass so you can watch the real
+behaviour.
+
 Back the credential up once it is minted; restoring a file beats re-running an
 interactive flow through the sandbox:
 
@@ -1572,16 +1886,23 @@ chmod 600 ~/claude-oauth-backup.json
 
 ### Entrypoint subcommands
 
-Available via `docker compose run --rm -it claude-wrapper <cmd>`:
+Available via `docker compose run --rm -it claude-wrapper <cmd>` — except the
+`codex-*`/`codex` rows, which exist only in codex-stack images (the claude
+build ships no codex binary): run those as
+`docker compose -f docker-compose.codex.yml run --rm -it codex-refresher <cmd>`.
 
 | Command | Purpose |
 | --- | --- |
 | `serve` (also `start`, `run`, or no argument) | Start the uvicorn API server |
 | `agent` / `shim` | Start the agent shim — used by the sandbox topology |
+| `refresher` / `refresh` | Keep the volume's Claude login renewed — the claude-refresher service's role |
 | `login` / `init` | Interactive Claude Code OAuth login |
-| `setup-token` / `token` | Mint a long-lived OAuth token |
+| `setup-token` / `token` | Mint a long-lived OAuth token (printed, not saved) |
 | `shell` / `bash` | Drop into bash inside the container |
 | `claude …` | Run any other `claude` CLI command |
+| `codex-login` | Codex device-code login — the codex stack's bootstrap |
+| `codex-refresher` | Keep a ChatGPT-plan `auth.json` fresh — the codex-refresher service's role |
+| `codex …` | Run any other `codex` CLI command |
 | anything else | Executed verbatim |
 
 ### 2. Client → wrapper
@@ -1617,6 +1938,21 @@ read-only.
 `claude-home` mounted **read-only** on the API container and writable on the
 agent, and the inbox mounted on the agent rather than the API.
 
+`docker-compose.codex.yml` keeps volumes of its own — `codex-data`,
+`codex-workspace`, and `codex-home` → `/home/claude/.codex` (`auth.json`,
+`config.toml` and the sqlite thread store — writable on `codex-agent` and
+`codex-refresher`, and mounted read-only on the API container **only when
+opted in**: the API-key file mode; the mount ships commented out — see
+[Codex → OpenAI](#codex--openai)). Nothing is shared with the claude stack:
+the two run concurrently, and a shared file store or registry would race.
+
+Session-registry entries are still tagged with the agent that wrote them, so
+a volume that does serve both agents over time — the
+[single-container layout](#single-container-layout-sunset), where
+`CLAUDE_WRAPPER_AGENT` alone flips the agent — starts fresh sessions instead
+of cross-resuming: the other agent's entries are ignored, not deleted, and
+switching back finds them again.
+
 The containers run unprivileged as `CLAUDE_UID:CLAUDE_GID` with `cap_drop: ALL`
 and `no-new-privileges`, so everything they touch on the host must be readable by
 that uid.
@@ -1646,16 +1982,18 @@ with `docker compose exec`.
 
 ## Running the tests
 
-The suite is 14 files covering endpoints, JSON mode, the budget, downloads,
+The suite is 23 files covering endpoints, JSON mode, the budget, downloads,
 effort, the tool bridge, the KB addendum, PDF handling, the sandbox shim, resume
-self-healing and model discovery. It stubs Claude Code, so **no Docker and no
-Anthropic credentials are required**.
+self-healing, model discovery — and, since the codex integration: the agent
+selector, the codex runner, the OpenAI bridge and the entrypoint roles. It
+stubs both CLIs, so **no Docker and no Anthropic or OpenAI credentials are
+required**.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt pytest        # pytest is NOT in requirements.txt
 CLAUDE_WRAPPER_DATA=/tmp/cw-test python -m pytest tests -q
-# 171 passed
+# 332 passed  (the exact count moves with every added test; treat ±a few as fine)
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same command on Python 3.11, preceded by
@@ -1664,8 +2002,8 @@ under a second — three separate import-level breakages reached `main` before t
 guard existed. CI does not lint, type-check, build the image, or validate the
 compose files.
 
-Seven of the test files also run standalone (`python tests/test_endpoints.py`)
-and print a `RESULT pass=N fail=M` line; the other seven are pytest-only and use
+Nine of the test files also run standalone (`python tests/test_endpoints.py`)
+and print a `RESULT pass=N fail=M` line; the rest are pytest-only and use
 fixtures. Prefer the pytest command — the standalone path in `test_endpoints.py`
 executes 27 of the 31 tests defined in that file, and its `check()` helper counts
 failures without asserting, so a failure there does not fail the file under
@@ -1701,6 +2039,11 @@ Each of the corresponding misconfigurations otherwise fails silently.
 | Every sandbox run dies instantly | The target host isn't on the allowlist; on older CLIs possibly DNS (see the `CLAUDE_CODE_PROXY_RESOLVES_HOSTS` note — do not set it casually, it disables in-agent OAuth) |
 | Inbox files unreadable under rootless podman | Host uid maps to container 0; needs `userns_mode: keep-id` |
 | Old chats fail fast, new chats work | A dead `--resume` target; the wrapper self-heals on the next turn |
+| Tools requests 502 `no_upstream_credential` under codex | ChatGPT-plan-only deployment — plan tokens can't call the Platform API. Set `OPENAI_API_KEY`, or opt into the `auth.json` mount — see [Codex → OpenAI](#codex--openai) |
+| Boot refusal naming two agents | The wrapper and agent container disagree on `CLAUDE_WRAPPER_AGENT` — stale `.env`, or `CLAUDE_WRAPPER_AGENT_URL` pointing at the other stack |
+| `codex login` stalls in the agent container | Interactive flows can't complete behind the sandbox; bootstrap via `codex-refresher codex-login` (device auth) — see [First-time login (Codex)](#first-time-login-codex) |
+| Every codex turn times out with silent stdout | Egress blocked — codex retries forever. Check the OpenAI allowlist block is uncommented |
+| A "resumed with model …" warning in a codex turn | Harmless notice that the resumed thread previously used a different model |
 
 ### Changing CLAUDE_UID after first run
 
@@ -1748,8 +2091,9 @@ fail the same way on the first real request instead of at boot.
 
 | Path | What it is |
 | --- | --- |
-| `src/` | The application. `main.py` (routes + SSE), `claude_runner.py` (CLI subprocess + sessions), `converters.py` (prompt building), `tool_bridge.py` (Messages API path), `agent_shim.py` (sandbox agent service), plus per-area routers. |
-| `tests/` | 14 test files; see [Running the tests](#running-the-tests). |
+| `src/` | The application. `main.py` (routes + SSE), `agent_runner.py` (agent-neutral runner core + sessions), `claude_runner.py` (Claude CLI dialect), `codex_runner.py` (codex exec dialect), `converters.py` (prompt building), `tool_bridge.py` (Messages API path), `openai_bridge.py` (OpenAI passthrough for codex tools requests), `agent_shim.py` (sandbox agent service), plus per-area routers. |
+| `docker-compose.codex.yml` | The codex variant of the default sandboxed stack — see [Quick start (Codex)](#quick-start-codex). |
+| `tests/` | 23 test files; see [Running the tests](#running-the-tests). |
 | `sandbox/` | `squid.conf` and `allowlist.txt`, bind-mounted into the squid container. Config only — there is no `sandbox` executable despite what the comments in those files suggest. |
 | `tools/` | Host-side helper scripts, not part of the service and not in the image. `split_pdf.py` slices a PDF by page range or outline chapter; `chat_with_pdfs.py` uploads PDFs as binary `file_id`s and posts a chat completion, bypassing Open WebUI's text extraction. |
 | `deploy/` | **Historical.** An archived incident runbook for a mis-mounted `claude-home` volume. Both fixes shipped; `fix-claude-home-mount.sh` fails its own preflight by design and must not be run. |
@@ -1776,6 +2120,32 @@ fail the same way on the first real request instead of at boot.
   it needs; later calls reuse the cached install.
 - **`/docs`, `/redoc`, `/openapi.json` and `GET /v1/realtime/sessions` are
   unauthenticated** even when API keys are configured.
-- **Builds are not reproducible.** The base image tag, the Claude Code CLI and
-  the squid image are all unpinned.
+- **Builds are not reproducible.** The base image tag, the Claude Code CLI, the
+  squid image — and the codex CLI, when built with `INSTALL_CODEX=1` — are all
+  unpinned.
+- **Codex has no per-tool CLI gating.** `--disallowedTools` is Claude-only;
+  under codex, command execution is intrinsic to the agent and the container
+  sandbox is the enforcement boundary. `CLAUDE_WRAPPER_EXPOSE_TERMINAL` cannot
+  disable it — and `/v1/models` is honest about that: under codex the
+  CLI-shaped capabilities (`terminal`, `web_search`, `sub_agents`) always
+  advertise as present, even if a profile removes them, because the removal
+  would not be enforced. Profiles still genuinely gate `client_tools` (the
+  bridge enforces it).
+- **No wrapper-owned tools on the codex bridge.** `memory` and `time_calc`
+  live in the Anthropic hybrid loop; the OpenAI passthrough never injects them.
+- **Codex-tuned model ids cannot take `tools` requests.** OpenAI serves the
+  `*-codex` ids only via the Responses API, and the passthrough speaks
+  `/v1/chat/completions` — such requests are rejected with a 400 naming the
+  fix (use a non-codex id, or drop `tools` for the CLI path) rather than
+  forwarded into an opaque upstream 404. The gate applies only against the
+  default `api.openai.com`; a custom `CLAUDE_WRAPPER_OPENAI_BASE_URL` backend
+  is assumed to know its own model surface.
+- **The token budget is uncalibrated for ChatGPT plans.** The plan presets are
+  Anthropic-shaped, so the codex stack ships the cap off.
+- **Codex streaming is item-granular.** `codex exec --json` emits whole text
+  blocks, so the CLI path has no token-by-token deltas under codex.
+- **Delegated endpoints are exercised primarily under Claude.**
+- **Agent identity is only verified at wrapper boot.** An agent container
+  recreated later with the wrong agent fails per-turn rather than refusing at
+  startup.
 - **Single-worker only** — see [Concurrency](#concurrency).

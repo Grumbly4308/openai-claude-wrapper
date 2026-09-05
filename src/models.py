@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from .json_mode import responses_text_format
 
@@ -151,18 +151,35 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Optional[Union[str, dict[str, Any]]] = None
     parallel_tool_calls: Optional[bool] = None
     # Legacy function calling (openai<1.0, older LangChain): normalized into
-    # tools/tool_choice below so the whole bridge sees one shape. `functions`
-    # staying set is the marker that the RESPONSE must use the legacy shape
-    # too (message.function_call, finish_reason "function_call").
+    # tools/tool_choice below so the whole bridge sees one shape. Whether the
+    # RESPONSE must use the legacy shape (message.function_call,
+    # finish_reason "function_call") is answered by legacy_functions_shape —
+    # NOT by `functions` alone, which also stays set when a client sends both
+    # families and the modern one wins.
     functions: Optional[list[ToolFunctionDef]] = None
     function_call: Optional[Union[str, dict[str, Any]]] = None
     # {"include_usage": true} => streaming responses append a usage chunk
     # before [DONE] (Vercel AI SDK sends this).
     stream_options: Optional[dict[str, Any]] = None
 
+    # Set by the adopter below: distinguishes "tools synthesized FROM
+    # functions" from "client sent both families itself".
+    _tools_from_functions: bool = PrivateAttr(default=False)
+
+    @property
+    def legacy_functions_shape(self) -> bool:
+        """True when the request speaks only the legacy `functions` family —
+        the response must then use the legacy shape (message.function_call,
+        finish_reason "function_call"). A migration-era client sending BOTH
+        families keeps its modern contract: tools/tool_choice win and the
+        legacy pair is treated as the redundant copy, instead of the modern
+        family being silently discarded."""
+        return self.functions is not None and self._tools_from_functions
+
     @model_validator(mode="after")
     def _adopt_legacy_functions(self) -> "ChatCompletionRequest":
         if self.tools is None and self.functions:
+            self._tools_from_functions = True
             self.tools = [ToolDef(type="function", function=f) for f in self.functions]
             if self.tool_choice is None and self.function_call is not None:
                 fc = self.function_call

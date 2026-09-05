@@ -47,6 +47,13 @@ services:
       CLAUDE_WRAPPER_PORT: "${CLAUDE_WRAPPER_PORT:-8000}"
       CLAUDE_WRAPPER_HOST: "0.0.0.0"
 
+      # Which agent this container wraps: claude (default) | codex. In this
+      # single-container layout the env var alone selects the agent — there is
+      # no per-agent compose file. Codex here additionally requires
+      # CLAUDE_WRAPPER_SESSION_PLAN=off (the token cap's plan presets are
+      # Anthropic-shaped) and an image built with --build-arg INSTALL_CODEX=1.
+      CLAUDE_WRAPPER_AGENT: "${CLAUDE_WRAPPER_AGENT:-claude}"
+
       # Optional: fall back to env-based auth instead of the persisted
       # OAuth login. Leave blank once you've run `compose run … login`.
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
@@ -80,7 +87,10 @@ services:
       CLAUDE_WRAPPER_WORKSPACE_HINT: "${CLAUDE_WRAPPER_WORKSPACE_HINT:-on}"
       CLAUDE_WRAPPER_WORKSPACE_PROMPT: "${CLAUDE_WRAPPER_WORKSPACE_PROMPT:-}"
 
-      CLAUDE_WRAPPER_DEFAULT_MODEL: "${CLAUDE_WRAPPER_DEFAULT_MODEL:-claude-opus-4-8}"
+      # Empty falls through to the code default, which is per-agent (claude:
+      # claude-opus-4-8, codex: gpt-6-astra) — a non-empty default here would
+      # append a claude id to the codex model list.
+      CLAUDE_WRAPPER_DEFAULT_MODEL: "${CLAUDE_WRAPPER_DEFAULT_MODEL:-}"
 
       # Reasoning effort forwarded to every `claude` invocation: low | medium |
       # high | xhigh | max are passed as `--effort <level>`. "ultracode" is also

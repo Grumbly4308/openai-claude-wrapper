@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .claude_runner import ClaudeResult, ClaudeRunner
+from .agent_runner import AgentResult, BaseAgentRunner
 
 
 log = logging.getLogger("claude_wrapper.delegate")
@@ -36,14 +36,18 @@ log = logging.getLogger("claude_wrapper.delegate")
 class DelegationResult:
     workspace: Path
     session_key: str
-    claude: ClaudeResult
+    claude: AgentResult  # historical name; holds whichever agent ran
     outputs: list[Path]
+
+    @property
+    def agent(self) -> AgentResult:
+        return self.claude
 
 
 class Delegator:
-    """Helper around ClaudeRunner for one-shot endpoint subtasks."""
+    """Helper around the agent runner for one-shot endpoint subtasks."""
 
-    def __init__(self, runner: ClaudeRunner, workspace_root: Path):
+    def __init__(self, runner: BaseAgentRunner, workspace_root: Path):
         self.runner = runner
         self.workspace_root = workspace_root
 

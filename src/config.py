@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import datetime
 import hashlib
 import json
@@ -162,6 +163,69 @@ def _resolve_session_allowance() -> tuple[int, str]:
     return 0, ""
 
 
+# ---------- Wrapped-agent selection ----------
+#
+# Everything Settings.from_env() reads has to live ABOVE the SETTINGS singleton
+# below — the codex branch of the default-model expression evaluates lazily
+# under claude, so a NameError here would pass every claude-mode test and only
+# explode on a codex deployment's first boot.
+
+AGENT_CHOICES = ("claude", "codex")
+
+
+def _agent_from_env() -> str:
+    """CLAUDE_WRAPPER_AGENT, validated fail-closed.
+
+    The raise happens inside Settings.from_env(), so a typo kills the process
+    at import with a message naming the variable, instead of silently serving
+    Claude models against a codex deployment (or vice versa).
+    """
+    raw = os.environ.get("CLAUDE_WRAPPER_AGENT", "").strip().lower()
+    if not raw:
+        return "claude"  # empty string == unset (compose ${VAR:-} trap)
+    if raw not in AGENT_CHOICES:
+        raise RuntimeError(
+            f"CLAUDE_WRAPPER_AGENT={raw!r} is not a supported agent "
+            f"(choose one of: {', '.join(AGENT_CHOICES)})"
+        )
+    return raw
+
+
+CODEX_DEFAULT_MODEL = "gpt-6-astra"  # the codex CLI's own default in 0.153.x
+
+# Static list, mirroring FALLBACK_MODELS' role. Sourced from ids the shipped
+# codex binary knows (gpt-6-astra through gpt-5.5 verified against 0.153.4;
+# the 5.6 family and codex-spark follow the family's id convention, unverified
+# against a live CLI); there is no discovery scan for codex — override with
+# CLAUDE_WRAPPER_CODEX_MODELS as OpenAI ships/retires ids.
+CODEX_FALLBACK_MODELS: tuple[str, ...] = (
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-5.2-codex",
+    "gpt-5.2",
+    "gpt-5.1-codex-max",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.5",
+)
+
+
+def _codex_models_from_env() -> tuple[str, ...]:
+    raw = os.environ.get("CLAUDE_WRAPPER_CODEX_MODELS", "").strip()
+    ids = tuple(m.strip() for m in raw.split(",") if m.strip())
+    return ids or CODEX_FALLBACK_MODELS
+
+
+# Reasoning-effort values `codex exec` accepts via -c model_reasoning_effort
+# (verified live: none|minimal|low|medium|high|xhigh; default medium).
+CODEX_EFFORT_LEVELS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh")
+CODEX_EFFORT_CHOICES: tuple[str, ...] = ("none",) + CODEX_EFFORT_LEVELS
+
+
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path
@@ -172,6 +236,8 @@ class Settings:
     require_auth: bool
     default_model: str
     claude_bin: str
+    codex_bin: str
+    agent: str
     max_upload_bytes: int
     request_timeout_seconds: int
     public_base_url: str
@@ -216,6 +282,12 @@ class Settings:
         if self.session_token_allowance <= 0 or self.session_block_percent <= 0:
             return 0
         return int(self.session_token_allowance * self.session_block_percent / 100)
+
+    @property
+    def agent_bin(self) -> str:
+        """The binary the selected agent actually spawns — what deps and the
+        shim should use instead of hardcoding claude_bin."""
+        return self.codex_bin if self.agent == "codex" else self.claude_bin
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -265,6 +337,11 @@ class Settings:
         for d in (data_dir, workspace, files, sessions):
             d.mkdir(parents=True, exist_ok=True)
 
+        # Resolved before the field list because default_model depends on it;
+        # an unknown value raises right here, so a typo'd deployment refuses to
+        # boot instead of coming up wearing the wrong vendor's models.
+        agent = _agent_from_env()
+
         return cls(
             data_dir=data_dir,
             workspace_dir=workspace,
@@ -272,8 +349,15 @@ class Settings:
             sessions_dir=sessions,
             api_keys=keys,
             require_auth=require,
-            default_model=os.environ.get("CLAUDE_WRAPPER_DEFAULT_MODEL", "claude-opus-4-8"),
+            # Empty means "the selected agent's own default" — the compose
+            # files interpolate ${VAR:-} to "", which must not become a model id.
+            default_model=(
+                os.environ.get("CLAUDE_WRAPPER_DEFAULT_MODEL", "").strip()
+                or (CODEX_DEFAULT_MODEL if agent == "codex" else "claude-opus-4-8")
+            ),
             claude_bin=os.environ.get("CLAUDE_WRAPPER_CLAUDE_BIN", "claude"),
+            codex_bin=os.environ.get("CLAUDE_WRAPPER_CODEX_BIN", "codex").strip() or "codex",
+            agent=agent,
             max_upload_bytes=int(os.environ.get("CLAUDE_WRAPPER_MAX_UPLOAD_BYTES", str(2 * 1024 * 1024 * 1024))),
             request_timeout_seconds=int(os.environ.get("CLAUDE_WRAPPER_REQUEST_TIMEOUT", "1800")),
             public_base_url=os.environ.get("CLAUDE_WRAPPER_PUBLIC_BASE_URL", "").strip().rstrip("/"),
@@ -402,7 +486,20 @@ ULTRACODE_EFFORT = "ultracode"
 # given model is decided per-model by effort_choices_for().
 EFFORT_CHOICES: tuple[str, ...] = EFFORT_LEVELS + (ULTRACODE_EFFORT,)
 
-_EFFORT_CHOICE_SET = frozenset(EFFORT_CHOICES)
+# Recognition is per-agent, NOT a union of both vocabularies: recognizing
+# "(minimal)" on a claude deployment would silently strip it and run at the
+# server default — flipping what was a loud CLI rejection (and a 404 on
+# GET /v1/models/<id>:minimal) into a request that succeeds while ignoring
+# what the client asked for. An unrecognized suffix stays part of the model
+# string and fails where it always failed.
+_CLAUDE_EFFORT_CHOICE_SET = frozenset(EFFORT_CHOICES)
+_CODEX_EFFORT_CHOICE_SET = frozenset(CODEX_EFFORT_CHOICES)
+
+
+def _effort_choice_set() -> frozenset[str]:
+    return (
+        _CODEX_EFFORT_CHOICE_SET if SETTINGS.agent == "codex" else _CLAUDE_EFFORT_CHOICE_SET
+    )
 
 # Family-rule version boundaries for effort support (from the model docs):
 # effort landed on Opus 4.5 and on Sonnet 4.6.
@@ -435,8 +532,17 @@ def effort_choices_for(model: str) -> tuple[str, ...]:
 
     Opus 4.5+ and the codename families (fable/mythos): low/medium/high/xhigh/max
     + ultracode. Sonnet 4.6+: low/medium/high/xhigh (no max, no ultracode).
-    Haiku, older Opus/Sonnet, and anything unrecognized: none.
+    Haiku, older Opus/Sonnet, and anything unrecognized: none. Under
+    CLAUDE_WRAPPER_AGENT=codex, every advertised model takes the codex ladder.
     """
+    if SETTINGS.agent == "codex":
+        # Effort is a request parameter on the Responses API, not model-gated
+        # the way `claude --effort` is; every advertised codex model takes it.
+        # "none" is a valid -c value too, but is not advertised as a variant —
+        # CodexRunner._effort_choices_for (the runner ACCEPTANCE set) returns
+        # CODEX_EFFORT_CHOICES so an explicit ":none"/"(none)" suffix reaches
+        # the CLI instead of being silently dropped to codex's default medium.
+        return CODEX_EFFORT_LEVELS
     fam, ver = _family_version(model)
     if ver is not None:
         if fam == "opus" and ver >= _OPUS_EFFORT_MIN:
@@ -464,16 +570,21 @@ def _discovery_mode() -> str:
 
 
 def _build_supported_models() -> tuple[str, ...]:
-    discovered: list[str] = []
-    if _discovery_mode() != "off":
-        try:
-            from .model_discovery import discover_models
+    if SETTINGS.agent == "codex":
+        # No binary scan for codex (CLAUDE_WRAPPER_MODEL_DISCOVERY is
+        # claude-only): the static list + env override is the whole story.
+        models = list(_codex_models_from_env())
+    else:
+        discovered: list[str] = []
+        if _discovery_mode() != "off":
+            try:
+                from .model_discovery import discover_models
 
-            discovered = discover_models(SETTINGS.claude_bin)
-        except Exception:  # never let discovery break startup
-            log.exception("model discovery failed; falling back to static list")
-            discovered = []
-    models = discovered or list(FALLBACK_MODELS)
+                discovered = discover_models(SETTINGS.claude_bin)
+            except Exception:  # never let discovery break startup
+                log.exception("model discovery failed; falling back to static list")
+                discovered = []
+        models = discovered or list(FALLBACK_MODELS)
     # The configured default must always be selectable, even if discovery missed it.
     if SETTINGS.default_model and SETTINGS.default_model not in models:
         models.append(SETTINGS.default_model)
@@ -503,6 +614,11 @@ def advertised_models() -> list[str]:
     return out
 
 
+def model_owner() -> str:
+    """`owned_by` for /v1/models entries — matches the selected agent's vendor."""
+    return "openai" if SETTINGS.agent == "codex" else "anthropic"
+
+
 def split_model_effort(model: str) -> tuple[str, str | None]:
     """Split an advertised model id into (base_model, effort).
 
@@ -511,12 +627,13 @@ def split_model_effort(model: str) -> tuple[str, str | None]:
     so plain model ids keep using the server-default effort.
     """
     m = (model or "").strip()
+    choices = _effort_choice_set()
     paren = re.match(r"^(?P<base>.+?)\s*\((?P<lvl>[A-Za-z]+)\)\s*$", m)
-    if paren and paren.group("lvl").lower() in _EFFORT_CHOICE_SET:
+    if paren and paren.group("lvl").lower() in choices:
         return paren.group("base").strip(), paren.group("lvl").lower()
     if ":" in m:
         base, _, lvl = m.rpartition(":")
-        if base.strip() and lvl.strip().lower() in _EFFORT_CHOICE_SET:
+        if base.strip() and lvl.strip().lower() in choices:
             return base.strip(), lvl.strip().lower()
     return m, None
 
@@ -579,6 +696,10 @@ class CredentialStatus:
     # whether you ever have to log in again — expires_in only describes the
     # access token, which the CLI renews by itself.
     refresh_in: Optional[float] = None
+    # Vendor vocabulary for describe(). The codex readers below set "codex" so
+    # one status type serves both agents without forking the expiry/escalation
+    # logic; the default keeps every existing claude call site untouched.
+    provider: str = "claude"  # "claude" | "codex"
 
     @property
     def expired(self) -> bool:
@@ -597,7 +718,39 @@ class CredentialStatus:
             return 0 < self.refresh_in < _RELOGIN_SOON_SECONDS
         return self.expires_in is not None and 0 < self.expires_in < _LONG_LIVED_SECONDS
 
+    def _describe_codex(self) -> str:
+        """The codex vocabulary; structural mirror of the claude wording below.
+
+        Keys env-vs-file API keys off ``path``: the env reader leaves it None,
+        the file reader carries the auth.json it inspected.
+        """
+        where = self.path or CODEX_CREDENTIALS_FILE
+        if self.kind == "api-key":
+            if self.path is None:
+                return "OPENAI_API_KEY from the environment (no expiry)"
+            return f"Codex API key in {where} (no expiry)"
+        if self.kind == "none":
+            return f"NONE — no OPENAI_API_KEY and no usable codex login in {where}"
+        if self.expires_in is None:
+            return f"Codex ChatGPT login ({where}, no expiry readable)"
+        renew = (
+            f", re-login estimated in {_describe_duration(self.refresh_in)}"
+            if self.refresh_in is not None and self.refresh_in > 0
+            else ""
+        )
+        if self.expired:
+            return (
+                f"Codex ChatGPT login ({where}) EXPIRED "
+                f"{_describe_duration(self.expires_in)} ago{renew}"
+            )
+        return (
+            f"Codex ChatGPT login ({where}), access valid for "
+            f"{_describe_duration(self.expires_in)}{renew}"
+        )
+
     def describe(self) -> str:
+        if self.provider == "codex":
+            return self._describe_codex()
         where = self.path or CREDENTIALS_FILE
         if self.kind == "api-key":
             return "ANTHROPIC_API_KEY (no expiry)"
@@ -756,3 +909,154 @@ def log_credential_status(where: str, path: Optional[Path] = None) -> Credential
                 shadowed.describe(),
             )
     return status
+
+
+# ---------- Codex credentials ----------
+
+# Where `codex login` persists auth. The OpenAI tool-bridge passthrough reads
+# the same file (API-key mode only, and only when the operator has opted into
+# mounting it — see docker-compose.codex.yml), which is why it is configurable.
+# `or` pattern, not a .get default: the codex compose file delivers this var
+# as "" (the ${VAR:-} interpolation trap), which must fall through to the
+# CODEX_HOME default instead of becoming Path(".").
+CODEX_CREDENTIALS_FILE = Path(
+    os.environ.get("CLAUDE_WRAPPER_CODEX_CREDENTIALS_FILE", "").strip()
+    or str(Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json")
+)
+
+# Codex's refresh-token lifetime is not documented; ~28 days is the observed
+# figure and is treated as an ESTIMATE throughout — it drives boot-log warnings
+# via the claude thresholds above, never an auth decision.
+_CODEX_REFRESH_LIFETIME_SECONDS = 28 * 24 * 3600
+
+
+def _jwt_expiry_seconds(token: str) -> Optional[float]:
+    """Best-effort seconds-until-`exp` from a JWT access token, or None.
+
+    auth.json records no expiry field of its own; the only readable signal is
+    the exp claim inside the (unverified) token payload. Any failure —
+    malformed token, opaque token, missing claim — is None, never an exception:
+    this feeds a boot log line, not an auth decision.
+    """
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)  # JWTs strip base64 padding
+        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+    except Exception:
+        return None
+    if not isinstance(exp, (int, float)) or isinstance(exp, bool):
+        return None
+    return float(exp) - time.time()  # JWT exp is epoch SECONDS, not ms
+
+
+def _codex_refresh_estimate(raw: object) -> Optional[float]:
+    """Estimated seconds until the refresh token dies, from ``last_refresh``.
+
+    codex stamps last_refresh (ISO-8601, usually with a trailing Z) whenever it
+    renews; the refresh token's own lifetime is unreadable, so the deadline is
+    last_refresh + ~28d − now — an estimate for the boot report, nothing more.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        refreshed = datetime.datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if refreshed.tzinfo is None:
+        refreshed = refreshed.replace(tzinfo=datetime.timezone.utc)
+    return refreshed.timestamp() + _CODEX_REFRESH_LIFETIME_SECONDS - time.time()
+
+
+def read_codex_file_credential(path: Optional[Path] = None) -> CredentialStatus:
+    """Inspect the on-disk codex login, ignoring the environment entirely.
+
+    Mirror of read_file_credential: an env key wins but does NOT renew this
+    file, so the boot report has to be able to look underneath here too.
+    """
+    where = path or CODEX_CREDENTIALS_FILE
+    try:
+        data = json.loads(where.read_text())
+    except (OSError, json.JSONDecodeError):
+        return CredentialStatus("none", path=where, provider="codex")
+    if not isinstance(data, dict):
+        return CredentialStatus("none", path=where, provider="codex")
+    # `codex login --with-api-key` persists the key itself, not a token pair.
+    if str(data.get("auth_mode") or "") == "apikey" and str(data.get("OPENAI_API_KEY") or "").strip():
+        return CredentialStatus("api-key", path=where, provider="codex")
+    tokens = data.get("tokens") or {}
+    if not str(tokens.get("access_token") or ""):
+        return CredentialStatus("none", path=where, provider="codex")
+    return CredentialStatus(
+        "oauth-file",
+        _jwt_expiry_seconds(str(tokens.get("access_token"))),
+        where,
+        _codex_refresh_estimate(data.get("last_refresh")),
+        provider="codex",
+    )
+
+
+def read_codex_credential_status(path: Optional[Path] = None) -> CredentialStatus:
+    """Inspect the codex credential in force, without validating it upstream."""
+    # .strip() matters: the compose file always delivers the var, often as "".
+    if os.environ.get("OPENAI_API_KEY", "").strip():
+        # path=None is load-bearing: describe() keys env-vs-file off it.
+        return CredentialStatus("api-key", provider="codex")
+    return read_codex_file_credential(path)
+
+
+def log_codex_credential_status(where: str, path: Optional[Path] = None) -> CredentialStatus:
+    """Report the codex credential state at boot; mirror of log_credential_status.
+
+    One deliberate softening: under the recommended ChatGPT-login deployment
+    the API container intentionally holds no credential (the auth.json mount
+    ships commented out), so "none" here is a pointer, not a broken boot.
+    """
+    status = read_codex_credential_status(path)
+    if status.kind == "none":
+        log.warning(
+            "%s credentials: %s. CLI turns are unaffected if the agent container "
+            "holds a login; only function-calling (tools) requests need one here "
+            "— set OPENAI_API_KEY, or persist an API key to the codex-home "
+            "volume and uncomment its read-only mount. To bootstrap a ChatGPT "
+            "login: `codex login --device-auth` via the codex-refresher service "
+            "(README 'First-time login (Codex)').",
+            where,
+            status.describe(),
+        )
+    elif status.expired:
+        log.error(
+            "%s credentials: %s. Every turn will fail until this is replaced — "
+            "re-run the codex login bootstrap or set OPENAI_API_KEY.",
+            where,
+            status.describe(),
+        )
+    elif status.short_lived:
+        log.warning(
+            "%s credentials: %s. Codex renews this login when it runs with "
+            "working egress; the codex-refresher service covers idle stretches.",
+            where,
+            status.describe(),
+        )
+    else:
+        log.info("%s credentials: %s", where, status.describe())
+
+    # Same trap as the claude env token: an env key wins and codex then stops
+    # exercising (and refreshing) the file login, which decays in place.
+    if status.kind == "api-key" and status.path is None:
+        shadowed = read_codex_file_credential(path)
+        if shadowed.kind == "oauth-file":
+            log.warning(
+                "%s credentials: a ChatGPT login also exists (%s) but is "
+                "SHADOWED by OPENAI_API_KEY — codex will not refresh it while "
+                "that is set, so it decays until it needs a fresh login.",
+                where,
+                shadowed.describe(),
+            )
+    return status
+
+
+def log_agent_credential_status(where: str) -> CredentialStatus:
+    """Dispatch on SETTINGS.agent — the one call sites use from Step 4 on."""
+    if SETTINGS.agent == "codex":
+        return log_codex_credential_status("Codex" if where == "Claude" else where)
+    return log_credential_status(where)

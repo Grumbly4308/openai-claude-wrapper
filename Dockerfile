@@ -27,6 +27,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN npm install -g @anthropic-ai/claude-code@latest \
     && claude --version
+# Codex is opt-in at build time: claude-only deployments must not inherit a
+# second unpinned vendor (plus its install-script egress) in their image.
+# docker-compose.codex.yml sets INSTALL_CODEX=1 on its build blocks.
+# The ARG is declared HERE, after the claude-code layer: an ARG is part of
+# the environment of every subsequent RUN, so declaring it earlier made the
+# arg's value (0 vs 1) bust the claude-code layer cache — the two stacks then
+# each ran the unpinned @latest install and could ship different claude-code
+# versions from same-day builds.
+ARG INSTALL_CODEX=0
+RUN if [ "$INSTALL_CODEX" = "1" ]; then \
+      npm install -g @openai/codex@latest && codex --version; \
+    fi
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
@@ -54,7 +66,7 @@ RUN userdel -r node 2>/dev/null || true \
     && (getent group "${CLAUDE_GID}" >/dev/null || groupadd --gid "${CLAUDE_GID}" claude) \
     && useradd --create-home --shell /bin/bash \
         --uid "${CLAUDE_UID}" --gid "${CLAUDE_GID}" claude \
-    && mkdir -p /data/files /data/workspace /data/sessions /home/claude/.claude \
+    && mkdir -p /data/files /data/workspace /data/sessions /home/claude/.claude /home/claude/.codex \
     && chown -R "${CLAUDE_UID}:${CLAUDE_GID}" /app /data /home/claude
 
 USER claude
@@ -66,7 +78,12 @@ USER claude
 # the config to the container layer and lost it on exit, leaving the CLI to
 # report a missing config next to a backup that did persist. Pointing
 # CLAUDE_CONFIG_DIR at the mounted directory puts all of it on the volume.
+# CODEX_HOME plays the same role for codex builds (auth.json, config.toml and
+# the sqlite thread store land on the codex-home volume, not tmpfs — which
+# also silences codex's helper-binaries-under-temporary-dir warning). Set
+# unconditionally: without the binary it is inert.
 ENV CLAUDE_CONFIG_DIR=/home/claude/.claude \
+    CODEX_HOME=/home/claude/.codex \
     CLAUDE_WRAPPER_DATA=/data \
     CLAUDE_WRAPPER_WORKSPACE=/data/workspace \
     CLAUDE_WRAPPER_FILES=/data/files \

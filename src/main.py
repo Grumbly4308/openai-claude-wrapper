@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
+import httpx
 from fastapi import (
     Depends,
     FastAPI,
@@ -22,12 +23,14 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import download_tokens, tool_bridge
+from . import download_tokens, openai_bridge, tool_bridge
 from .capabilities import resolve_profile
 from .config import (
+    CODEX_EFFORT_CHOICES,
     SETTINGS,
     advertised_models,
-    log_credential_status,
+    log_agent_credential_status,
+    model_owner,
     split_model_effort,
     supported_models,
 )
@@ -177,10 +180,51 @@ async def _openai_error_handler(request: Request, exc: HTTPException) -> JSONRes
     )
 
 
+async def _verify_agent_identity() -> None:
+    """Best-effort boot handshake with the agent shim (sandboxed topology).
+
+    A wrapper=codex/shim=claude split (stale .env, CLAUDE_WRAPPER_AGENT_URL
+    pointing at the other stack, partially updated compose) would otherwise
+    surface as an opaque per-turn error. The shim's /healthz names its agent,
+    so a reachable-and-wrong shim refuses the boot loudly. Unreachable is only
+    a WARNING: compose depends_on does not guarantee readiness, and the
+    wrapper must not crash-loop while the agent container is still starting —
+    a shim that boots later with the wrong agent still fails per-turn.
+    """
+    try:
+        # trust_env=False for the same reason as RemoteAgentExecutor: the shim
+        # hop is internal and must never route through the egress proxy.
+        async with httpx.AsyncClient(trust_env=False) as client:
+            resp = await client.get(f"{SETTINGS.agent_url}/healthz", timeout=2.0)
+        body = resp.json() if resp.status_code == 200 else {}
+    except Exception as e:  # any failure here just means "not up yet"
+        log.warning("agent shim not reachable yet; agent identity unverified (%s)", e)
+        return
+    shim_agent = body.get("agent") if isinstance(body, dict) else None
+    if shim_agent is None:
+        log.warning(
+            "agent shim reports no agent identity — its image predates agent "
+            "reporting; rebuild it"
+        )
+    elif shim_agent != SETTINGS.agent:
+        raise RuntimeError(
+            f"agent mismatch: this wrapper is configured for "
+            f"CLAUDE_WRAPPER_AGENT={SETTINGS.agent!r} but the shim at "
+            f"{SETTINGS.agent_url} runs {shim_agent!r} — likely a stale .env, "
+            f"CLAUDE_WRAPPER_AGENT_URL pointing at the other stack, or a "
+            f"partially updated compose file; refusing to boot"
+        )
+
+
 @app.on_event("startup")
 async def _startup() -> None:
+    # Which CLI this deployment wraps — the single line to check when the
+    # advertised models or credential wording look like the other vendor's.
+    log.info("wrapped agent: %s (bin=%s)", SETTINGS.agent, SETTINGS.agent_bin)
+
     # Build the model list once on load by scanning the installed Claude Code
-    # binary (memoized thereafter). Logged so the resolved set is visible at boot.
+    # binary (memoized thereafter; a static list under codex). Logged so the
+    # resolved set is visible at boot.
     models = supported_models()
     log.info("model list ready: %d models — %s", len(models), ", ".join(models))
 
@@ -190,7 +234,7 @@ async def _startup() -> None:
     # pointing at the file on disk. Under the sandboxed topology the CLI runs in
     # the agent container, so this container's view is of a read-only mount; the
     # agent reports the same status for the copy it owns.
-    log_credential_status("Claude")
+    log_agent_credential_status("Claude")
 
     # Where turns execute: locally, or in the sandboxed agent container.
     if SETTINGS.agent_url:
@@ -199,8 +243,9 @@ async def _startup() -> None:
             "must be a volume shared with it at the same path)",
             SETTINGS.agent_url,
         )
+        await _verify_agent_identity()
     else:
-        log.info("agent execution: local subprocess (%s)", SETTINGS.claude_bin)
+        log.info("agent execution: local subprocess (%s)", SETTINGS.agent_bin)
 
     # Resolve every model's capability profile now so a bad profile file fails
     # the boot loudly instead of 500ing the first /v1/models call. Logged so
@@ -321,6 +366,7 @@ async def _startup() -> None:
 async def _shutdown() -> None:
     await PREPARER.aclose()
     await tool_bridge.aclose()
+    await openai_bridge.aclose()
     await RUNNER.aclose()
 
 
@@ -351,7 +397,7 @@ async def healthz() -> dict:
 
 def _model_info(model_id: str, now: int) -> ModelInfo:
     caps = sorted(c.value for c in resolve_profile(model_id))
-    return ModelInfo(id=model_id, created=now, capabilities=caps)
+    return ModelInfo(id=model_id, created=now, owned_by=model_owner(), capabilities=caps)
 
 
 @app.get("/v1/models", response_model=ModelList, dependencies=[Depends(auth_dependency)])
@@ -612,9 +658,16 @@ async def _tool_bridge_completion(req: ChatCompletionRequest):
 
     model = req.model if req.model and req.model != "auto" else SETTINGS.default_model
     run_model, effort = split_model_effort(model)
+    # The agent selector picks the bridge: same routing rule, same call shapes
+    # (openai_bridge mirrors tool_bridge's public surface on purpose).
+    bridge = openai_bridge if SETTINGS.agent == "codex" else tool_bridge
     # Effort is a Claude Code CLI concept; the direct Messages API call has no
     # equivalent, so it is reported as unapplied rather than silently claimed.
     effort_info = {"applied": "api-default", "source": "tool-bridge", "requested": effort}
+    if SETTINGS.agent == "codex" and effort in CODEX_EFFORT_CHOICES:
+        # Unlike Anthropic, the effort DOES apply here: the openai bridge maps
+        # an explicit suffix onto the reasoning_effort request parameter.
+        effort_info = {"applied": effort or "api-default", "source": "tool-bridge", "requested": effort}
 
     if req.stream:
         async def _record(in_tok: int, out_tok: int) -> None:
@@ -622,21 +675,21 @@ async def _tool_bridge_completion(req: ChatCompletionRequest):
                 await USAGE_LEDGER.record(session_key, in_tok + out_tok)
 
         return StreamingResponse(
-            tool_bridge.stream(
+            bridge.stream(
                 req, run_model, model, session_key, effort_info, on_usage=_record
             ),
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
         )
 
-    result = await tool_bridge.complete(req, run_model, session_key)
+    result = await bridge.complete(req, run_model, session_key)
     if USAGE_LEDGER.enabled:
         await USAGE_LEDGER.record(session_key, result.input_tokens + result.output_tokens)
 
     # Legacy `functions` clients read message.function_call (a single call)
     # and finish_reason "function_call" instead of the tool_calls shape.
     tool_calls, function_call, finish_reason = result.tool_calls, None, result.finish_reason
-    if req.functions is not None and tool_calls:
+    if req.legacy_functions_shape and tool_calls:
         if len(tool_calls) > 1:
             log.warning(
                 "dropping %d parallel call(s): legacy function_call responses carry one call",
@@ -689,7 +742,7 @@ async def _sync_response(
     )
 
     if result.error and not result.final_text:
-        raise HTTPException(status_code=502, detail=f"claude failed: {result.error}")
+        raise HTTPException(status_code=502, detail=f"{RUNNER.agent_label} failed: {result.error}")
 
     if USAGE_LEDGER.enabled:
         await USAGE_LEDGER.record(session_key, result.input_tokens + result.output_tokens)
@@ -1298,7 +1351,7 @@ async def _responses_sync(
         clarify=_resolve_clarify(rreq), workspace_hint=_resolve_workspace_hint(rreq),
     )
     if result.error and not result.final_text:
-        raise HTTPException(status_code=502, detail=f"claude failed: {result.error}")
+        raise HTTPException(status_code=502, detail=f"{RUNNER.agent_label} failed: {result.error}")
 
     if USAGE_LEDGER.enabled:
         await USAGE_LEDGER.record(session_key, result.input_tokens + result.output_tokens)

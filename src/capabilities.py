@@ -56,6 +56,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from . import config as _config
 from .config import _bool_env, split_model_effort
 
 log = logging.getLogger("claude_wrapper.capabilities")
@@ -253,7 +254,17 @@ def resolve_profile(model: str) -> frozenset[Capability]:
     if _config_cache is None:
         _config_cache = _load_config()
     caps = _resolve(base, _config_cache)
-    if Capability.TERMINAL in caps and not _bool_env(TERMINAL_TOGGLE_ENV, False):
+    if _config.SETTINGS.agent == "codex":
+        # Honesty over gating: the codex CLI has no per-tool switches — its
+        # command execution, web access and delegation are intrinsic and
+        # cannot be removed per-run (see codex_runner._build_argv), so a
+        # profile removal or the terminal env toggle would only falsify
+        # /v1/models while enforcement stayed nil. The CLI-shaped
+        # capabilities therefore always advertise as present under codex;
+        # profiles still govern the rest (notably client_tools, which the
+        # openai bridge really enforces).
+        caps = caps | frozenset(_CLI_TOOLS_BY_CAPABILITY)
+    elif Capability.TERMINAL in caps and not _bool_env(TERMINAL_TOGGLE_ENV, False):
         log.debug(
             "terminal capability masked for %s (%s not enabled)", base, TERMINAL_TOGGLE_ENV
         )

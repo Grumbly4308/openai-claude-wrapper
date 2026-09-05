@@ -34,6 +34,24 @@ mcp-proxy.anthropic.com
 # Homebrew's formula index — only needed if the agent installs via brew.
 # formulae.brew.sh
 
+# --- OpenAI Codex (CLAUDE_WRAPPER_AGENT=codex, docker-compose.codex.yml) ----
+# Uncomment when deploying the codex stack; leave commented (or delete) on
+# Claude deployments — every line is a destination data could leave through.
+# Squid is CONNECT-only, so the WebSocket transport codex tries first
+# (wss://api.openai.com) rides the same CONNECT:443 entry as HTTPS.
+#
+# Always needed under codex:
+#api.openai.com          # model API (API-key auth) + the tool-bridge passthrough
+#
+# ChatGPT-plan login ONLY — an API-key-only setup should leave these commented:
+#chatgpt.com             # ChatGPT-plan backend (backend-api/codex)
+#auth.openai.com         # OAuth token refresh
+# Deliberately absent: chat.openai.com (legacy host, not observed in use by
+# the shipped CLI — add it only if your login flow demonstrably fails without
+# it), ab.chatgpt.com (telemetry), api.github.com / raw.githubusercontent.com
+# (update check) — codex tolerates all of these being blocked, and the
+# wrapper disables the update probe via `-c check_for_update_on_startup=false`.
+
 # --- Source hosting ---------------------------------------------------------
 # .github.com covers github.com, api.github.com, codeload.github.com and
 # ssh.github.com (the SSH-over-443 endpoint used by deploy keys).

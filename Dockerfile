@@ -25,13 +25,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-ARG INSTALL_CODEX=0
-
 RUN npm install -g @anthropic-ai/claude-code@latest \
     && claude --version
 # Codex is opt-in at build time: claude-only deployments must not inherit a
 # second unpinned vendor (plus its install-script egress) in their image.
 # docker-compose.codex.yml sets INSTALL_CODEX=1 on its build blocks.
+# The ARG is declared HERE, after the claude-code layer: an ARG is part of
+# the environment of every subsequent RUN, so declaring it earlier made the
+# arg's value (0 vs 1) bust the claude-code layer cache — the two stacks then
+# each ran the unpinned @latest install and could ship different claude-code
+# versions from same-day builds.
+ARG INSTALL_CODEX=0
 RUN if [ "$INSTALL_CODEX" = "1" ]; then \
       npm install -g @openai/codex@latest && codex --version; \
     fi

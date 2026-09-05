@@ -916,11 +916,12 @@ def log_credential_status(where: str, path: Optional[Path] = None) -> Credential
 # Where `codex login` persists auth. The OpenAI tool-bridge passthrough reads
 # the same file (API-key mode only, and only when the operator has opted into
 # mounting it — see docker-compose.codex.yml), which is why it is configurable.
+# `or` pattern, not a .get default: the codex compose file delivers this var
+# as "" (the ${VAR:-} interpolation trap), which must fall through to the
+# CODEX_HOME default instead of becoming Path(".").
 CODEX_CREDENTIALS_FILE = Path(
-    os.environ.get(
-        "CLAUDE_WRAPPER_CODEX_CREDENTIALS_FILE",
-        str(Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json"),
-    )
+    os.environ.get("CLAUDE_WRAPPER_CODEX_CREDENTIALS_FILE", "").strip()
+    or str(Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "auth.json")
 )
 
 # Codex's refresh-token lifetime is not documented; ~28 days is the observed

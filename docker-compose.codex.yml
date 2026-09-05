@@ -111,8 +111,11 @@ services:
       HTTPS_PROXY: "http://squid:3128"
       http_proxy: "http://squid:3128"
       https_proxy: "http://squid:3128"
-      NO_PROXY: "codex-agent,squid,localhost,127.0.0.1"
-      no_proxy: "codex-agent,squid,localhost,127.0.0.1"
+      # SANDBOX_EXTRA_NO_PROXY is honored HERE too: the image-backend and KB
+      # comments below direct internal hosts at it, and this container makes
+      # some of those calls itself.
+      NO_PROXY: "codex-agent,squid,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
+      no_proxy: "codex-agent,squid,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
 
       # Everything below is identical to docker-compose.yml — the API surface
       # and its features are unchanged by the agent swap.
@@ -137,6 +140,10 @@ services:
       CLAUDE_WRAPPER_DEFAULT_MODEL: "${CODEX_WRAPPER_DEFAULT_MODEL:-}"
       # Comma list overriding the built-in codex model ids (no discovery scan).
       CLAUDE_WRAPPER_CODEX_MODELS: "${CLAUDE_WRAPPER_CODEX_MODELS:-}"
+      # Where the tool-bridge passthrough looks for a persisted API key
+      # (auth.json file mode — only meaningful with the codex-home mount
+      # below uncommented).
+      CLAUDE_WRAPPER_CODEX_CREDENTIALS_FILE: "${CLAUDE_WRAPPER_CODEX_CREDENTIALS_FILE:-}"
       CLAUDE_WRAPPER_EFFORT: "${CLAUDE_WRAPPER_EFFORT:-medium}"
       CLAUDE_WRAPPER_MAX_UPLOAD_BYTES: "${CLAUDE_WRAPPER_MAX_UPLOAD_BYTES:-2147483648}"
       CLAUDE_WRAPPER_REQUEST_TIMEOUT: "${CLAUDE_WRAPPER_REQUEST_TIMEOUT:-1800}"
@@ -273,6 +280,11 @@ services:
 
       # CLI credentials (only needed if you skip the ChatGPT login).
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      # The codex executable the runner spawns, and where boot-time credential
+      # checks look for auth.json. The CLI runs in THIS container, so the
+      # knobs live here — on the wrapper they would be inert.
+      CLAUDE_WRAPPER_CODEX_BIN: "${CLAUDE_WRAPPER_CODEX_BIN:-}"
+      CLAUDE_WRAPPER_CODEX_CREDENTIALS_FILE: "${CLAUDE_WRAPPER_CODEX_CREDENTIALS_FILE:-}"
       # Codex stderr tracing knob for debugging (RUST_LOG syntax).
       RUST_LOG: "${CODEX_RUST_LOG:-}"
 

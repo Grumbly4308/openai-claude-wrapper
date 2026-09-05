@@ -107,8 +107,11 @@ services:
       HTTPS_PROXY: "http://squid:3128"
       http_proxy: "http://squid:3128"
       https_proxy: "http://squid:3128"
-      NO_PROXY: "claude-agent,squid,localhost,127.0.0.1"
-      no_proxy: "claude-agent,squid,localhost,127.0.0.1"
+      # SANDBOX_EXTRA_NO_PROXY is honored HERE too: the image-backend and KB
+      # comments below direct internal hosts at it, and this container makes
+      # some of those calls itself.
+      NO_PROXY: "claude-agent,squid,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
+      no_proxy: "claude-agent,squid,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
 
       # Everything below is identical to docker-compose.yml — the API surface
       # and its features are unchanged by the sandbox.

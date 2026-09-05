@@ -1,8 +1,13 @@
-# The codex variant of the default stack (CLAUDE_WRAPPER_AGENT=codex). Run ONE
-# of the two files — the fixed container_names make that mutually exclusive on
-# purpose. Same sandboxed topology, four containers, one inbound door:
+# The codex variant of the default stack (CLAUDE_WRAPPER_AGENT=codex). Runs
+# SIDE BY SIDE with docker-compose.yml on the same machine: everything that
+# lands in a machine-global namespace is deconflicted — its own compose
+# project (`name:` below, which prefixes the networks and volumes), its own
+# container names, its own image tag (the INSTALL_CODEX build would otherwise
+# clobber the claude stack's image and vice versa), and its own published
+# port (CODEX_WRAPPER_PORT, default 8001, clear of the claude stack's 8000).
+# Same sandboxed topology, four containers, one inbound door:
 #
-#   [clients] ──> claude-wrapper (FastAPI — the ONLY published port)
+#   [clients] ──> codex-wrapper (FastAPI — the ONLY published port)
 #                     │
 #                     │  backend network (internal: no route to the outside)
 #                     ├──> codex-agent  (OpenAI Codex CLI behind src/agent_shim.py)
@@ -27,6 +32,9 @@
 # Works with docker compose and podman-compose:
 #   docker compose -f docker-compose.codex.yml up -d
 #   podman-compose -f docker-compose.codex.yml up -d
+# (If your podman-compose predates top-level `name:` support, add
+# `-p codex-wrapper` to every command — without it the project name falls
+# back to the directory and collides with the claude stack's networks.)
 #
 # Under ROOTLESS podman the same four caveats as docker-compose.yml apply
 # (restart policy at boot, squid's tmpfs mode, `user:` inside the namespace,
@@ -42,8 +50,14 @@
 # The alternative is API-key auth: set OPENAI_API_KEY in .env (which then
 # shadows any volume login — codex stops exercising and refreshing it).
 
+# Fixed project name so the networks and volumes never share a prefix with
+# the claude stack, which derives its project name from the directory — both
+# files live in one checkout, and without this the two stacks would read as
+# one compose project.
+name: codex-wrapper
+
 services:
-  claude-wrapper:
+  codex-wrapper:
     build:
       context: .
       dockerfile: Dockerfile
@@ -58,8 +72,8 @@ services:
     # docker-CLI (buildx) build tags docker.io/library/... — that split leaves
     # the stack recreating containers from a stale localhost-tagged image no
     # matter how often you rebuild. The qualified name is exact on both engines.
-    image: localhost/claude-wrapper:latest
-    container_name: claude-wrapper
+    image: localhost/codex-wrapper:latest
+    container_name: codex-wrapper
     restart: always
     user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
     security_opt:
@@ -71,9 +85,12 @@ services:
       - codex-agent
       - squid
     ports:
-      - "0.0.0.0:${CLAUDE_WRAPPER_PORT:-8000}:${CLAUDE_WRAPPER_PORT:-8000}"
+      - "0.0.0.0:${CODEX_WRAPPER_PORT:-8001}:${CODEX_WRAPPER_PORT:-8001}"
     environment:
-      CLAUDE_WRAPPER_PORT: "${CLAUDE_WRAPPER_PORT:-8000}"
+      # Fed from CODEX_WRAPPER_PORT, not CLAUDE_WRAPPER_PORT: one .env serves
+      # both stacks, and a shared variable would land two published ports on
+      # the same host port. The default keeps clear of the claude stack's 8000.
+      CLAUDE_WRAPPER_PORT: "${CODEX_WRAPPER_PORT:-8001}"
       CLAUDE_WRAPPER_HOST: "0.0.0.0"
 
       # Literal, not ${…}: a stale .env carrying CLAUDE_WRAPPER_AGENT=claude
@@ -175,11 +192,13 @@ services:
       CLAUDE_WRAPPER_IMAGE_BACKEND_MODEL: "${CLAUDE_WRAPPER_IMAGE_BACKEND_MODEL:-}"
     volumes:
       # File store, session registry, usage ledgers, batches — API-only state.
-      - claude-data:/data
+      # Its own volume (not the claude stack's claude-data): the two wrappers
+      # can run concurrently, and a shared registry/file store would race.
+      - codex-data:/data
       # Per-session workspaces, shared with the agent AT THE SAME PATH: the
       # wrapper materializes uploads and collects generated files here; the
       # CLI runs here.
-      - claude-workspace:/data/workspace
+      - codex-workspace:/data/workspace
       # Uncomment ONLY if you persist an API key to the volume via
       # `codex login --with-api-key` — the tool-bridge passthrough then reads
       # auth.json here. Left off by default on purpose: for a ChatGPT-plan
@@ -196,7 +215,7 @@ services:
       - frontend
       - backend
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CLAUDE_WRAPPER_PORT:-8000}/healthz"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CODEX_WRAPPER_PORT:-8001}/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -204,10 +223,10 @@ services:
 
   codex-agent:
     # Same image as the API container. It declares the build explicitly rather
-    # than relying on claude-wrapper having been built first: this service is
-    # started BEFORE claude-wrapper (depends_on, above), and podman-compose only
+    # than relying on codex-wrapper having been built first: this service is
+    # started BEFORE codex-wrapper (depends_on, above), and podman-compose only
     # builds services that carry a build section — without one, a first `up` on
-    # a clean machine tries to resolve localhost/claude-wrapper:latest as a registry pull.
+    # a clean machine tries to resolve localhost/codex-wrapper:latest as a registry pull.
     # Both services tag the same image, so the second build is a cache hit.
     build:
       context: .
@@ -216,7 +235,7 @@ services:
         CLAUDE_UID: "${CLAUDE_UID:-1000}"
         CLAUDE_GID: "${CLAUDE_GID:-1000}"
         INSTALL_CODEX: "1"
-    image: localhost/claude-wrapper:latest
+    image: localhost/codex-wrapper:latest
     container_name: codex-agent
     restart: always
     user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
@@ -262,15 +281,15 @@ services:
       HTTPS_PROXY: "http://squid:3128"
       http_proxy: "http://squid:3128"
       https_proxy: "http://squid:3128"
-      NO_PROXY: "claude-wrapper,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
-      no_proxy: "claude-wrapper,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
+      NO_PROXY: "codex-wrapper,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
+      no_proxy: "codex-wrapper,localhost,127.0.0.1,${SANDBOX_EXTRA_NO_PROXY:-}"
 
       # The KB curl calls execute here.
       OPENWEBUI_BASE_URL: "${OPENWEBUI_BASE_URL:-}"
       OPENWEBUI_API_KEY: "${OPENWEBUI_API_KEY:-}"
       OPENWEBUI_DEFAULT_COLLECTION: "${OPENWEBUI_DEFAULT_COLLECTION:-}"
     volumes:
-      - claude-workspace:/data/workspace
+      - codex-workspace:/data/workspace
       # Codex's own state and credentials live HERE (writable): auth.json,
       # config.toml and the sqlite thread store. Do NOT try to log in via this
       # service — no device-code flow completes behind the proxy. Bootstrap
@@ -312,7 +331,7 @@ services:
         CLAUDE_UID: "${CLAUDE_UID:-1000}"
         CLAUDE_GID: "${CLAUDE_GID:-1000}"
         INSTALL_CODEX: "1"
-    image: localhost/claude-wrapper:latest
+    image: localhost/codex-wrapper:latest
     container_name: codex-refresher
     restart: always
     user: "${CLAUDE_UID:-1000}:${CLAUDE_GID:-1000}"
@@ -344,7 +363,7 @@ services:
 
   squid:
     image: docker.io/ubuntu/squid:latest
-    container_name: claude-squid
+    container_name: codex-squid
     restart: always
     # Unprivileged from the first instruction: squid never runs as root, so it
     # cannot write /var/run/squid.pid — squid.conf points the pid file at
@@ -381,6 +400,6 @@ networks:
   egress: {}
 
 volumes:
-  claude-data:
-  claude-workspace:
+  codex-data:
+  codex-workspace:
   codex-home:

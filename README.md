@@ -80,7 +80,10 @@ advertised on `/v1/models`:
 - **`docker-compose.codex.yml`** — the Codex stack: same topology, same
   security guarantees, with `codex-agent` and `codex-refresher` in place of
   their Claude counterparts and `CLAUDE_WRAPPER_AGENT: "codex"` pinned on its
-  app services. See [Quick start (Codex)](#quick-start-codex).
+  app services. Everything machine-global lives in its own `codex-*`
+  namespace — compose project, container names, image tag, volumes, and the
+  published port (`CODEX_WRAPPER_PORT`, default `8001`) — so both stacks run
+  side by side on one machine. See [Quick start (Codex)](#quick-start-codex).
 
 The env var is pinned as a literal in each compose file on purpose — a stale
 `.env` must not be able to half-select agents across containers. As a knob it
@@ -421,9 +424,9 @@ podman rm -f claude-wrapper claude-agent claude-squid 2>/dev/null
 podman pod ls && podman pod rm -f <pod-name>
 ```
 
-(On the codex stack the names are `claude-wrapper codex-agent codex-refresher
-claude-squid` — the wrapper and squid names are shared between the two files
-on purpose, so only one stack can run at a time.)
+(On the codex stack the names are `codex-wrapper codex-agent codex-refresher
+codex-squid` — no name is shared with the claude stack, so the two can run
+side by side.)
 
 ---
 
@@ -440,7 +443,10 @@ the credential flow differ. Background:
 ### 1. Configure
 
 Follow [1. Configure](#1-configure) from the Docker quick start unchanged —
-same `.env`, same `CLAUDE_UID`/`CLAUDE_GID` warning. Then open
+same `.env`, same `CLAUDE_UID`/`CLAUDE_GID` warning. One codex-specific knob:
+the stack publishes on `CODEX_WRAPPER_PORT` (default `8001`), not
+`CLAUDE_WRAPPER_PORT` — separate variables so both stacks can share the
+`.env` and the machine. Then open
 `sandbox/allowlist.txt` and uncomment `api.openai.com` in the OpenAI Codex
 block. It ships commented out — the default Claude deployment should not
 carry OpenAI egress — and it is split by auth mode: if you will use a
@@ -453,12 +459,14 @@ ChatGPT-plan login rather than an API key, uncomment `chatgpt.com` and
 docker compose -f docker-compose.codex.yml build
 ```
 
-Same Dockerfile, same `localhost/claude-wrapper:latest` name — the codex
+Same Dockerfile, its own `localhost/codex-wrapper:latest` tag — the codex
 compose file sets the `INSTALL_CODEX=1` build arg, which adds
 `@openai/codex@latest` to the image. Like the Claude CLI it is unpinned, so
-two builds a week apart can ship different codex versions. A Claude-built
-image contains no codex binary at all, so switching an existing checkout to
-this stack needs `--build`.
+two builds a week apart can ship different codex versions. The tag is
+separate from the claude stack's `localhost/claude-wrapper:latest` on
+purpose: the two builds differ (a Claude-built image contains no codex
+binary at all), and a shared tag would let each stack's build silently
+clobber the other's image.
 
 ### 3. Initialize Codex credentials (one time)
 
@@ -503,11 +511,11 @@ docker compose -f docker-compose.codex.yml up -d
 Confirm:
 
 ```bash
-curl -fsS http://localhost:8000/healthz     # {"status":"ok"}
+curl -fsS http://localhost:8001/healthz     # {"status":"ok"}
 docker compose -f docker-compose.codex.yml ps
-                         # claude-wrapper, codex-agent, codex-refresher,
-                         # claude-squid — all Up
-docker compose -f docker-compose.codex.yml logs -f claude-wrapper
+                         # codex-wrapper, codex-agent, codex-refresher,
+                         # codex-squid — all Up
+docker compose -f docker-compose.codex.yml logs -f codex-wrapper
 ```
 
 Then verify the sandbox is fencing egress, exactly as in the
@@ -692,6 +700,7 @@ this table is the code-level truth. Booleans are false only for
 | --- | --- | --- |
 | `CLAUDE_UID` / `CLAUDE_GID` | Build arg + runtime uid/gid. | `1000` |
 | `CLAUDE_WRAPPER_PORT` | uvicorn port, published host port, healthcheck. | `8000` |
+| `CODEX_WRAPPER_PORT` | Same, for the codex stack (`docker-compose.codex.yml` feeds it into `CLAUDE_WRAPPER_PORT`). A separate variable so one `.env` can run both stacks side by side without a host-port collision. | `8001` |
 | `CLAUDE_WRAPPER_HOST` | uvicorn bind address. | `0.0.0.0` |
 | `CLAUDE_WRAPPER_WORKERS` | `uvicorn --workers`. **Leave at 1** — see [Concurrency](#concurrency). | `1` |
 | `CLAUDE_INBOX_DIR` | Host drop folder → `/data/inbox` (read-only). | `./inbox` |
@@ -1918,15 +1927,19 @@ read-only.
 `claude-home` mounted **read-only** on the API container and writable on the
 agent, and the inbox mounted on the agent rather than the API.
 
-`docker-compose.codex.yml` swaps `claude-home` for **`codex-home`** →
-`/home/claude/.codex` — `auth.json`, `config.toml` and the sqlite thread
-store — writable on `codex-agent` and `codex-refresher`, and mounted
-read-only on the API container **only when opted in** (the API-key file mode;
-the mount ships commented out — see [Codex → OpenAI](#codex--openai)).
+`docker-compose.codex.yml` keeps volumes of its own — `codex-data`,
+`codex-workspace`, and `codex-home` → `/home/claude/.codex` (`auth.json`,
+`config.toml` and the sqlite thread store — writable on `codex-agent` and
+`codex-refresher`, and mounted read-only on the API container **only when
+opted in**: the API-key file mode; the mount ships commented out — see
+[Codex → OpenAI](#codex--openai)). Nothing is shared with the claude stack:
+the two run concurrently, and a shared file store or registry would race.
 
-Session-registry entries under `claude-data` are tagged with the agent that
-wrote them, so switching stacks starts fresh sessions instead of
-cross-resuming: the other agent's entries are ignored, not deleted, and
+Session-registry entries are still tagged with the agent that wrote them, so
+a volume that does serve both agents over time — the
+[single-container layout](#single-container-layout-sunset), where
+`CLAUDE_WRAPPER_AGENT` alone flips the agent — starts fresh sessions instead
+of cross-resuming: the other agent's entries are ignored, not deleted, and
 switching back finds them again.
 
 The containers run unprivileged as `CLAUDE_UID:CLAUDE_GID` with `cap_drop: ALL`

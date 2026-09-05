@@ -248,6 +248,29 @@ def test_dead_first_turn_forgets_the_placeholder(tmp_path):
     assert not runner.registry.has(key)
 
 
+# ---------- RUST_LOG stderr confinement ----------
+
+
+def test_stderr_withheld_from_client_error_when_rust_log_active(tmp_path, monkeypatch):
+    # With RUST_LOG tracing on, codex stderr can carry request URLs/headers;
+    # the 502 detail clients see must not include it. Without the knob the
+    # terse failure hint stays in the error string as always.
+    script = tmp_path / "fake-codex-err"
+    script.write_text('#!/bin/sh\ncat > /dev/null\necho "secret-trace-line" >&2\nexit 1\n')
+    script.chmod(0o755)
+    runner = _runner("rustlog", bin_path=str(script))
+
+    monkeypatch.setenv("RUST_LOG", "debug")
+    result = asyncio.run(runner.run_collect(prompt="hi", session_key="rl-1", model="gpt-5.2"))
+    assert result.error is not None and result.error.startswith("codex exited 1")
+    assert "secret-trace-line" not in result.error
+    assert "withheld" in result.error
+
+    monkeypatch.delenv("RUST_LOG")
+    result = asyncio.run(runner.run_collect(prompt="hi", session_key="rl-2", model="gpt-5.2"))
+    assert result.error is not None and "secret-trace-line" in result.error
+
+
 # ---------- tolerance ----------
 
 

@@ -414,6 +414,13 @@ class BaseAgentRunner:
     def _stderr_indicates_dead_session(self, stderr_lc: str) -> bool:
         return False
 
+    def _stderr_for_client(self, stderr: str) -> str:
+        """The stderr tail embedded in client-facing error strings (the
+        ``<agent> exited N: …`` detail main returns as a 502). Overridable so
+        an agent whose stderr can carry sensitive tracing withholds it —
+        self-heal detection is unaffected, it reads the full stderr."""
+        return stderr[-500:] if stderr else ""
+
     # ---- shared machinery ----
 
     async def aclose(self) -> None:
@@ -578,7 +585,7 @@ class BaseAgentRunner:
             if returncode != 0 and turn.errored is None:
                 turn.errored = (
                     f"{self.agent_label} exited {returncode}: "
-                    f"{stderr_output[-500:] if stderr_output else ''}"
+                    f"{self._stderr_for_client(stderr_output)}"
                 )
             errored = turn.errored
             # Self-heal a broken resume. If a --resume turn fails — a non-zero

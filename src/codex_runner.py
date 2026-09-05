@@ -18,6 +18,7 @@ delegation layer works unchanged. Differences from the Claude dialect:
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -227,3 +228,18 @@ class CodexRunner(BaseAgentRunner):
             or "no such" in stderr_lc
             or "does not exist" in stderr_lc
         )
+
+    def _stderr_for_client(self, stderr: str) -> str:
+        # With CODEX_RUST_LOG active, codex's Rust tracing lands on stderr —
+        # at debug/trace that includes request URLs and headers, which must
+        # not ride a 502 detail out to API tenants. The tail goes to the
+        # server log instead; without the knob, stderr is the usual terse
+        # failure hint and stays in the error string.
+        if os.environ.get("RUST_LOG", "").strip():
+            if stderr:
+                log.error(
+                    "codex stderr withheld from client error (RUST_LOG active): %s",
+                    stderr[-2000:],
+                )
+            return "[stderr withheld: RUST_LOG active — see the agent container log]"
+        return super()._stderr_for_client(stderr)

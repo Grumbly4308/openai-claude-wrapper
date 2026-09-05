@@ -131,6 +131,16 @@ def _codex_file_has_chatgpt_login() -> bool:
     return bool(isinstance(tokens, dict) and tokens.get("access_token"))
 
 
+def has_platform_credential() -> bool:
+    """Whether a Platform API key resolves — the `auto` tool-mode predicate.
+
+    Deliberately the same lookup resolve_auth() performs, minus the raising:
+    routing must not send a request down the bridge only for it to 502 on the
+    credential it just failed to find.
+    """
+    return bool(os.environ.get("OPENAI_API_KEY", "").strip() or _codex_file_api_key())
+
+
 def resolve_auth() -> dict[str, str]:
     """Bearer header for api.openai.com. Precedence:
 

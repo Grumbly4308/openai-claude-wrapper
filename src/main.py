@@ -23,12 +23,13 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import download_tokens, openai_bridge, tool_bridge
+from . import codex_cli_tools, download_tokens, openai_bridge, tool_bridge
 from .capabilities import resolve_profile
 from .config import (
     CODEX_EFFORT_CHOICES,
     SETTINGS,
     advertised_models,
+    codex_tool_mode,
     log_agent_credential_status,
     model_owner,
     split_model_effort,
@@ -235,6 +236,24 @@ async def _startup() -> None:
     # the agent container, so this container's view is of a read-only mount; the
     # agent reports the same status for the copy it owns.
     log_agent_credential_status("Claude")
+
+    # Which path will serve client-declared tools. Reported at boot because
+    # the two fail in different ways and the answer depends on a credential
+    # probe no operator can see from the config alone. codex_tool_mode()
+    # raises on a typo, failing closed like the agent selector.
+    if SETTINGS.agent == "codex":
+        mode = codex_tool_mode()
+        if _codex_cli_tools_selected():
+            log.info(
+                "client-declared tools: codex CLI loop (mode=%s%s) — prompt-declared "
+                "function calling, no OpenAI Platform key needed",
+                mode,
+                "" if mode == "cli" else "; no Platform credential found",
+            )
+        else:
+            log.info(
+                "client-declared tools: OpenAI Platform passthrough (mode=%s)", mode
+            )
 
     # Where turns execute: locally, or in the sandboxed agent container.
     if SETTINGS.agent_url:
@@ -572,6 +591,21 @@ async def _prepare_run(req: ChatCompletionRequest):
     return prompt, session_key, model
 
 
+def _codex_cli_tools_selected() -> bool:
+    """Whether client-declared tools are served by the CLI loop this request.
+
+    `auto` prefers native function calling and falls back to the CLI loop when
+    no Platform credential resolves — so a ChatGPT-plan deployment gets working
+    tools instead of a 502 telling it to buy Platform access.
+    """
+    if SETTINGS.agent != "codex":
+        return False
+    mode = codex_tool_mode()
+    return mode == "cli" or (
+        mode == "auto" and not openai_bridge.has_platform_credential()
+    )
+
+
 def _log_request(kind: str, req: Any) -> None:
     """One compact line per generation request.
 
@@ -603,7 +637,15 @@ def _log_request(kind: str, req: Any) -> None:
 async def run_chat_completion(req: ChatCompletionRequest):
     """Shared implementation reused by /v1/chat/completions, /v1/completions,
     and the batches worker."""
-    _log_request("chat/completions" + (" [tool-bridge]" if req.tools else ""), req)
+    # Which tool path served the turn is the first thing to know when a tools
+    # request misbehaves — the CLI loop and the passthrough fail in entirely
+    # different ways.
+    tool_path = ""
+    if req.tools:
+        tool_path = (
+            " [codex-cli-tools]" if _codex_cli_tools_selected() else " [tool-bridge]"
+        )
+    _log_request("chat/completions" + tool_path, req)
     # Function calling: the CLIENT owns the agent loop, so the request is served
     # by the tool bridge (a direct Messages API call) and stops at the tool_call.
     # The bridge has no Claude Code CLI, hence no session workspace and no
@@ -659,12 +701,24 @@ async def _tool_bridge_completion(req: ChatCompletionRequest):
     model = req.model if req.model and req.model != "auto" else SETTINGS.default_model
     run_model, effort = split_model_effort(model)
     # The agent selector picks the bridge: same routing rule, same call shapes
-    # (openai_bridge mirrors tool_bridge's public surface on purpose).
-    bridge = openai_bridge if SETTINGS.agent == "codex" else tool_bridge
+    # (every tool module mirrors tool_bridge's public surface on purpose).
+    cli_tools = _codex_cli_tools_selected()
+    if SETTINGS.agent == "codex":
+        bridge = codex_cli_tools if cli_tools else openai_bridge
+    else:
+        bridge = tool_bridge
     # Effort is a Claude Code CLI concept; the direct Messages API call has no
     # equivalent, so it is reported as unapplied rather than silently claimed.
     effort_info = {"applied": "api-default", "source": "tool-bridge", "requested": effort}
-    if SETTINGS.agent == "codex" and effort in CODEX_EFFORT_CHOICES:
+    if SETTINGS.agent == "codex" and cli_tools:
+        # The CLI loop is a real codex turn, so effort applies exactly as it
+        # does on the chat path.
+        effort_info = {
+            "applied": effort or SETTINGS.effort or "cli-default",
+            "source": "codex-cli-tools",
+            "requested": effort,
+        }
+    elif SETTINGS.agent == "codex" and effort in CODEX_EFFORT_CHOICES:
         # Unlike Anthropic, the effort DOES apply here: the openai bridge maps
         # an explicit suffix onto the reasoning_effort request parameter.
         effort_info = {"applied": effort or "api-default", "source": "tool-bridge", "requested": effort}

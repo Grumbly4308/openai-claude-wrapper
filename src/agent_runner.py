@@ -414,6 +414,15 @@ class BaseAgentRunner:
     def _stderr_indicates_dead_session(self, stderr_lc: str) -> bool:
         return False
 
+    def _stderr_indicates_busy_session(self, stderr_lc: str) -> bool:
+        """True when a resume failed because the session is IN USE, not dead.
+
+        Self-heal must not fire here: dropping the mapping would abandon a
+        perfectly good session (and, for CLI-assigned ids, orphan the thread)
+        because a concurrent or wedged turn happened to hold it. The next
+        attempt should re-resume the SAME id."""
+        return False
+
     def _stderr_for_client(self, stderr: str) -> str:
         """The stderr tail embedded in client-facing error strings (the
         ``<agent> exited N: …`` detail main returns as a 502). Overridable so
@@ -609,15 +618,32 @@ class BaseAgentRunner:
             # first turn that dies before announcing its id leaves the
             # registry holding a wrapper-minted placeholder that can never be
             # resumed, so it must be forgotten now, not one failed turn later.
+            #
+            # busy_session vetoes all of it: "the session is in use" is not
+            # "the session is broken". A turn still running (a wedged
+            # predecessor holding the CLI's writer lock, or genuine
+            # concurrency on one conversation) makes resume fail while the
+            # session stays perfectly good — forgetting the mapping there
+            # abandons a live session and orphans its thread.
             stderr_lc = (stderr_output or "").lower()
             dead_session = self._stderr_indicates_dead_session(stderr_lc)
+            busy_session = self._stderr_indicates_busy_session(stderr_lc)
             resume_unusable = bool(errored) and not final_text_parts
             placeholder_unbound = (
                 not self.wrapper_assigns_session_id
                 and created
                 and turn.observed_session_uuid is None
             )
-            if (not created and (dead_session or resume_unusable)) or (
+            if busy_session:
+                log.warning(
+                    "session %s uuid %s is busy (returncode=%s error=%r); keeping the "
+                    "mapping — retry once the in-flight turn finishes",
+                    session_key,
+                    session_uuid,
+                    returncode,
+                    errored,
+                )
+            elif (not created and (dead_session or resume_unusable)) or (
                 placeholder_unbound and bool(errored)
             ):
                 log.warning(

@@ -229,6 +229,16 @@ class CodexRunner(BaseAgentRunner):
             or "does not exist" in stderr_lc
         )
 
+    def _stderr_indicates_busy_session(self, stderr_lc: str) -> bool:
+        # Observed live: `thread/resume failed: thread <id> already has an
+        # active writer (code -32600)`. Codex takes a writer lock on the
+        # thread store for the duration of a turn, so a previous turn that is
+        # still running — notably one wedged in codex's own "Reconnecting…"
+        # loop after an egress failure — makes the next resume fail while the
+        # thread itself is fine. Forgetting the mapping here would strand
+        # that thread and start a blank one.
+        return "active writer" in stderr_lc or "already has an active" in stderr_lc
+
     def _stderr_for_client(self, stderr: str) -> str:
         # With CODEX_RUST_LOG active, codex's Rust tracing lands on stderr —
         # at debug/trace that includes request URLs and headers, which must

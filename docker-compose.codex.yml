@@ -194,6 +194,12 @@ services:
       # and cannot be toggled off; kept only so a stale .env carrying the
       # claude knob is visible in `docker inspect` rather than surprising.
       CLAUDE_WRAPPER_EXPOSE_TERMINAL: "${CLAUDE_WRAPPER_EXPOSE_TERMINAL:-}"
+      # Codex's own web_search tool (default off). Set on BOTH app services:
+      # the agent passes the -c override to the CLI, and THIS container
+      # decides whether /v1/models may advertise the web_search capability —
+      # letting them disagree would advertise a tool the CLI never gets.
+      # Runs on the agent path, so it needs no OpenAI Platform key.
+      CLAUDE_WRAPPER_CODEX_WEB_SEARCH: "${CLAUDE_WRAPPER_CODEX_WEB_SEARCH:-}"
       # Bridge server-side web search injection (default off). Executes on
       # Anthropic's infrastructure via api.anthropic.com — already on the
       # allowlist; no extra egress needed.
@@ -277,6 +283,9 @@ services:
       CLAUDE_WRAPPER_CLARIFY: "${CLAUDE_WRAPPER_CLARIFY:-on}"
       CLAUDE_WRAPPER_CLARIFY_PROMPT: "${CLAUDE_WRAPPER_CLARIFY_PROMPT:-}"
       CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS: "${CLAUDE_WRAPPER_CLARIFY_DISALLOWED_TOOLS:-}"
+      # Codex's own web_search tool — the CLI is spawned HERE, so the flag
+      # must be here; the wrapper carries the same value for advertisement.
+      CLAUDE_WRAPPER_CODEX_WEB_SEARCH: "${CLAUDE_WRAPPER_CODEX_WEB_SEARCH:-}"
 
       # CLI credentials (only needed if you skip the ChatGPT login).
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"

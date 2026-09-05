@@ -111,10 +111,18 @@ def test_codex_advertises_intrinsic_cli_capabilities(monkeypatch):
     try:
         caps = resolve_profile("gpt-5.2")
         assert Capability.TERMINAL in caps
-        assert Capability.WEB_SEARCH in caps
         assert Capability.SUB_AGENTS in caps
         assert Capability.CLIENT_TOOLS not in caps
+        # web_search is the exception: codex's search is opt-in, so while the
+        # knob is off the capability must NOT be advertised — the same
+        # advertise-only-what-is-real rule, cutting the other way.
+        assert Capability.WEB_SEARCH not in caps
+
+        os.environ["CLAUDE_WRAPPER_CODEX_WEB_SEARCH"] = "true"
+        reset_profile_cache()
+        assert Capability.WEB_SEARCH in resolve_profile("gpt-5.2")
     finally:
+        os.environ.pop("CLAUDE_WRAPPER_CODEX_WEB_SEARCH", None)
         _reset()
 
 

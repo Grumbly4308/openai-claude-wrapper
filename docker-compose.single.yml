@@ -156,6 +156,9 @@ services:
       # Lets the tool bridge inject Anthropic server-side web search for
       # web_search-profiled models (a new billing surface, hence its own gate).
       CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH: "${CLAUDE_WRAPPER_BRIDGE_WEB_SEARCH:-}"
+      # Codex's own web_search tool (only meaningful with AGENT=codex): the
+      # agent path's search, needing no OpenAI Platform key.
+      CLAUDE_WRAPPER_CODEX_WEB_SEARCH: "${CLAUDE_WRAPPER_CODEX_WEB_SEARCH:-}"
       CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS: "${CLAUDE_WRAPPER_BRIDGE_MAX_TOOL_ROUNDS:-8}"
       # Optional OpenAI-compatible image backend for /v1/images/generations.
       CLAUDE_WRAPPER_IMAGE_BACKEND_URL: "${CLAUDE_WRAPPER_IMAGE_BACKEND_URL:-}"

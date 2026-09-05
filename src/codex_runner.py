@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from .agent_runner import BaseAgentRunner, SessionRegistry, StreamEvent, TurnState
-from .config import CODEX_EFFORT_CHOICES
+from .config import CODEX_EFFORT_CHOICES, CODEX_WEB_SEARCH_ENV, _bool_env
 
 log = logging.getLogger("claude_wrapper.runner")
 
@@ -103,6 +103,13 @@ class CodexRunner(BaseAgentRunner):
             "--dangerously-bypass-approvals-and-sandbox",
             "-c", "check_for_update_on_startup=false",  # no update probe through squid
         ]
+        if _bool_env(CODEX_WEB_SEARCH_ENV, False):
+            # Codex's own web_search tool, off by default in the CLI. Enabling
+            # it is what makes "search the web" work on the AGENT path — no
+            # Platform API key involved, unlike client-declared tools which
+            # leave for the bridge. Its result items already normalize into
+            # tool_use/tool_result frames (_handle_event below).
+            argv += ["-c", "tools.web_search=true"]
         if model:
             argv += ["--model", model]
         eff, _src = self._resolve_effort(model, effort)
@@ -228,6 +235,16 @@ class CodexRunner(BaseAgentRunner):
             or "no such" in stderr_lc
             or "does not exist" in stderr_lc
         )
+
+    def _stderr_indicates_busy_session(self, stderr_lc: str) -> bool:
+        # Observed live: `thread/resume failed: thread <id> already has an
+        # active writer (code -32600)`. Codex takes a writer lock on the
+        # thread store for the duration of a turn, so a previous turn that is
+        # still running — notably one wedged in codex's own "Reconnecting…"
+        # loop after an egress failure — makes the next resume fail while the
+        # thread itself is fine. Forgetting the mapping here would strand
+        # that thread and start a blank one.
+        return "active writer" in stderr_lc or "already has an active" in stderr_lc
 
     def _stderr_for_client(self, stderr: str) -> str:
         # With CODEX_RUST_LOG active, codex's Rust tracing lands on stderr —

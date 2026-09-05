@@ -132,6 +132,19 @@ def test_claude_only_efforts_are_dropped():
         assert not any("model_reasoning_effort" in a for a in argv), eff
 
 
+def test_web_search_override_is_opt_in(monkeypatch):
+    # Codex's own web_search is off in the CLI by default; the knob is what
+    # makes "search the web" work on the agent path (no Platform key).
+    runner = _runner("argv-search")
+    argv = runner._build_argv(session_uuid="u", model="gpt-5.2", resume=False)
+    assert not any("web_search" in a for a in argv)
+
+    monkeypatch.setenv("CLAUDE_WRAPPER_CODEX_WEB_SEARCH", "true")
+    argv = runner._build_argv(session_uuid="u", model="gpt-5.2", resume=False)
+    assert argv.index("tools.web_search=true") == argv.index("-c", argv.index("-c") + 1) + 1
+    assert argv[-1] == "-"
+
+
 def test_capability_gating_adds_nothing():
     runner = _runner("argv-gate")
     gated = runner._build_argv(
@@ -246,6 +259,37 @@ def test_dead_first_turn_forgets_the_placeholder(tmp_path):
     assert result.error is not None
     assert result.error.startswith("codex exited 1")
     assert not runner.registry.has(key)
+
+
+# ---------- busy session (writer lock) ----------
+
+
+def test_active_writer_keeps_the_mapping(tmp_path):
+    # Observed live: a turn wedged in codex's reconnect loop keeps the thread's
+    # writer lock, so the next resume fails with "already has an active
+    # writer". The thread is fine — self-heal must NOT drop the mapping, or
+    # the live thread is orphaned and the conversation restarts blank.
+    script = tmp_path / "fake-codex-busy"
+    script.write_text(
+        "#!/bin/sh\ncat > /dev/null\n"
+        'echo "Error: thread/resume: thread/resume failed: thread %s already '
+        'has an active writer (code -32600)" >&2\nexit 1\n' % THREAD_ID
+    )
+    script.chmod(0o755)
+    runner = _runner("busy", bin_path=str(script))
+    key = "conv-busy"
+    reg = runner.registry
+
+    async def _go():
+        await reg.bind_uuid(key, THREAD_ID)
+        return await runner.run_collect(prompt="hi", session_key=key, model="gpt-5.2")
+
+    result = asyncio.run(_go())
+    assert result.error is not None and "active writer" in result.error
+    # The binding survives, pointing at the same thread.
+    assert reg.has(key)
+    entry = json.loads((Path(_TMP) / "sessions-busy" / f"{key}.json").read_text())
+    assert entry["uuid"] == THREAD_ID
 
 
 # ---------- RUST_LOG stderr confinement ----------

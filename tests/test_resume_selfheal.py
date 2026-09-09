@@ -131,6 +131,32 @@ async def _drain_resume(
         claude_runner.asyncio.create_subprocess_exec = orig
 
 
+def test_fresh_failure_reports_details_and_drops_mapping() -> None:
+    async def run() -> None:
+        for tag, lines, expected in [
+            ("plain", [b"Login expired. Please log in again.\n"], "Login expired"),
+            ("errors", [b'{"type":"result","subtype":"error_during_execution","errors":["Authentication failed"]}\n'], "Authentication failed"),
+            ("is-error", [b'{"type":"result","subtype":"success","is_error":true,"result":"Model unavailable"}\n'], "Model unavailable"),
+            ("empty", [], "no error details from CLI"),
+        ]:
+            runner = _runner("fresh-" + tag)
+            fake = _FakeProc(lines, returncode=1)
+
+            async def _fake_exec(*_args, **_kwargs):
+                return fake
+
+            orig = claude_runner.asyncio.create_subprocess_exec
+            claude_runner.asyncio.create_subprocess_exec = _fake_exec
+            try:
+                result = await runner.run_collect(prompt="hi", session_key=tag)
+            finally:
+                claude_runner.asyncio.create_subprocess_exec = orig
+            check(tag + ".details", expected in (result.error or ""), str(result.error))
+            check(tag + ".mapping_dropped", not runner.registry.has(tag))
+
+    asyncio.run(run())
+
+
 def test_dead_resume_drops_mapping() -> None:
     """A resume that errors with no assistant text drops the mapping."""
     runner = _runner("dead")
@@ -194,6 +220,7 @@ def test_partial_mode_delta_output_keeps_mapping() -> None:
 
 
 if __name__ == "__main__":
+    test_fresh_failure_reports_details_and_drops_mapping()
     test_dead_resume_drops_mapping()
     test_nonzero_resume_no_output_drops_mapping()
     test_healthy_resume_keeps_mapping()

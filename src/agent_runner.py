@@ -430,6 +430,9 @@ class BaseAgentRunner:
         self-heal detection is unaffected, it reads the full stderr."""
         return stderr[-500:] if stderr else ""
 
+    def _stdout_for_client(self, stdout: str) -> str:
+        return ""
+
     # ---- shared machinery ----
 
     async def aclose(self) -> None:
@@ -550,6 +553,7 @@ class BaseAgentRunner:
             final_text_parts: list[str] = []
             turn = TurnState()
             exit_info: Optional[ExecExit] = None
+            stdout_tail = ""
 
             # The executor owns the process (or the shim connection): it kills
             # the subprocess on timeout/cancel and always terminates the stream
@@ -570,6 +574,7 @@ class BaseAgentRunner:
                 try:
                     evt = json.loads(line)
                 except json.JSONDecodeError:
+                    stdout_tail = (stdout_tail + line + "\n")[-2000:]
                     continue
 
                 for normalized in self._handle_event(evt, turn):
@@ -594,7 +599,7 @@ class BaseAgentRunner:
             if returncode != 0 and turn.errored is None:
                 turn.errored = (
                     f"{self.agent_label} exited {returncode}: "
-                    f"{self._stderr_for_client(stderr_output)}"
+                    f"{self._stderr_for_client(stderr_output) or self._stdout_for_client(stdout_tail) or 'no error details from CLI'}"
                 )
             errored = turn.errored
             # Self-heal a broken resume. If a --resume turn fails — a non-zero
@@ -613,6 +618,8 @@ class BaseAgentRunner:
             # The "no assistant text this turn" guard means a session that
             # streamed a real answer and only then hit a late error is left
             # intact — we only reset sessions that produced nothing usable.
+            # Apply the same guard to fresh wrapper-assigned sessions: a CLI
+            # that failed at startup may never have persisted the new uuid.
             #
             # placeholder_unbound covers CLI-assigned-id agents (codex): a
             # first turn that dies before announcing its id leaves the
@@ -643,11 +650,11 @@ class BaseAgentRunner:
                     returncode,
                     errored,
                 )
-            elif (not created and (dead_session or resume_unusable)) or (
+            elif ((not created or self.wrapper_assigns_session_id) and (dead_session or resume_unusable)) or (
                 placeholder_unbound and bool(errored)
             ):
                 log.warning(
-                    "resume failed for session %s uuid %s (returncode=%s error=%r); "
+                    "run failed for session %s uuid %s (returncode=%s error=%r); "
                     "dropping mapping so the next turn replays full history",
                     session_key,
                     session_uuid,

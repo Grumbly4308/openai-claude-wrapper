@@ -154,9 +154,15 @@ class ClaudeRunner(BaseAgentRunner):
             usage = evt.get("usage") or {}
             turn.input_tokens = int(usage.get("input_tokens") or 0)
             turn.output_tokens = int(usage.get("output_tokens") or 0)
-            if evt.get("subtype") and evt["subtype"] != "success":
-                turn.errored = evt.get("error") or evt.get("subtype")
+            if evt.get("is_error") or (evt.get("subtype") and evt["subtype"] != "success"):
+                errors = evt.get("errors") or []
+                if isinstance(errors, list):
+                    errors = "; ".join(str(error) for error in errors)
+                turn.errored = str(evt.get("error") or errors or evt.get("result") or evt.get("subtype") or "claude failed")
         return out
+
+    def _stdout_for_client(self, stdout: str) -> str:
+        return stdout.strip()[-500:]
 
     def _stderr_indicates_dead_session(self, stderr_lc: str) -> bool:
         return "session" in stderr_lc and (
